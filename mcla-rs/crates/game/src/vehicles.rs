@@ -1,0 +1,3202 @@
+//! Vehicle system: GPU car models shared between instances, player + traffic cars,
+//! spawning/despawning around the player, car-car separation.
+
+use crate::ai::AiDriver;
+use crate::physics::{CarInput, CarParams, CarState};
+use crate::render::{Gpu, GpuTexture, MatMode, ObjectBinding, ObjectUniform, Vertex};
+use crate::vehicle_model::{self, CarAsset, CarConfig, Slot};
+use crate::world::{GpuBatch, World};
+use anyhow::Result;
+use glam::{Mat4, Quat, Vec3};
+use std::path::Path;
+use std::sync::Arc;
+use wgpu::util::DeviceExt;
+
+/// The glow table's kind of a `glow<name>0` bone of a car part's skeleton (every bone of that name
+/// is the place of one glow of the kind): 0 brake, 1 tail, 2 signal, 3 head, 4 high beam,
+/// 6 reversing, 8 fog, 12 third brake.
+fn glow_bone_kind(name: &str) -> Option<u8> {
+    let p = name.trim_end_matches(|c: char| c.is_ascii_digit());
+    Some(match p {
+        "glowbrake" => 0,
+        "glowtail" => 1,
+        "glowsignal" => 2,
+        "glowhead" => 3,
+        "glowhigh" => 4,
+        "glowreverse" => 6,
+        "glowfog" => 8,
+        "glowthirdbrake" => 12,
+        _ => return None,
+    })
+}
+
+pub struct CarModel {
+    pub name: String,
+    pub batches: Vec<GpuBatch>,
+    /// the lamps: type (the id of the game's glow table: 0 brake, 1 tail, 3 head, 6 reverse,
+    /// 12 third brake, 13 / 14 police) and the middle of each lamp face in car space
+    pub lamps: Vec<(u8, Vec3)>,
+    /// the lamps' glow places as the car's own part files give them (the bones under `glowbrake0`,
+    /// `glowhead0` ... of each fitted part's skeleton - what the original's light set holds, one
+    /// record a bone, read out of the running game for the R8): the kind of the game's glow table
+    /// and the bone's place in car space. Render only (the glow pass, `halo_lamps`).
+    pub glow_bones: Vec<(u8, Vec3, Vec3)>,
+    pub params: CarParams,
+    /// the same car with every performance upgrade fitted (the tuning file's "mods" set)
+    pub params_mods: Option<CarParams>,
+    /// the original's simulation tuning (base and mods), when the car has it
+    pub simtunes: Option<Arc<mcla_formats::rage::simtune::SimTunes>>,
+    /// what the computer drivers know of the car (the game's own calibration tables)
+    pub aitunes: Option<Arc<mcla_formats::rage::aitune::AiTunes>>,
+    /// the height the wheels' centres were modelled at (mean of front and rear)
+    pub rest_height: Option<f32>,
+    /// the car's own stock wheels (`resources/rims/whl_stk_<car>`), when the disc has them
+    pub wheels: Option<Arc<WheelModel>>,
+    /// the car's brakes behind them (`resources/brakes/brk_stk_<car>`, else `brk_car_base`)
+    pub brakes: Option<Arc<BrakeModel>>,
+    pub brake_dir: Option<std::path::PathBuf>,
+    /// where those came from, and the rim's share of the wheel diameter (stock size)
+    pub rim_dir: Option<std::path::PathBuf>,
+    pub rim_ratio: f32,
+    /// motorcycle: one front and one rear wheel on the centre line, leans into corners
+    pub bike: bool,
+    pub min: Vec3,
+    pub max: Vec3,
+    pub cfg: CarConfig,
+    /// (slot, variant names) for the garage
+    pub variants: Vec<(Slot, Vec<String>)>,
+    /// display labels matching `variants`
+    pub variant_labels: Vec<(Slot, Vec<String>)>,
+    /// extra garage rows with a placed fragment on this car
+    pub extra_variants: std::collections::HashSet<(String, usize)>,
+}
+
+pub struct WheelModel {
+    pub batches: Vec<GpuBatch>,
+    /// where the rim's spokes stand along the axle (the mean x of zone 1, in the unit
+    /// wheel's own measure: -0.25 is the outer face)
+    pub spoke_x: f32,
+}
+
+/// How far a brake is moved in along the axle to stand behind the spokes of a rim
+/// (its own outer face is at -0.1875 of the unit wheel). (approx.) the game's rule for
+/// it was not read; the gap is by eye.
+fn brake_shift(spoke_x: f32) -> f32 {
+    (spoke_x + 0.07 + 0.1875).clamp(0.0, 0.30)
+}
+
+/// A brake of `resources/brakes` (`brk_stk_<car>`, `brk_car_base` ...): the rotor, which
+/// turns with the wheel, and the caliper, which does not.
+pub struct BrakeModel {
+    pub rotor: Vec<GpuBatch>,
+    pub caliper: Vec<GpuBatch>,
+}
+
+/// (approx.) the rotor's diameter against the rim's, measured on the capture `g_rm_0`
+const ROTOR_OF_RIM: f32 = 0.74;
+
+/// The brake model in `dir`, its unit-diameter meshes scaled to `k` of the wheel's.
+fn load_brakes(gpu: &mut Gpu, world: &mut World, dir: &Path, k: f32, shift: f32) -> Option<BrakeModel> {
+    let (mut r63, mut r83) = (None, None);
+    for e in std::fs::read_dir(dir).ok()?.flatten() {
+        let p = e.path();
+        match p.extension().and_then(|x| x.to_str()) {
+            Some("r63") => r63 = Some(p),
+            Some("r83") => r83 = Some(p),
+            _ => {}
+        }
+    }
+    // (the shaders and the brake's own textures are in the .r83)
+    let look = vehicle_model::load_simple(&r83?, None).ok();
+    let mut model = vehicle_model::load_simple(&r63?, None).ok()?;
+    if model.shaders.is_empty() {
+        model.shaders = look.as_ref().map(|l| l.shaders.clone()).unwrap_or_default();
+    }
+    let xf = Mat4::from_translation(Vec3::new(shift, 0.0, 0.0)) * Mat4::from_scale(Vec3::new(1.0, k, k));
+    let mut out = BrakeModel { rotor: Vec::new(), caliper: Vec::new() };
+    let mut seen: Vec<(String, bool)> = Vec::new();
+    for (mesh, si) in &model.meshes {
+        if mesh.positions.is_empty() {
+            continue;
+        }
+        // the rotor is the whole disc; the caliper sits on one side of it. The first of
+        // each is the finest (the others are its coarser levels).
+        let (lo, hi) = mesh.positions.iter().fold((f32::MAX, f32::MIN), |a, p| (a.0.min(p.z), a.1.max(p.z)));
+        let is_rotor = lo < -0.4 && hi > 0.4;
+        let list = if is_rotor { &mut out.rotor } else { &mut out.caliper };
+        let sh = model.shaders.get(*si as usize);
+        let sname = sh.map(|s| s.name.clone()).unwrap_or_default();
+        // (one mesh of a kind: the caliper, its maker's mark)
+        if seen.contains(&(sname.clone(), is_rotor)) {
+            continue;
+        }
+        seen.push((sname.clone(), is_rotor));
+        let name = sh.and_then(|s| s.diffuse().map(|n| n.to_ascii_lowercase())).unwrap_or_default();
+        let keys = [mcla_formats::hash::joaat(&name), mcla_formats::hash::joaat(name.trim_end_matches(".dds"))];
+        let own = [&model.textures, look.as_ref().map(|l| &l.textures).unwrap_or(&model.textures)].into_iter().find_map(|d| keys.iter().find_map(|k| d.get(k).map(|t| (*k, t))));
+        let key = own.map_or(keys[0], |o| o.0);
+        let tex = match own {
+            Some((k, t)) => gpu.upload_texture(k, t),
+            None if !name.is_empty() => keys.iter().find_map(|k| world.texture_any(gpu, *k)).unwrap_or_else(|| gpu.white.clone()),
+            None => gpu.white.clone(),
+        };
+        if std::env::var("MCLA_WHEEL_DUMP").is_ok() {
+            if let Some((_, t)) = own {
+                let px = t.to_rgba8();
+                let at = |u: f32, v: f32| { let (x, y) = (((u * t.width as f32) as usize).min(t.width as usize - 1), ((v * t.height as f32) as usize).min(t.height as usize - 1)); let i = (y * t.width as usize + x) * 4; [px[i], px[i + 1], px[i + 2], px[i + 3]] };
+                let grid: Vec<Vec<[u8; 4]>> = (0..8).map(|y| (0..8).map(|x| at((x as f32 + 0.5) / 8.0, (y as f32 + 0.5) / 8.0)).collect()).collect();
+                log::info!("brake texel {} at (0.943,0.942) {:?} flipped {:?} grid {:?}", name, at(0.943, 0.942), at(0.943, 0.058), grid);
+            }
+            log::info!("brake params {} rotor {}: {:?}", sname, is_rotor, sh.map(|s| s.params.iter().map(|(h, p)| format!("{:08x}={:?}", h, p)).collect::<Vec<_>>()));
+            log::info!("brake mesh {} shader {} texture {:?} own {} rotor {} size {:?} means {:?} uv {:?}", dir.display(), sname, name, own.is_some(), is_rotor, own.map(|o| (o.1.width, o.1.height)), own.map(|o| o.1.level_means()), mesh.uv0.iter().fold((glam::Vec2::splat(9.0), glam::Vec2::splat(-9.0)), |a, u| (a.0.min(*u), a.1.max(*u))));
+        }
+        // The rotor's texture is its pattern in dark grey (the shader makes the metal of
+        // it); a caliper of the rotor's shader has one texel and takes its colour at run
+        // time - red on the R8 (`ref/g_rm_0`), which is the only one captured. Both go
+        // through the rim's branch of the shader, marked by zone: 8 rotor, 9 caliper.
+        let lower = sname.to_ascii_lowercase();
+        let mode = if lower.contains("alpha") { MatMode::AlphaTest } else { MatMode::Rim };
+        // (uv1.y 1: the caliper's colour is its texture's - the Project Mu sets' teal is a
+        // patch of the rotor's texture; where that texel is plain dark grey, as on the R8,
+        // the colour is the game's own: red)
+        let plain = own.map_or(false, |(_, t)| {
+            let (px, uv) = (t.to_rgba8(), mesh.uv0.first().copied().unwrap_or_default());
+            let (x, y) = (((uv.x.clamp(0.0, 0.999)) * t.width as f32) as usize, ((uv.y.clamp(0.0, 0.999)) * t.height as f32) as usize);
+            let i = (y * t.width as usize + x) * 4;
+            px.get(i..i + 3).map_or(true, |c| c.iter().max().unwrap() - c.iter().min().unwrap() < 12 && c[0] < 60)
+        });
+        let (zone, paint, own_tex) = if is_rotor { (8.0, [255u8, 255, 255], 0.0) } else if lower.contains("rotor") && plain { (9.0, [150, 6, 6], 0.0) } else { (9.0, [255, 255, 255], 1.0) };
+        let mut b = mesh_to_batch_xf(gpu, mesh, &sname, mode, tex.clone(), tex, key, key, xf);
+        // (as on the rims the first colour channel is baked occlusion, the others empty:
+        // the generic path would draw the brake black)
+        let verts: Vec<Vertex> = (0..mesh.positions.len())
+            .map(|i| {
+                let p = xf.transform_point3(mesh.positions[i]);
+                let nr = xf.transform_vector3(mesh.normals.get(i).copied().unwrap_or(Vec3::Y)).normalize_or(Vec3::Y);
+                let occ = mesh.colors.get(i).map_or(255, |c| c[0]);
+                let (uv1, color) = if mode == MatMode::Rim { ([zone, own_tex], [paint[0], paint[1], paint[2], occ]) } else { (mesh.uv1.get(i).copied().unwrap_or_default().to_array(), [255, 255, 255, 255]) };
+                Vertex { pos: p.to_array(), normal: nr.to_array(), uv0: mesh.uv0.get(i).copied().unwrap_or_default().to_array(), uv1, color, color1: [0, 0, 0, 255], uv2: [0.0, 0.0] }
+            })
+            .collect();
+        b.vb = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("brake vb"), contents: bytemuck::cast_slice(&verts), usage: wgpu::BufferUsages::VERTEX });
+        list.push(b);
+    }
+    (!out.rotor.is_empty()).then_some(out)
+}
+
+pub struct CarInstance {
+    pub model: Arc<CarModel>,
+    pub binding: ObjectBinding,
+    pub wheel_bindings: Vec<ObjectBinding>,
+    /// the brake calipers' objects: as the wheels', without their turning
+    pub caliper_bindings: Vec<ObjectBinding>,
+    pub state: CarState,
+    pub input: CarInput,
+    pub color: [f32; 4],
+    pub ai: Option<AiDriver>,
+    pub placed: bool,
+    pub is_player: bool,
+    /// aftermarket wheels fitted in the garage (player only)
+    pub wheels: Option<Arc<WheelModel>>,
+    /// visual lean angle of a motorcycle (rad)
+    pub lean: f32,
+    /// performance upgrade level 0..1 and the blended parameters for it
+    pub perf: f32,
+    pub tuned: Option<Box<CarParams>>,
+    /// police cruiser
+    pub cop: bool,
+    /// seconds the car is knocked out (EMP / Roar): no throttle, no steering
+    pub stunned: f32,
+    /// parked at the kerb: index of its parking spot
+    pub parked: Option<usize>,
+    /// seconds of physics left before a parked car is frozen in place
+    pub settle: f32,
+    /// roaming street racer (free roam): can be challenged
+    pub racer: bool,
+    /// a computer racer's slipstream turbo charge (0..1)
+    pub sst: f32,
+    /// takes part in the running event: never despawned, not counted as traffic
+    pub pinned: bool,
+    /// seconds of nitrous an AI car has been told to use (race scripts)
+    pub boost: f32,
+    /// character id of a named rival at the wheel ("GH_06"), else empty
+    pub driver: String,
+    /// licence plate text (set by whoever spawns the car; else a random Californian one)
+    pub plate_text: String,
+    /// plate texture with the text on it
+    pub plate: Option<Arc<wgpu::BindGroup>>,
+    /// car set-up whose livery the body wears ("GH_06_0_vp_dsn_280z_75"), else empty
+    pub vinyl_name: String,
+    pub vinyl: Option<Arc<wgpu::BindGroup>>,
+    vinyl_done: bool,
+    /// the wheels of this car's own set-up (a rival's `.xcc`), where it has one
+    pub setup: Option<mcla_formats::rage::simtune::WheelFit>,
+    pub pose_history: crate::vehicle_pose::History,
+    /// step 19d: the factor on the damage this vehicle inflicts on another it hits
+    /// (mcCarDamage +20, Racer_SetDamageInflictedFactor; 1 by default)
+    pub inflict: f32,
+    /// one of the payback client's friends (made through the police manager without being
+    /// police: no light bar, no siren)
+    pub goon: bool,
+    /// what the car's set-up paints on it (not the player's car: that is `player_*`)
+    pub look: Option<Arc<CarLook>>,
+    /// the brake model of its set-up
+    pub brake: Option<Arc<BrakeModel>>,
+    /// the set-up in `vinyl_name` has been put on the car (`Vehicles::dress_setups`)
+    pub dressed: bool,
+    /// the character set at the wheel ("drv_mb_009_set": Racer_SetCharacterName), else empty
+    pub driver_set: String,
+    /// step 19e: the power-up control override on the car's input (the original's vehicle
+    /// +624; `powerups::apply_ctl`)
+    pub pu_ctl: u32,
+    /// step 19f: MegaStealth - the car's archetype includes only the map's type (2048) and its
+    /// wheels' probes likewise (sub_8237F8B0): it meets no other car and no prop
+    pub pu_ghost: bool,
+    /// step 19g: Mirror - the paint's DL6.w (sub_823802D8 -> render object +4108 -> sub_823580D0:
+    /// the player's car only), added to PS_CarPaint's mirror weight
+    pub pu_mirror: f32,
+    /// step 19g: Stealth - the car is drawn by pu_fx.rs with PS_Stealth instead of its own look
+    pub pu_stealth: bool,
+}
+
+/// What a set-up file paints on a car that is not the player's, as the renderer takes it
+/// for the player's (`Vehicles::player_*`): the body's paint type, its second colour (w the
+/// fade), the window tint, the cabin's five colour groups, the five paint areas after the
+/// body, and the rims' finish. Made by `mc4::setup_look`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CarLook {
+    pub paint_type: u8,
+    pub color2: [f32; 4],
+    pub tint: [f32; 4],
+    pub interior: [[f32; 4]; 5],
+    pub area_a: [[f32; 4]; 5],
+    pub area_b: [[f32; 4]; 5],
+    pub rim_finish: [[f32; 4]; 3],
+}
+
+/// A set-up as `Vehicles::dress_setups` puts it on a car: the model's parts, the rim's
+/// directory and size (0: the car's own), the tire set, the brake model, the body's first
+/// colour, the look, and the share of performance upgrades (None: left as it is).
+#[derive(Clone, Debug)]
+pub struct Dress {
+    pub cfg: CarConfig,
+    pub rim_dir: Option<std::path::PathBuf>,
+    pub inches: u32,
+    pub tire: String,
+    pub brake: Option<String>,
+    pub color: [f32; 4],
+    pub look: CarLook,
+    pub perf: Option<f32>,
+    /// step 19e: the set-up's licence plate text (0x847; empty: none)
+    pub plate: String,
+}
+
+impl CarInstance {
+    pub fn render_pose(&self, alpha: f32) -> crate::vehicle_pose::Pose {
+        self.pose_history.sample(&self.state, self.lean, alpha)
+    }
+
+    pub fn render_state(&self, alpha: f32) -> CarState {
+        let pose = self.render_pose(alpha);
+        let mut state = self.state.clone();
+        state.pos = pose.pos;
+        state.rot = pose.rot;
+        for i in 0..4 {
+            state.wheels[i].world_pos = pose.pos + pose.rot * pose.hubs[i];
+            state.wheels[i].steer = pose.steer[i];
+            state.wheels[i].spin = pose.spin[i];
+        }
+        state
+    }
+
+    /// Wear another livery ("" for none); the texture is fetched on the next frame.
+    pub fn set_vinyl(&mut self, name: &str) {
+        if self.vinyl_name != name {
+            self.vinyl_name = name.to_string();
+            self.vinyl = None;
+            self.vinyl_done = false;
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct Vehicles {
+    pub render_alpha: f32,
+    pub models: Vec<Arc<CarModel>>,
+    pub wheels: Option<Arc<WheelModel>>,
+    pub cars: Vec<CarInstance>,
+    pub traffic_target: usize,
+    /// solid props around the racing cars (centre, radius), refreshed by the game a few times a second
+    pub solids: Vec<(Vec3, f32)>,
+    /// the glows of the cars' lamps this frame (instances of the glow pipeline)
+    glow_buf: Option<wgpu::Buffer>,
+    glow_count: u32,
+    /// rim size chosen in the garage for the player's car (inches; 0 = the car's stock size)
+    pub player_rim_inches: u8,
+    /// traffic density a race script asked for on a road (a point on it, 0..5), not yet resolved
+    pub road_density_new: Vec<(Vec3, i32)>,
+    /// the same per lane of the road network
+    pub road_density: std::collections::HashMap<usize, i32>,
+    pub spawn_timer: f32,
+    pub rng: u32,
+    /// countdown: physics and AI are held
+    pub frozen: bool,
+    /// no car has its lamps on (VEHICLE SELECT: three cars standing in a lot)
+    pub lights_off: bool,
+    /// the finish of the player's rims by zone - spoke A, spoke B, lip (the rim meshes'
+    /// uv1.x 1..3): colour, and in w 1 painted, 2 chrome, 3 brushed (0 = as the model is)
+    pub player_rim_finish: [[f32; 4]; 3],
+    /// the player's cabin colours A, B, C (w 1 = chosen)
+    pub player_interior: [[f32; 4]; 5],
+    /// the brakes fitted in the garage (BRAKES: a model of `resources/brakes`), else the car's own
+    pub player_brake: Option<Arc<BrakeModel>>,
+    /// the tires fitted in the garage (TIRES: a set of `resources/tires/textures`; empty =
+    /// the plain set), the set the next wheels are built with, and the rim and size the
+    /// player's wheels stand on
+    pub player_tire: String,
+    tire_now: String,
+    player_rim: Option<(std::path::PathBuf, f32)>,
+    player_brake_name: String,
+    /// the bumper camera sits inside the bodywork: the player's car is not drawn
+    pub hide_player: bool,
+    /// the player's car is driven by the test driver (`--auto`): it passes traffic like the racers
+    pub auto_player: bool,
+    /// the city's parking spots and a 64 m lookup grid
+    pub parking: Vec<mcla_formats::rage::parking::ParkingSpot>,
+    park_grid: hashbrown::HashMap<(i32, i32), Vec<usize>>,
+    pub parked_target: usize,
+    wheel_cache: hashbrown::HashMap<(std::path::PathBuf, String, u32), Arc<WheelModel>>,
+    brake_cache: hashbrown::HashMap<(std::path::PathBuf, u32, i32), Arc<BrakeModel>>,
+    /// police light bars are flashing
+    pub sirens: bool,
+    /// running time for light flashing (s)
+    pub clock: f32,
+    /// traffic signals (shared with the props) and the signal clock
+    pub signals: crate::signals::Signals,
+    /// payback target: takes heavy damage when the player rams it
+    pub fragile: Option<usize>,
+    /// Agro: the player shrugs off collisions with other cars
+    pub agro: bool,
+    /// step 19e: the power-up sources' glows (x, y, z, size, r, g, b, strength)
+    pub pu_glows: Vec<[f32; 8]>,
+    /// slipstream strength 0..1 on the player
+    pub draft: f32,
+    /// district traffic tables (`tune/ambients`) and the hour they are read at
+    pub ambient: crate::ambient::Distribution,
+    pub hour: f32,
+    /// the paint type of the player's car (garage: 1 Matte .. 5 Sparkle)
+    pub player_paint_type: u8,
+    /// its second colour and, in w, the fade type (`garage.ChangePaintFadeType`)
+    pub player_paint_b: [f32; 4],
+    /// the player's paint areas after the body (`ObjectUniform::area_a`, `area_b`)
+    pub player_area_a: [[f32; 4]; 5],
+    pub player_area_b: [[f32; 4]; 5],
+    /// its window tint (colour, level 1..10 or 0)
+    pub player_tint: [f32; 4],
+    /// parking spots that take a random small car (the others take the list's Escalade)
+    park_small: hashbrown::HashSet<(i32, i32)>,
+    /// diagnostics: car-frames braking for / standing at a red light
+    pub held_at_red: u64,
+    pub stopped_at_red: u64,
+    trace_car: Option<(usize, u32)>,
+    /// plate background and font (RGBA), and the finished plates by text
+    plate_art: Option<(u32, u32, Vec<u8>, Vec<u8>)>,
+    plates: hashbrown::HashMap<String, Arc<wgpu::BindGroup>>,
+    plate_serial: u32,
+    /// the background of the player's plate (a name of `resources/license_plates/backgrounds`:
+    /// the vehicle record's LicenseBG - `mc4`; none = the California plate), and those loaded
+    pub player_plate_bg: Option<String>,
+    plate_bgs: hashbrown::HashMap<String, Option<(u32, u32, Vec<u8>)>>,
+    /// liveries of the named opponents: texture file by set-up name, loaded ones
+    vinyl_index: Option<hashbrown::HashMap<String, std::path::PathBuf>>,
+    vinyl_painted: hashbrown::HashSet<String>,
+    vinyls: hashbrown::HashMap<String, Option<Arc<wgpu::BindGroup>>>,
+}
+
+/// Trailers are towed, never driven.
+fn is_trailer(n: &str) -> bool {
+    n.contains("trailer") || n.contains("flatbed") || n.contains("flatloaded") || n.contains("tanker")
+}
+
+/// Too big for a kerbside parking spot.
+fn is_large(n: &str) -> bool {
+    is_trailer(n) || n.contains("citybus") || n.contains("rstr") || n.contains("semitruck") || n.contains("limo")
+}
+
+pub const PALETTE: [[f32; 4]; 10] = [
+    [0.75, 0.05, 0.05, 1.0],
+    [0.05, 0.05, 0.08, 1.0],
+    [0.85, 0.85, 0.88, 1.0],
+    [0.55, 0.57, 0.60, 1.0],
+    [0.05, 0.15, 0.55, 1.0],
+    [0.85, 0.65, 0.05, 1.0],
+    [0.10, 0.40, 0.15, 1.0],
+    [0.45, 0.10, 0.50, 1.0],
+    [0.90, 0.35, 0.05, 1.0],
+    [0.30, 0.30, 0.32, 1.0],
+];
+
+/// Everyday paint colours for ambient traffic.
+pub const TRAFFIC_PALETTE: [[f32; 4]; 10] = [
+    [0.62, 0.63, 0.65, 0.3],
+    [0.05, 0.05, 0.06, 0.2],
+    [0.80, 0.80, 0.78, 0.1],
+    [0.30, 0.31, 0.33, 0.3],
+    [0.35, 0.05, 0.05, 0.2],
+    [0.06, 0.10, 0.25, 0.3],
+    [0.45, 0.40, 0.30, 0.3],
+    [0.10, 0.20, 0.12, 0.2],
+    [0.55, 0.55, 0.50, 0.3],
+    [0.20, 0.22, 0.28, 0.3],
+];
+
+fn car_mode(shader: &str) -> MatMode {
+    let s = shader.to_ascii_lowercase();
+    if s.contains("paint") {
+        MatMode::Paint
+    } else if s.contains("blackmatte") {
+        // (BlackMatte.fx: no reflection at all - the backing of grilles, the inside of pipes)
+        MatMode::Rubber
+    } else if s.contains("carbonfiber") {
+        // (CarbonFiber.fx has no texture: a dark glossy weave made by the shader - the R8's
+        // side blades, carbon hoods; drawn as black gloss)
+        MatMode::BlackGloss
+    } else if s == "grillopaque" && std::env::var("MCLA_CARPARTS_OLD").is_err() {
+        // (grillopaque.fxc is the BumpSpec program again, opaque, its soft reflection times the
+        // texture - the silver mesh panels, e.g. the R8's number plate recess; marked below)
+        MatMode::Object
+    } else if s.contains("blackopaque") || s.contains("grill") {
+        MatMode::BlackGloss
+    } else if s.contains("glass") {
+        MatMode::CarGlass
+    } else if s.contains("alphachrome") {
+        MatMode::AlphaTest
+    } else if s.contains("chrome") || s.contains("brushedmetal") || (s.contains("metal") && !s.contains("grime")) {
+        MatMode::Chrome
+    } else if s.contains("light") && !s.contains("lightmap") {
+        MatMode::Light
+    } else if s == "bumpspecalpha" && std::env::var("MCLA_CARPARTS_OLD").is_err() {
+        // (bumpspecalpha.fxc is the BumpSpec program with a cut-out - the mirrors' glass, badges,
+        // trim: a car part, not a wall; its vertices are marked below for city.wgsl)
+        MatMode::Object
+    } else if s.contains("alpha") || s.contains("grill") {
+        MatMode::AlphaTest
+    } else if s.contains("rubber") || s.contains("underbody") || s.contains("bumpersubframe") {
+        MatMode::Rubber
+    } else if s.starts_with("interiortrim") {
+        MatMode::Interior
+    } else {
+        MatMode::Object
+    }
+}
+
+fn mesh_to_batch(gpu: &mut Gpu, mesh: &mcla_formats::rage::geometry::Mesh, sname: &str, mode: MatMode, d: Arc<GpuTexture>, s2: Arc<GpuTexture>, k0: u32, k1: u32) -> GpuBatch {
+    mesh_to_batch_xf(gpu, mesh, sname, mode, d, s2, k0, k1, Mat4::IDENTITY)
+}
+
+/// The stored tangent word's sign w (raw 1 = +1, raw 3 = -1; the game's programs hand the pixel
+/// stage `cross(T, N) x w`) rides in the LENGTH of the vertex normal as on the walls
+/// (`world::mark_binormal`): 2 for w = -1, 1.5 for w = 0, unchanged for +1 and for meshes without
+/// tangents. city.wgsl `vs_body` takes it off (`bflip`) and normalises.
+fn car_binormal_mark(mesh: &mcla_formats::rage::geometry::Mesh, i: usize, nrm: Vec3) -> Vec3 {
+    match mesh.tangents.get(i) {
+        Some(t) if mesh.tangents.len() == mesh.positions.len() => {
+            let k = if t.w >= 1.5 { 2.0 } else if t.w < 0.5 { 1.5 } else { 1.0 };
+            nrm * k
+        }
+        _ => nrm,
+    }
+}
+
+fn mesh_to_batch_xf(gpu: &mut Gpu, mesh: &mcla_formats::rage::geometry::Mesh, sname: &str, mode: MatMode, d: Arc<GpuTexture>, s2: Arc<GpuTexture>, k0: u32, k1: u32, xf: Mat4) -> GpuBatch {
+    let bind = gpu.texture_bind_group(&d, &s2, k0, k1);
+    let n = mesh.positions.len();
+    let mut verts = Vec::with_capacity(n);
+    let identity = xf == Mat4::IDENTITY;
+    let own = if mesh.normals.len() < n { face_normals(mesh) } else { Vec::new() };
+    let mut mn = Vec3::splat(f32::INFINITY);
+    let mut mx = Vec3::splat(f32::NEG_INFINITY);
+    for i in 0..n {
+        let nrm0 = mesh.normals.get(i).or(own.get(i)).copied().unwrap_or(Vec3::Y);
+        let (pos, nrm) = if identity { (mesh.positions[i], nrm0) } else { (xf.transform_point3(mesh.positions[i]), xf.transform_vector3(nrm0).normalize_or(Vec3::Y)) };
+        mn = mn.min(pos);
+        mx = mx.max(pos);
+        let nrm = car_binormal_mark(mesh, i, nrm);
+        let uv0 = mesh.uv0.get(i).copied().unwrap_or_default();
+        let uv1 = mesh.uv1.get(i).copied().unwrap_or_default();
+        let c = mesh.colors.get(i).copied().unwrap_or([255, 255, 255, 255]);
+        let c1 = mesh.colors1.get(i).copied().unwrap_or([c[0], 255, 255, 255]); // (no second colour set: its alpha slot carries the first set's alpha, the body's baked occlusion - the lighting reads it there; the first set's own alpha stays the baked-paint flag)
+        verts.push(Vertex { pos: pos.to_array(), normal: nrm.to_array(), uv0: uv0.to_array(), uv1: uv1.to_array(), color: [c[1], c[2], c[3], 0], color1: [c1[1], c1[2], c1[3], c1[0]], uv2: [0.0, 0.0] });
+    }
+    let vb = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&verts), usage: wgpu::BufferUsages::VERTEX });
+    let ib = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&mesh.indices), usage: wgpu::BufferUsages::INDEX });
+    GpuBatch { shader: sname.to_string(), vb, ib, count: mesh.indices.len() as u32, bind, mode, min: mn, max: mx }
+}
+
+/// The California plate background of the disc (`resources/license_plates/backgrounds`),
+/// uploaded once. The files hold a single texture object behind the root pointer.
+fn plate_texture(gpu: &mut Gpu, world: &World) -> (Arc<GpuTexture>, u32) {
+    const KEY: u32 = 0xb59c_dcaf; // joaat("plate_ca_00")
+    if let Some(t) = gpu.textures.get(&KEY) {
+        return (t.clone(), KEY);
+    }
+    let dir = world.assets.root.join("resources/license_plates/backgrounds/plate_ca_00");
+    let file = std::fs::read_dir(&dir).ok().and_then(|rd| rd.flatten().map(|e| e.path()).find(|p| p.extension().map_or(false, |x| x == "r1")));
+    if let Some(f) = file {
+        if let Ok(res) = crate::assets::load_resource_file(&f) {
+            let rd = mcla_formats::rage::Rd::new(&res);
+            if let Some(o) = rd.ptr(0) {
+                if let Ok(t) = mcla_formats::rage::texture::Texture::parse(&rd, o) {
+                    return (gpu.upload_texture(KEY, &t), KEY);
+                }
+            }
+        }
+    }
+    (gpu.white.clone(), 0)
+}
+
+/// (render only) The carbon weave's normal map of the disc: `__cfnormalmap` = `cf_bump2.dds` of
+/// `textures/global/cars/globaltex` (256 x 256, x / y tilt in red / green, the strand in alpha),
+/// uploaded as stored - no gamma decoding. White when the file is missing (the shader then takes a flat map).
+fn carbon_weave(gpu: &mut Gpu, world: &World) -> (Arc<GpuTexture>, u32) {
+    const KEY: u32 = 0x9499_fb74 ^ 0x0052_4157; // joaat("cf_bump2.dds"), kept apart from a gamma-decoded upload of the same file
+    if let Some(t) = gpu.textures.get(&KEY) {
+        return (t.clone(), KEY);
+    }
+    if let Some(p) = world.globaltex.get(&mcla_formats::hash::joaat("cf_bump2.dds")) {
+        if let Some(t) = std::fs::read(p).ok().and_then(|d| mcla_formats::dds::parse_dds("cf_bump2.dds", &d).ok()) {
+            return (gpu.upload_texture_raw(KEY, &t), KEY);
+        }
+    }
+    (gpu.white.clone(), 0)
+}
+
+/// Normals for a mesh whose vertex format has none (the matte black parts are stored as
+/// positions alone): the area-weighted mean of the faces around each vertex.
+fn face_normals(mesh: &mcla_formats::rage::geometry::Mesh) -> Vec<Vec3> {
+    let n = mesh.positions.len();
+    let mut out = vec![Vec3::ZERO; n];
+    for t in mesh.indices.chunks_exact(3) {
+        let (a, b, c) = (t[0] as usize, t[1] as usize, t[2] as usize);
+        if a < n && b < n && c < n {
+            let f = (mesh.positions[b] - mesh.positions[a]).cross(mesh.positions[c] - mesh.positions[a]);
+            out[a] += f;
+            out[b] += f;
+            out[c] += f;
+        }
+    }
+    out.iter().map(|v| v.normalize_or(Vec3::Y)).collect()
+}
+
+/// CPU-side accumulator for meshes that share a material.
+struct MergeAcc {
+    verts: Vec<Vertex>,
+    indices: Vec<u32>,
+    d: Arc<GpuTexture>,
+    s2: Arc<GpuTexture>,
+    sname: String,
+    mode: MatMode,
+    min: Vec3,
+    max: Vec3,
+}
+
+impl MergeAcc {
+    fn push(&mut self, mesh: &mcla_formats::rage::geometry::Mesh, xf: Mat4, dark_above: Option<f32>, lens: f32) {
+        let base = self.verts.len() as u32;
+        let identity = xf == Mat4::IDENTITY;
+        let n = mesh.positions.len();
+        let own = if mesh.normals.len() < n { face_normals(mesh) } else { Vec::new() };
+        for i in 0..n {
+            let nrm0 = mesh.normals.get(i).or(own.get(i)).copied().unwrap_or(Vec3::Y);
+            let nrm0 = if nrm0.is_finite() { nrm0 } else { Vec3::Y };
+            let (pos, nrm) = if identity { (mesh.positions[i], nrm0) } else { (xf.transform_point3(mesh.positions[i]), xf.transform_vector3(nrm0).normalize_or(Vec3::Y)) };
+            self.min = self.min.min(pos);
+            self.max = self.max.max(pos);
+            let nrm = car_binormal_mark(mesh, i, nrm);
+            let uv0 = mesh.uv0.get(i).copied().unwrap_or_default();
+            let uv1 = mesh.uv1.get(i).copied().unwrap_or_default();
+            let c = mesh.colors.get(i).copied().unwrap_or([255, 255, 255, 255]);
+            let c1 = mesh.colors1.get(i).copied().unwrap_or([c[0], 255, 255, 255]); // (no second colour set: its alpha slot carries the first set's alpha, the body's baked occlusion - the lighting reads it there; the first set's own alpha stays the baked-paint flag)
+            self.verts.push(Vertex { pos: pos.to_array(), normal: nrm.to_array(), uv0: uv0.to_array(), uv1: uv1.to_array(), color: [c[1], c[2], c[3], 0], color1: [c1[1], c1[2], c1[3], c1[0]], uv2: [if dark_above.map_or(false, |y| pos.y >= y) { 1.0 } else { 0.0 }, lens] });
+        }
+        for t in mesh.indices.chunks_exact(3) {
+            if t.iter().all(|&i| (i as usize) < n) {
+                self.indices.extend(t.iter().map(|&i| i + base));
+            }
+        }
+    }
+}
+
+/// Physics parameters derived from the art bounds.
+pub fn car_params(car: &CarAsset) -> CarParams {
+    let mut p = CarParams::default();
+    let size = car.max - car.min;
+    let center = (car.max + car.min) * 0.5;
+    if let Some(h) = car.hubs {
+        // hub height above the ground plane (y = 0) is the wheel radius
+        p.wheel_radius = h.iter().map(|v| v.y).sum::<f32>() / 4.0;
+        p.wheel_radius = p.wheel_radius.clamp(0.25, 0.5);
+        p.wheel_pos = [h[0], h[1], h[2], h[3]].map(|v| Vec3::new(v.x, v.y + p.susp_rest, v.z));
+    } else {
+        p.wheel_radius = (size.y * 0.16).clamp(0.30, 0.40);
+        let hub_y = car.min.y + p.wheel_radius;
+        let half_w = size.x * 0.5 - 0.10;
+        let front_z = center.z - size.z * 0.31;
+        let rear_z = center.z + size.z * 0.30;
+        p.wheel_pos = [
+            Vec3::new(-half_w, hub_y + p.susp_rest, front_z),
+            Vec3::new(half_w, hub_y + p.susp_rest, front_z),
+            Vec3::new(-half_w, hub_y + p.susp_rest, rear_z),
+            Vec3::new(half_w, hub_y + p.susp_rest, rear_z),
+        ];
+    }
+    p.body_half = Vec3::new(size.x * 0.5, size.y * 0.5, size.z * 0.5);
+    p.mass = (900.0 + size.x * size.y * size.z * 90.0).clamp(1000.0, 2600.0);
+    if let Some(t) = car.tune.as_ref() {
+        p.mass = t.mass.clamp(600.0, 3500.0);
+        if t.dims.iter().all(|d| *d > 0.5) && !car.bike {
+            p.body_half = Vec3::new(t.dims[0] * 0.5, t.dims[1] * 0.5, t.dims[2] * 0.5);
+        }
+        if car.bike {
+            // bike + rider
+            p.body_half = Vec3::new(0.38, 0.6, (size.z * 0.5).max(0.9));
+        }
+        p.drive_front = match t.drivetrain {
+            1 => 1.0,
+            2 => 0.5,
+            _ => 0.0,
+        };
+        p.top_speed = t.engine.top_speed.clamp(30.0, 120.0);
+        let e = &t.engine;
+        p.accel = e.accel.clone();
+        if !e.gears.is_empty() {
+            p.gear_count = e.gears.len().min(8);
+            for (i, g) in e.gears.iter().take(8).enumerate() {
+                p.gears[i] = *g;
+            }
+        }
+        let peak = e.torque.iter().cloned().fold(0.0f32, f32::max);
+        if e.torque.len() == 40 && peak > 0.0 {
+            for i in 0..40 {
+                p.torque[i] = (0.45 + 0.55 * e.torque[i] / peak).clamp(0.3, 1.0);
+            }
+        }
+        if t.redline > 2000.0 {
+            p.redline = t.redline.clamp(4000.0, 14000.0);
+        } else if e.rpm_scale > 500.0 {
+            p.redline = (e.rpm_scale * 2.5).clamp(5000.0, 10000.0);
+        }
+        // tyres, steering lock and wheel size straight from the car's axle data
+        if let (Some(f), Some(h)) = (car.fit.as_ref(), car.hubs) {
+            // (the original's wheels: at the hub bones' height and length, sideways where the
+            // fenders put tyres of this width; drawn 6.35 mm larger than the tyre's physics)
+            p.wheel_radius = f.radius[0] + 0.00635;
+            for (i, w) in p.wheel_pos.iter_mut().enumerate() {
+                let x = f.half_track[i / 2];
+                *w = Vec3::new(if x > 0.0 { h[i].x.signum() * x } else { h[i].x }, h[i].y + p.susp_rest, h[i].z);
+            }
+        } else if t.front.radius > 0.2 && t.front.radius < 0.6 {
+            // (the hub bones sit a few centimetres above this on some cars: droop)
+            let hub = p.wheel_radius;
+            p.wheel_radius = t.front.radius;
+            for w in p.wheel_pos.iter_mut() {
+                w.y += p.wheel_radius - hub;
+            }
+        }
+        if t.front.grip > 0.3 && t.rear.grip > 0.3 {
+            p.grip_front = t.front.grip;
+            p.grip_rear = t.rear.grip;
+        }
+        if t.front.steer > 0.2 && t.front.steer < 1.2 {
+            p.max_steer = t.front.steer;
+        }
+        if t.front.brake > 0.05 && t.rear.brake > 0.05 {
+            p.brake_bias = t.front.brake / (t.front.brake + t.rear.brake);
+        }
+        // grip hint: the game's own lateral grip triple (Golf ~1.8, muscle cars ~1.2)
+        let g = (t.grip_a[0] + t.grip_a[2]) * 0.5;
+        if g > 0.3 {
+            p.grip *= (0.88 + 0.12 * (g / 1.9)).clamp(0.85, 1.05);
+        }
+    }
+    // The wheel models are as wide as half their diameter; the cars wear tyres of about
+    // two thirds of that, and never wider than the body leaves room for.
+    p.wheel_width = p.wheel_radius * 0.72;
+    if let Some(h) = car.hubs {
+        let room = 2.0 * (size.x * 0.5 - h[1].x.abs());
+        if room > 0.12 {
+            p.wheel_width = p.wheel_width.min(room);
+        }
+    }
+    if car.bike {
+        p.wheel_width = 0.17;
+    }
+    p.engine_force = p.mass * 11.0;
+    // maximum braking deceleration of the car (the tyres still limit it)
+    let decel = car.tune.as_ref().map(|t| t.engine.brake_decel).filter(|d| *d > 4.0 && *d < 30.0).unwrap_or(11.0);
+    p.brake_force = p.mass * decel * 1.25;
+    if car.tune.is_none() {
+        p.grip_front = p.grip;
+        p.grip_rear = p.grip;
+    }
+    p.spring = p.mass * 32.0;
+    p.damper = p.mass * 3.2;
+    p.finalize();
+    p
+}
+
+/// Parameters of the fully upgraded car: the "mods" drivetrain table and mass.
+pub fn car_params_mods(car: &CarAsset, base: &CarParams) -> Option<CarParams> {
+    let t = car.tune.as_ref()?;
+    let e = &t.engine_mods;
+    if e.top_speed <= base.top_speed * 0.9 || e.accel.len() < 16 {
+        return None;
+    }
+    let mut p = base.clone();
+    p.top_speed = e.top_speed.clamp(30.0, 130.0);
+    p.accel = e.accel.clone();
+    if t.mass_mods > 300.0 {
+        p.mass = t.mass_mods.clamp(600.0, 3500.0);
+    }
+    if !e.gears.is_empty() {
+        p.gear_count = e.gears.len().min(8);
+        for (i, g) in e.gears.iter().take(8).enumerate() {
+            p.gears[i] = *g;
+        }
+    }
+    if e.brake_decel > 4.0 && e.brake_decel < 30.0 {
+        p.brake_force = p.mass * e.brake_decel * 1.25;
+    }
+    // upgraded tyres: the catalogue handling figure grows by about a quarter
+    p.grip_front *= 1.12;
+    p.grip_rear *= 1.12;
+    p.finalize();
+    Some(p)
+}
+
+impl CarInstance {
+    /// The parameters this car drives with (stock, or blended towards the upgrades).
+    pub fn params(&self) -> &CarParams {
+        self.tuned.as_deref().unwrap_or(&self.model.params)
+    }
+
+    /// Give the car the wheels of a set-up (`mcCarConfig`: a rival's `.xcc`).
+    pub fn set_setup(&mut self, cfg: &[u8]) {
+        let Some(s) = self.model.simtunes.as_ref() else { return };
+        let Some(fit) = (**s).clone().fit(cfg) else { return };
+        if self.setup != Some(fit) {
+            self.setup = Some(fit);
+            let perf = self.perf;
+            self.set_perf(perf);
+        }
+    }
+
+    /// Fit performance upgrades: 0 = stock, 1 = everything.
+    pub fn set_perf(&mut self, level: f32) {
+        self.perf = level.clamp(0.0, 1.0);
+        self.tuned = None;
+        if let Some(ai) = self.ai.as_mut() {
+            ai.tune = None;
+        }
+        if self.perf <= 0.0 && self.setup.is_none() {
+            return;
+        }
+        let b = &self.model.params;
+        let f = self.perf;
+        let mut p = b.clone();
+        if let Some(s) = self.model.simtunes.as_ref() {
+            // the game blends the base and the upgraded tuning field by field
+            let mut tune = mcla_formats::rage::simtune::SimTune::lerp(&s.base, &s.mods, f);
+            // (and then writes the set-up's wheels over the blend)
+            if let Some(fit) = self.setup {
+                for (axle, wt) in [&mut tune.wheel_front, &mut tune.wheel_back].into_iter().enumerate() {
+                    wt.radius = fit.radius[axle];
+                    wt.width = fit.width[axle];
+                    wt.suspension_offset = fit.offset[axle];
+                }
+                for (i, w) in p.wheel_pos.iter_mut().enumerate() {
+                    if fit.half_track[i / 2] > 0.0 {
+                        w.x = w.x.signum() * fit.half_track[i / 2];
+                    }
+                }
+            }
+            let mut vt = crate::physics::vehsim::VehTune::new(tune);
+            vt.bike = self.model.bike;
+            if let Some(h) = self.model.rest_height {
+                vt.seat(h);
+            }
+            p.veh = Some(Arc::new(vt));
+        }
+        let Some(m) = self.model.params_mods.as_ref() else {
+            if p.veh.is_some() {
+                self.tuned = Some(Box::new(p));
+            }
+            return;
+        };
+        p.top_speed = b.top_speed + (m.top_speed - b.top_speed) * f;
+        p.mass = b.mass + (m.mass - b.mass) * f;
+        p.brake_force = b.brake_force + (m.brake_force - b.brake_force) * f;
+        p.grip_front = b.grip_front + (m.grip_front - b.grip_front) * f;
+        p.grip_rear = b.grip_rear + (m.grip_rear - b.grip_rear) * f;
+        // both tables span 0..their own top speed: resample at equal real speeds
+        if !b.accel.is_empty() && !m.accel.is_empty() {
+            let n = b.accel.len().max(m.accel.len());
+            p.accel = (0..n)
+                .map(|i| {
+                    let v = (i as f32 + 0.5) / n as f32 * p.top_speed;
+                    b.accel_at(v) + (m.accel_at(v) - b.accel_at(v)) * f
+                })
+                .collect();
+        }
+        p.spring = p.mass * 32.0;
+        p.damper = p.mass * 3.2;
+        p.finalize();
+        self.tuned = Some(Box::new(p));
+    }
+}
+
+impl Vehicles {
+    pub fn new() -> Vehicles {
+        Vehicles { traffic_target: 0, rng: 12345, ..Default::default() }
+    }
+
+    fn rand(&mut self) -> f32 {
+        let mut x = self.rng;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.rng = x;
+        (x % 100000) as f32 / 100000.0
+    }
+
+    /// Load a car directory into a shared GPU model.
+    pub fn load_model(&mut self, gpu: &mut Gpu, world: &mut World, dir: &Path) -> Result<Arc<CarModel>> {
+        self.load_model_cfg(gpu, world, dir, &CarConfig::default())
+    }
+
+    pub fn load_model_cfg(&mut self, gpu: &mut Gpu, world: &mut World, dir: &Path, cfg: &CarConfig) -> Result<Arc<CarModel>> {
+        let car = vehicle_model::load_car(&world.assets, dir)?;
+        let car_is_ambient = dir.file_name().map_or(false, |n| n.to_string_lossy().to_ascii_lowercase().starts_with("va_"));
+        let mut batches = Vec::new();
+        let mut merged: hashbrown::HashMap<(u32, u32, u32), MergeAcc> = hashbrown::HashMap::new();
+        // (which colour group each zone of the cabin trim takes: the vehicle's own table, its .r83)
+        let zone_table = crate::mc4::zone_groups_dir(dir);
+        // (lamp faces by type and side: the sum of their vertices and how many)
+        let mut lamp_acc: hashbrown::HashMap<(i32, bool), (Vec3, u32)> = hashbrown::HashMap::new();
+        let variants: Vec<(Slot, Vec<String>)> = vehicle_model::CUSTOM_SLOTS.iter().map(|&s| (s, car.variants(s))).collect();
+        let variant_labels: Vec<(Slot, Vec<String>)> = vehicle_model::CUSTOM_SLOTS.iter().map(|&s| (s, car.variant_labels(s))).collect();
+        let mut extra_variants: std::collections::HashSet<(String, usize)> = car.parts.iter().filter(|p| p.placed)
+            .filter_map(|p| vehicle_model::extra_part(&p.primary))
+            .map(|(sec, index)| (sec.to_string(), index)).collect();
+        // (a convertible whose roof moves: the options' CONVERTIBLE TOP row is its)
+        if car.has_roof_animation() {
+            extra_variants.insert((vehicle_model::ROOF_DOWN.to_string(), 0));
+        }
+        let only_part = std::env::var("MCLA_ONLY_PART").ok();
+        let hide_part = std::env::var("MCLA_HIDE_PART").ok();
+        let lamp_dump = std::env::var("MCLA_LAMP_DUMP").is_ok();
+        let mut glow_bones: Vec<(u8, Vec3, Vec3)> = Vec::new();
+        for (part, part_xf) in car.placed_parts_for(cfg) {
+            if let Some(f) = only_part.as_deref() {
+                if !f.split(',').any(|n| part.primary == n) {
+                    continue;
+                }
+            }
+            if let Some(f) = hide_part.as_deref() {
+                if f.split(',').any(|n| part.primary == n) {
+                    continue;
+                }
+            }
+            log::debug!("draw part {} ({} meshes, from_parent {})", part.primary, part.meshes.len(), part.from_parent);
+            // (the glow places: bones of the part's own skeleton, children of the `glow<kind>0` bones)
+            if let Some(sk) = crate::assets::load_resource_file(&part.file).ok().and_then(|res| mcla_formats::rage::skeleton::Skeleton::parse(&res).ok().flatten()) {
+                for (bi, b) in sk.bones.iter().enumerate() {
+                    let parent = sk.bones.get(b.parent).map_or(String::new(), |q| q.name.to_ascii_lowercase());
+                    let w = (part_xf * b.world).w_axis.truncate();
+                    if lamp_dump {
+                        eprintln!("lampbone {} {} {} {} parent {} {:.4} {:.4} {:.4} z {:.3} {:.3} {:.3}", car.name, part.primary, bi, if b.name.is_empty() { "-" } else { b.name.as_str() }, if parent.is_empty() { "-" } else { parent.as_str() }, w.x, w.y, w.z, b.world.z_axis.x, b.world.z_axis.y, b.world.z_axis.z);
+                    }
+                    if let Some(kind) = glow_bone_kind(&b.name.to_ascii_lowercase()) {
+                        glow_bones.push((kind, w, -(part_xf * b.world).z_axis.truncate().normalize_or_zero()));
+                    }
+                }
+            }
+            for (mi, (mesh, si)) in part.meshes.iter().enumerate() {
+                let bone_m = part.mesh_bone.get(mi).copied().unwrap_or(Mat4::IDENTITY);
+                let sh = if part.from_parent && !car.shaders_parent.is_empty() { car.shaders_parent.get(*si as usize) } else { car.shaders.get(*si as usize) };
+                let sname = sh.map(|s| s.name.as_str()).unwrap_or("");
+                // (CarbonFiberHood: the hood's painted meshes - part slots hood and hood_wide - are
+                // drawn by the carbon fibre program in place of the paint, sub_8235D500 at 0x8235DEE0.
+                // (approx.) by the port's branch for the CarbonFiber material; the hood's own
+                // program, PS_HoodCarbonFiber of cars/0x0d96b4f8, has other constants - lighting work)
+                let sname = if car_mode(sname) == MatMode::Paint && cfg.extra.get("carbon_hood").copied().unwrap_or(0) != 0 && vehicle_model::classify_slot(&part.primary, &part.names) == Slot::Hood { "CarbonFiber" } else { sname };
+                let mode = car_mode(sname);
+                // (lighting diagnostics: MCLA_MESH_DUMP lists a car's meshes - part, index, shader, size, box in the
+                // part's space; MCLA_HIDE_MESH=part:index,... leaves meshes out)
+                if std::env::var("MCLA_MESH_DUMP").is_ok() {
+                    log::info!("meshdump-xf {} {} part placement {:?}", car.name, part.primary, part_xf);
+                    let (mut mn, mut mx) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+                    for v in &mesh.positions {
+                        let w = bone_m.transform_point3(*v);
+                        mn = mn.min(w);
+                        mx = mx.max(w);
+                    }
+                    log::info!("meshdump {} {}:{} shader {} #{} verts {} box {:.2?} .. {:.2?} tex {:?}", car.name, part.primary, mi, sname, si, mesh.positions.len(), mn.to_array(), mx.to_array(), sh.map(|s| s.textures().map(|(_, n)| n.to_string()).collect::<Vec<_>>()));
+                }
+                if let Ok(h) = std::env::var("MCLA_HIDE_MESH") {
+                    if h.split(',').any(|e| e == format!("{}:{}", part.primary, mi)) {
+                        continue;
+                    }
+                }
+                if std::env::var("MCLA_TRIM_DUMP").is_ok() && (mode == MatMode::Interior || sname.to_ascii_lowercase().contains("carbon") || sname.to_ascii_lowercase().contains("caliper") || sname.to_ascii_lowercase().contains("brake")) {
+                    let mut u1: std::collections::BTreeMap<i32, u32> = Default::default();
+                    for u in &mesh.uv1 {
+                        *u1.entry((u.x * 10.0).round() as i32).or_insert(0) += 1;
+                    }
+                    log::info!("trim: part {} shader {} verts {} uv1x10 {:?} tex {:?} params {:?}", part.primary, sname, mesh.positions.len(), u1, sh.map(|s| s.textures().map(|(_, n)| n.to_string()).collect::<Vec<_>>()), sh.map(|s| s.params.iter().filter(|(_, p)| format!("{:?}", p).len() < 90).map(|(h, p)| format!("{:08x}={:?}", h, p)).collect::<Vec<_>>()));
+                }
+                // ambient cars have no cabin: their windows (glass above the belt line) are dark
+                // and opaque, marked per vertex for the shader; lamp lenses stay clear
+                let dark_above = if mode == MatMode::CarGlass && car_is_ambient { Some(0.82) } else { None };
+                // pick the colour map by its sampler name; never a normal map
+                const NORMAL_SAMPLERS: [u32; 2] = [0x8ac11cb0, 0x28038e05];
+                // (the traffic lamps' program, PSAmbientCarLight, has ONE texture and it is a colour map - the car's trim sheet - bound to the sampler called NormalSampler)
+                let amb_lamp_map = sname.eq_ignore_ascii_case("AmbientCarLight") && std::env::var("MCLA_CARPARTS_OLD").is_err();
+                let all_tex: Vec<(u32, String)> = sh.map(|s| s.textures().filter(|(h, _)| !NORMAL_SAMPLERS.contains(h) || amb_lamp_map).map(|(h, n)| (h, n.to_string())).collect()).unwrap_or_default();
+                let is_normal = |n: &str| {
+                    let l = n.to_ascii_lowercase();
+                    l.ends_with("_n.dds") || l.ends_with("_nm.dds") || l.contains("normal") || l.ends_with("_bs.dds")
+                };
+                let dn = all_tex
+                    .iter()
+                    .find(|(h, n)| *h == crate::world::ph::DIFFUSE && !is_normal(n))
+                    .or_else(|| all_tex.iter().find(|(_, n)| !is_normal(n)))
+                    .map(|x| x.1.clone());
+                let sn = all_tex.iter().find(|(_, n)| Some(n) != dn.as_ref() && !is_normal(n)).map(|x| x.1.clone()).or_else(|| dn.clone());
+                if log::log_enabled!(log::Level::Debug) && dn.is_none() && !all_tex.is_empty() {
+                    log::debug!("shader {} has only normal maps: {:?}", sname, all_tex);
+                }
+                let resolve = |gpu: &mut Gpu, world: &mut World, name: Option<&str>| -> (Arc<GpuTexture>, u32) {
+                    let Some(name) = name else { return (gpu.white.clone(), 0) };
+                    let h = mcla_formats::hash::joaat(name);
+                    if let Some(t) = gpu.textures.get(&h) {
+                        return (t.clone(), h);
+                    }
+                    if let Some(t) = car.textures.get(&h) {
+                        log::debug!("car texture {} from car dict: {}x{} {:?} name {:?} levels {}", name, t.width, t.height, t.format, t.name, t.levels.len());
+                        return (gpu.upload_texture(h, t), h);
+                    }
+                    if let Some(t) = world.texture_any(gpu, h) {
+                        return (t, h);
+                    }
+                    log::debug!("car texture miss: {} ({:#010x})", name, h);
+                    (gpu.white.clone(), 0)
+                };
+                log::debug!("mat {} mesh {} shader#{} {} mode {:?} tex {:?}", part.primary, mi, si, sname, mode, dn);
+                if mode == MatMode::Paint {
+                    if let Ok(f) = std::env::var("MCLA_VINYL_DUMP") {
+                        // the painted body in car space with its unwrap: "v pos normal uv", "t indices"
+                        use std::io::Write;
+                        let m = part_xf * bone_m;
+                        if let Ok(mut out) = std::fs::OpenOptions::new().create(true).append(true).open(&f) {
+                            let _ = writeln!(out, "m {} {} {}", car.name, part.primary, mi);
+                            for k in 0..mesh.positions.len() {
+                                let p = m.transform_point3(mesh.positions[k]);
+                                let n = m.transform_vector3(mesh.normals.get(k).copied().unwrap_or(Vec3::Y));
+                                let u = mesh.uv0.get(k).copied().unwrap_or_default();
+                                let u1 = mesh.uv1.get(k).copied().unwrap_or_default();
+                                let u2 = mesh.uv2.get(k).copied().unwrap_or_default();
+                                let c = mesh.colors.get(k).copied().unwrap_or_default();
+                                let _ = writeln!(out, "v {:.4} {:.4} {:.4} {:.3} {:.3} {:.3} {:.5} {:.5} {:.5} {:.5} {:.5} {:.5} {} {} {} {}", p.x, p.y, p.z, n.x, n.y, n.z, u.x, u.y, u1.x, u1.y, u2.x, u2.y, c[0], c[1], c[2], c[3]);
+                            }
+                            for t in mesh.indices.chunks_exact(3) {
+                                let _ = writeln!(out, "t {} {} {}", t[0], t[1], t[2]);
+                            }
+                        }
+                    }
+                }
+                if mode == MatMode::Paint && std::env::var("MCLA_UV_LOG").is_ok() {
+                    let (mut u0, mut u1) = (glam::Vec2::splat(9e9), glam::Vec2::splat(-9e9));
+                    for u in &mesh.uv0 {
+                        u0 = u0.min(*u);
+                        u1 = u1.max(*u);
+                    }
+                    log::info!("paint uv {} {} mesh {} verts {} uv0 {} range {:?}..{:?}", car.name, part.primary, mi, mesh.positions.len(), mesh.uv0.len(), u0, u1);
+                }
+                if log::log_enabled!(log::Level::Debug) && std::env::var("MCLA_SHADER_DUMP").is_ok() {
+                    if let Some(sh) = sh {
+                        log::debug!("shaderdump {} #{} params {:?}", sname, si, sh.params.iter().map(|(h, p)| format!("{:08x}={:?}", h, p)).collect::<Vec<_>>());
+                    }
+                }
+                if log::log_enabled!(log::Level::Debug) && mode == MatMode::Light {
+                    if let Some(sh) = sh {
+                        log::debug!("light shader {} params {:?}", sname, sh.params.iter().map(|(h, p)| format!("{:08x}={:?}", h, p)).collect::<Vec<_>>());
+                    }
+                    let mut cols: hashbrown::HashMap<[u8; 4], u32> = hashbrown::HashMap::new();
+                    for c in &mesh.colors {
+                        *cols.entry(*c).or_insert(0) += 1;
+                    }
+                    let mut c1: hashbrown::HashMap<[u8; 4], u32> = hashbrown::HashMap::new();
+                    for c in &mesh.colors1 {
+                        *c1.entry(*c).or_insert(0) += 1;
+                    }
+                    let (mut u0, mut u1) = (glam::Vec2::splat(9e9), glam::Vec2::splat(-9e9));
+                    for u in &mesh.uv1 {
+                        u0 = u0.min(*u);
+                        u1 = u1.max(*u);
+                    }
+                    let mut cv: Vec<_> = cols.into_iter().collect();
+                    cv.sort_by_key(|x| std::cmp::Reverse(x.1));
+                    cv.truncate(6);
+                    let mut c1v: Vec<_> = c1.into_iter().collect();
+                    c1v.sort_by_key(|x| std::cmp::Reverse(x.1));
+                    c1v.truncate(4);
+                    log::debug!("light mesh {} #{} verts {} colors(argb) {:?} colors1 {:?} uv1 {:?}..{:?} names {:?}", part.primary, mi, mesh.positions.len(), cv, c1v, u0, u1, part.names.iter().take(12).collect::<Vec<_>>());
+                }
+                let (d, k0) = if sname.eq_ignore_ascii_case("LicensePlate") && dn.is_none() {
+                    plate_texture(gpu, world)
+                } else {
+                    resolve(gpu, world, dn.as_deref())
+                };
+                let (s2, k1) = resolve(gpu, world, sn.as_deref());
+                // (render only, blade round - PS_CarbonFiber's NormalSampler, the weave's normal map, rides as the CarbonFiber
+                // meshes' second texture; city.wgsl reads it in the carbon branch. MCLA_CARBON_OLD=1: none)
+                let (s2, k1) = if sname.eq_ignore_ascii_case("CarbonFiber") && !car_is_ambient && std::env::var("MCLA_CARBON_OLD").is_err() { carbon_weave(gpu, world) } else { (s2, k1) };
+                // meshes sharing textures and material mode are merged into one draw
+                let acc = merged.entry((k0, k1, mode as u32)).or_insert_with(|| MergeAcc { verts: Vec::new(), indices: Vec::new(), d, s2, sname: sname.to_string(), mode, min: Vec3::splat(f32::INFINITY), max: Vec3::splat(f32::NEG_INFINITY) });
+                // (the glass over a lamp is its lens: red over the tail lamps, clear elsewhere -
+                // the game tints it from a table per lamp, BumpedTintColors)
+                let pn = part.primary.to_ascii_lowercase();
+                let (glass, lamp) = (sname.to_ascii_lowercase().contains("bumpedglass"), mode == MatMode::Light);
+                if lamp {
+                    let xf = part_xf * bone_m;
+                    // (MCLA_LAMP_DUMP: every lamp mesh in full - vertices with their lamp id, triangles; work/lighting/fe_lamps.py)
+                    if std::env::var("MCLA_LAMP_DUMP").is_ok() {
+                        for (k, p) in mesh.positions.iter().enumerate() {
+                            let w = xf.transform_point3(*p);
+                            eprintln!("lampv {} {} {} {} {} {:.4} {:.4} {:.4}", car.name, part.primary, mi, k, mesh.uv1.get(k).map_or(-1, |u| u.x.round() as i32), w.x, w.y, w.z);
+                        }
+                        for t in mesh.indices.chunks_exact(3) {
+                            eprintln!("lampt {} {} {} {} {} {}", car.name, part.primary, mi, t[0], t[1], t[2]);
+                        }
+                    }
+                    for (k, p) in mesh.positions.iter().enumerate() {
+                        let id = mesh.uv1.get(k).map_or(-1, |u| u.x.round() as i32);
+                        if matches!(id, 0 | 1 | 3 | 6 | 12 | 13 | 14) {
+                            let w = xf.transform_point3(*p);
+                            let e = lamp_acc.entry((id, w.x > 0.0)).or_insert((Vec3::ZERO, 0));
+                            e.0 += w;
+                            e.1 += 1;
+                            if std::env::var("MCLA_GLOW_DUMP").is_ok() {
+                                eprintln!("lampvert {} {} mesh {} id {} {:.4} {:.4} {:.4}", car.name, part.primary, mi, id, w.x, w.y, w.z);
+                            }
+                        }
+                    }
+                }
+                let lens = if (glass || lamp) && (pn.contains("tail") || pn.contains("brake")) {
+                    1.0
+                } else if glass {
+                    2.0
+                } else {
+                    0.0
+                };
+                let first = acc.verts.len();
+                acc.push(mesh, part_xf * bone_m, dark_above, lens);
+                // (render only - car parts drawn by their own programs' rules in city.wgsl, see
+                // work/lighting bs3.py / bmprobe.py / cglassprobe.py: the material's terms ride in
+                // the vertices. BumpSpec family: uv2 = (-(1 + 200 smoothness + 256 x 200
+                // SpecularColor), 1 + base r + 256 base g), uv1 = (base b + 256 x 32 SpecMapExp, 0),
+                // colour alpha = 10 metallic + 16 cut-out + 32 cabin part + 64 GrillOpaque (its
+                // soft reflection goes by the texture). Brushed metal: uv2.x =
+                // 1 + ReflectColorMod. Opaque black glass: uv2.x = 1. Cabin paint: colour alpha 32
+                // (the cabin's own-lamp colours are the gauge colours, not the outside lamps').)
+                // (MCLA_CARPARTS_OLD=1 with MCLA_DEBUG_VIEW=72: everything as it was before this, for comparison)
+                if !car_is_ambient && std::env::var("MCLA_CARPARTS_OLD").is_err() {
+                    use mcla_formats::rage::drawable::ShaderParam;
+                    let pv = |h: u32, d: f32| sh.and_then(|s| s.params.iter().find_map(|(ph, p)| match p { ShaderParam::Vector(v) if *ph == h && !v.is_empty() => Some(v[0]), _ => None })).unwrap_or(glam::Vec4::splat(d));
+                    let by = |x: f32, k: f32| if x.is_finite() { (x.abs() * k).round().clamp(0.0, 255.0) } else { 0.0 };
+                    let cabin = pn.starts_with("interior") || pn.contains("_int") || pn.starts_with("seats") || pn.starts_with("steer_whl");
+                    let alpha_cut = sname.eq_ignore_ascii_case("BumpSpecAlpha");
+                    let spec_map = sname.eq_ignore_ascii_case("GrillOpaque");
+                    if sname.eq_ignore_ascii_case("BumpSpec") || alpha_cut || spec_map {
+                        let (bc, e, k, s, m) = (pv(0x1468b111, 1.0), pv(0xb37a7946, 1.0).x, pv(0xa98e2243, 0.0).x, pv(0x5e315fd1, 0.0).x, pv(0x83697767, 0.0).x);
+                        let a = (by(m, 10.0).min(15.0) + if alpha_cut { 16.0 } else { 0.0 } + if cabin { 32.0 } else { 0.0 } + if spec_map { 64.0 } else { 0.0 }) as u8;
+                        for v in &mut acc.verts[first..] {
+                            v.uv2 = [-(1.0 + by(s, 200.0) + 256.0 * by(k, 200.0)), 1.0 + by(bc.x, 255.0) + 256.0 * by(bc.y, 255.0)];
+                            v.uv1 = [by(bc.z, 255.0) + 256.0 * by(e, 32.0), 0.0];
+                            v.color[3] = a;
+                        }
+                    } else if sname.eq_ignore_ascii_case("BrushedMetal") {
+                        let rc = pv(0xaffa32ba, 1.0).x;
+                        for v in &mut acc.verts[first..] {
+                            v.uv2 = [1.0 + if rc.is_finite() { rc.clamp(0.0, 4.0) } else { 1.0 }, 0.0];
+                        }
+                    } else if sname.eq_ignore_ascii_case("BlackOpaqueGlass") {
+                        for v in &mut acc.verts[first..] {
+                            v.uv2 = [1.0, 0.0];
+                        }
+                    } else if sname.eq_ignore_ascii_case("CarbonFiber") && std::env::var("MCLA_CARBON_OLD").is_err() {
+                        // (render only - PS_CarbonFiber of cars/0x84fc57d9, city.wgsl: uv2.x = 2)
+                        for v in &mut acc.verts[first..] {
+                            v.uv2 = [2.0, 0.0];
+                        }
+                    } else if cabin && mode == MatMode::Paint {
+                        for v in &mut acc.verts[first..] {
+                            v.color[3] = 32;
+                        }
+                    } else if sname.eq_ignore_ascii_case("LicensePlate") && std::env::var("MCLA_PLATE_OLD").is_err() {
+                        // (render only - the number plate is drawn by its own program's rule,
+                        // PS_Plate of cars/0x94eca68d, city.wgsl: marked like a BumpSpec part with
+                        // the cut-out and the GrillOpaque bits both set, 16 + 64)
+                        for v in &mut acc.verts[first..] {
+                            v.uv2 = [-1.0, 1.0];
+                            v.uv1 = [0.0, 0.0];
+                            v.color[3] = 80;
+                        }
+                    }
+                }
+                // cabin trim: the colour group of the mesh's zone (uv1.x), by the vehicle's own
+                // table, rides in uv2.y as 100 + group (city.wgsl, mode 17; nothing else of that
+                // mode reads uv2.y) - the original builds the trim program's colour table from
+                // the same table every frame (sub_82358AE0)
+                if mode == MatMode::Interior {
+                    if let Some(table) = zone_table.as_ref() {
+                        for v in &mut acc.verts[first..] {
+                            let z = v.uv1[0].round();
+                            if (0.0..25.0).contains(&z) {
+                                v.uv2[1] = 100.0 + table[z as usize] as f32;
+                            }
+                        }
+                    }
+                }
+                // a part painted by itself: its colour in the vertices' own colour, marked by its
+                // alpha - the paint shader takes it in place of the car's (city.wgsl, mode paint)
+                if mode == MatMode::Paint {
+                    let kind = match vehicle_model::classify_slot(&part.primary, &part.names) {
+                        Slot::Hood => "hood",
+                        Slot::Trunk => "trunk",
+                        Slot::BumperF => "bumper_f",
+                        Slot::BumperR => "bumper_r",
+                        Slot::Spoiler => "spoiler",
+                        Slot::Skirts => "skirts",
+                        Slot::DoorL | Slot::DoorR => "doors",
+                        _ => "",
+                    };
+                    // (the part's paint area rides in uv2.y, 8 + area, for the player's own
+                    // entry per area - the original's table per part slot, 0x82050FD0: hood and
+                    // hood_wide 2, bumper_r 4, bumper_f 3, skirts 5, the doors and their wide
+                    // ones 1, every other slot the body's. Nothing else of the paint reads uv2.y.)
+                    let area = match kind {
+                        "doors" => 1.0,
+                        "hood" => 2.0,
+                        "bumper_f" => 3.0,
+                        "bumper_r" => 4.0,
+                        "skirts" => 5.0,
+                        _ => 0.0,
+                    };
+                    if area > 0.0 && !pn.starts_with("subbum") {
+                        for v in &mut acc.verts[first..] {
+                            v.uv2[1] = 8.0 + area;
+                        }
+                    }
+                    if let Some(c) = cfg.part_paint.get(kind) {
+                        // (the colour is the screen's: the shader's paint is linear)
+                        let lin = |v: u8| ((v as f32 / 255.0).powf(2.2) * 255.0).round() as u8;
+                        for v in &mut acc.verts[first..] {
+                            v.color = [lin(c[0]), lin(c[1]), lin(c[2]), 255];
+                        }
+                    }
+                }
+            }
+        }
+        let mut keys: Vec<(u32, u32, u32)> = merged.keys().copied().collect();
+        keys.sort_by_key(|k| (k.2, k.0, k.1));
+        if std::env::var("MCLA_WHEEL_DUMP").is_ok() {
+            if let Some(h) = car.hubs {
+                // profile of the body over the front and rear wheel and at mid-car
+                for (label, z) in [("front hub", h[0].z), ("rear hub", h[2].z), ("middle", 0.0)] {
+                    let mut ys: Vec<f32> = Vec::new();
+                    for acc in merged.values().filter(|a| a.mode == MatMode::Paint) {
+                        for v in &acc.verts {
+                            if (v.pos[2] - z).abs() < 0.05 && v.pos[0].abs() > h[1].x.abs() - 0.02 {
+                                ys.push(v.pos[1]);
+                            }
+                        }
+                    }
+                    ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    log::info!("body profile {} (z {:.2}): {} outer paint verts, lowest {:?}", label, z, ys.len(), ys.iter().take(6).collect::<Vec<_>>());
+                }
+                let mut lo = f32::INFINITY;
+                let mut which = String::new();
+                for acc in merged.values() {
+                    for v in &acc.verts {
+                        if v.pos[1] < lo {
+                            lo = v.pos[1];
+                            which = acc.sname.clone();
+                        }
+                    }
+                }
+                log::info!("body lowest vertex y {:.3} in shader {}", lo, which);
+            }
+        }
+        for k in keys {
+            let acc = merged.remove(&k).unwrap();
+            if acc.indices.is_empty() {
+                continue;
+            }
+            let bind = gpu.texture_bind_group(&acc.d, &acc.s2, k.0, k.1);
+            let vb = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&acc.verts), usage: wgpu::BufferUsages::VERTEX });
+            let ib = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&acc.indices), usage: wgpu::BufferUsages::INDEX });
+            batches.push(GpuBatch { shader: acc.sname, vb, ib, count: acc.indices.len() as u32, bind, mode: acc.mode, min: acc.min, max: acc.max });
+        }
+        let mut params = car_params(&car);
+        // cars with the original's tuning drive on the ported simulation (MCLA_OLD_PHYSICS keeps the simple model)
+        let simtunes = if std::env::var("MCLA_OLD_PHYSICS").is_ok() { None } else { car.simtune.clone() };
+        if let Some(s) = simtunes.as_ref() {
+            let mut vt = crate::physics::vehsim::VehTune::new(s.base.clone());
+            vt.bike = car.bike;
+            if let Some(hubs) = car.hubs {
+                vt.seat((hubs[0].y + hubs[2].y) * 0.5);
+            }
+            params.veh = Some(Arc::new(vt));
+            // (the body's collision hull, shaped as the game shapes it for this tuning)
+            if let (Some(h), Some(hubs)) = (car.hull.as_ref(), car.hubs) {
+                params.hull = Some(Arc::new(crate::physics::hull::shaped(h, &s.base, (hubs[0].y + hubs[2].y) * 0.5, car.bike)));
+            }
+            let d = &s.base.damage;
+            if d.max_damage > 1.0 && d.wipeout_threshold > 1.0 {
+                params.dmg = [d.max_damage, d.med_damage, d.impact_threshold, d.fatal_blow, d.wipeout_threshold];
+            }
+        }
+        log::info!("car {}: hubs {:?} bounds {:?}..{:?} wheel radius {:.3}", car.name, car.hubs, car.min, car.max, params.wheel_radius);
+        let params_mods = car_params_mods(&car, &params);
+        log::info!("car model {}: {} batches, mass {:.0}", car.name, batches.len(), params.mass);
+        // stock wheels: whl_stk_<car> for the base cars, whld_stk_<car> for the DLC set
+        let base_name = car.name.to_ascii_lowercase().replace("_dub", "");
+        let rims_root = world.assets.root.join("resources/rims");
+        let cands = [
+            base_name.strip_prefix("vpd_").map(|n| format!("whld_stk_{n}")),
+            base_name.strip_prefix("vp_").map(|n| format!("whl_stk_{n}")),
+            // a few are stored without the model year
+            base_name.strip_prefix("vp_").and_then(|n| n.rsplit_once('_').map(|(a, _)| format!("whl_stk_{a}"))),
+        ];
+        let tyre = if car.bike { "tir_bike" } else { "tir_car" };
+        let rim_ratio = if car.bike { 0.812 } else { stock_rim_ratio(&world.assets.root, &car.name, params.wheel_radius) };
+        let mut wheels = None;
+        let mut rim_dir = None;
+        for c in cands.iter().flatten() {
+            let dir = rims_root.join(c);
+            if dir.is_dir() {
+                wheels = self.wheel_set(gpu, world, &dir, tyre, rim_ratio);
+                rim_dir = Some(dir);
+                break;
+            }
+        }
+        if std::env::var("MCLA_PARTS_DUMP").is_ok() {
+            for p in &car.parts {
+                let l = p.primary.to_ascii_lowercase();
+                if ["gauge", "scissor", "door", "steer", "blower", "post"].iter().any(|k| l.contains(k)) {
+                    log::info!("part {} placed {} stock {} meshes {} box {:?}..{:?} at {:?} names {:?}", p.primary, p.placed, p.stock, p.meshes.len(), p.min, p.max, p.transform.w_axis, p.names.iter().take(4).collect::<Vec<_>>());
+                }
+            }
+        }
+        // the brakes: the car's own where the disc has them, else the plain set
+        let mut brake_dir = None;
+        let brakes = if car.bike {
+            None
+        } else {
+            let root = world.assets.root.join("resources/brakes");
+            let own = [base_name.strip_prefix("vpd_").map(|n| format!("brkd_stk_{n}")), base_name.strip_prefix("vp_").map(|n| format!("brk_stk_{n}"))];
+            let dir = own.iter().flatten().map(|n| root.join(n)).find(|d| d.is_dir()).unwrap_or_else(|| root.join("brk_car_base"));
+            let k = rim_ratio * ROTOR_OF_RIM;
+            let shift = brake_shift(wheels.as_ref().map_or(-0.2, |w: &Arc<WheelModel>| w.spoke_x));
+            let key = (dir.clone(), (k * 200.0).round() as u32, (shift * 200.0).round() as i32);
+            brake_dir = Some(dir.clone());
+            match self.brake_cache.get(&key) {
+                Some(b) => Some(b.clone()),
+                None => {
+                    let b = load_brakes(gpu, world, &dir, k, shift).map(Arc::new);
+                    if let Some(b) = b.as_ref() {
+                        self.brake_cache.insert(key, b.clone());
+                    }
+                    b
+                }
+            }
+        };
+        let lamps: Vec<(u8, Vec3)> = lamp_acc.iter().map(|((id, _), (sum, n))| (*id as u8, *sum / (*n).max(1) as f32)).collect();
+        let m = Arc::new(CarModel { name: car.name.clone(), lamps, glow_bones, batches, params, params_mods, simtunes, aitunes: car.aitune.clone(), rest_height: car.hubs.map(|h| (h[0].y + h[2].y) * 0.5), wheels, brakes, brake_dir, rim_dir, rim_ratio, bike: car.bike, min: car.min, max: car.max, cfg: cfg.clone(), variants, variant_labels, extra_variants });
+        self.models.push(m.clone());
+        if self.wheels.is_none() {
+            self.wheels = load_wheels(gpu, world).map(Arc::new);
+        }
+        Ok(m)
+    }
+
+    /// Tyre + rim model for a rim directory, loaded once.
+    /// The garage's BRAKES choice on the player's car (`None`: the car's own).
+    pub fn set_player_brake(&mut self, gpu: &mut Gpu, world: &mut World, name: Option<&str>) {
+        // (the car's own brake too: it stands behind the spokes of the rim now fitted)
+        let Some((ratio, spoke_x, own)) = self.player().filter(|c| !c.model.bike).map(|c| (c.model.rim_ratio, c.wheels.as_ref().or(c.model.wheels.as_ref()).map_or(-0.2, |w| w.spoke_x), c.model.brake_dir.clone())) else { return };
+        let k = ratio * ROTOR_OF_RIM;
+        let shift = brake_shift(spoke_x);
+        let Some(dir) = name.map(|n| world.assets.root.join("resources/brakes").join(n)).or(own) else { return };
+        let tag = format!("{}@{:.3}@{:.3}", dir.display(), k, shift);
+        if tag == self.player_brake_name {
+            return;
+        }
+        let key = (dir.clone(), (k * 200.0).round() as u32, (shift * 200.0).round() as i32);
+        self.player_brake = match self.brake_cache.get(&key) {
+            Some(b) => Some(b.clone()),
+            None => {
+                let b = load_brakes(gpu, world, &dir, k, shift).map(Arc::new);
+                if let Some(b) = b.as_ref() {
+                    self.brake_cache.insert(key, b.clone());
+                }
+                b
+            }
+        };
+        self.player_brake_name = tag;
+    }
+
+    /// The garage's TIRES choice on the player's car (a set's name; empty = the plain set).
+    pub fn set_player_tire(&mut self, gpu: &mut Gpu, world: &mut World, name: &str) {
+        if self.player_tire == name {
+            return;
+        }
+        self.player_tire = name.to_string();
+        let Some((bike, stock)) = self.player().map(|c| (c.model.bike, c.model.rim_dir.clone().map(|d| (d, c.model.rim_ratio)))) else { return };
+        if bike {
+            return;
+        }
+        if let Some((dir, ratio)) = self.player_rim.clone().or(stock) {
+            self.tire_now = self.player_tire.clone();
+            let w = self.wheel_set(gpu, world, &dir, "tir_car", ratio);
+            self.tire_now.clear();
+            if let Some(p) = self.player_mut() {
+                p.wheels = w;
+            }
+        }
+    }
+
+    fn wheel_set(&mut self, gpu: &mut Gpu, world: &mut World, rim_dir: &Path, tyre: &str, rim_ratio: f32) -> Option<Arc<WheelModel>> {
+        // (every tyre has a set of textures: the one chosen, else the first of the garage's
+        // list - a zero in a vehicle's record)
+        let set = if !self.tire_now.is_empty() { self.tire_now.clone() } else if tyre == "tir_bike" { "tir_bike_pir_corsa3".to_string() } else { "tir_car_bfg_kdw_blk".to_string() };
+        let key = (rim_dir.to_path_buf(), format!("{tyre}+{set}"), (rim_ratio * 200.0).round() as u32);
+        if let Some(w) = self.wheel_cache.get(&key) {
+            return Some(w.clone());
+        }
+        let w = Arc::new(load_wheels_with(gpu, world, rim_dir, tyre, rim_ratio, Some(&set))?);
+        self.wheel_cache.insert(key, w.clone());
+        Some(w)
+    }
+
+    /// Step 19d: the cars that came with a set-up's name (`vinyl_name`: a rival's, a
+    /// hookman's, the payback's cars) are put into it - one car a call, since a model may
+    /// have to be built: the model with the set-up's parts, its rims at their size on its
+    /// tires, its brakes, its paints (`CarLook`), its share of upgrades. `resolve(car,
+    /// set-up)` reads the set-up (`Game::mc4_dress_of`). Returns the car dressed.
+    pub fn dress_setups(&mut self, gpu: &mut Gpu, world: &mut World, resolve: &mut dyn FnMut(&str, &str) -> Option<Dress>) -> Option<usize> {
+        let i = self.cars.iter().position(|c| !c.is_player && !c.dressed && !c.vinyl_name.is_empty() && c.parked.is_none())?;
+        self.cars[i].dressed = true;
+        let name = self.cars[i].model.name.clone();
+        let d = resolve(&name, &self.cars[i].vinyl_name)?;
+        let dir = world.assets.root.join("resources/vehicle").join(&name);
+        let model = match self.models.iter().find(|m| m.name == name && m.cfg == d.cfg) {
+            Some(m) => m.clone(),
+            None if dir.is_dir() => match self.load_model_cfg(gpu, world, &dir, &d.cfg) {
+                Ok(m) => m,
+                Err(e) => {
+                    log::warn!("vehicles: {} could not be built in its set-up {}: {}", name, self.cars[i].vinyl_name, e);
+                    self.cars[i].model.clone()
+                }
+            },
+            None => self.cars[i].model.clone(),
+        };
+        let mut wheels = None;
+        let mut brake = None;
+        if !model.bike {
+            let ratio = if d.inches > 0 { rim_ratio_for(d.inches as f32, model.params.wheel_radius) } else { model.rim_ratio };
+            if let Some(rd) = d.rim_dir.clone().or(model.rim_dir.clone()) {
+                self.tire_now = d.tire.clone();
+                wheels = self.wheel_set(gpu, world, &rd, "tir_car", ratio);
+                self.tire_now.clear();
+            }
+            // (the brake stands behind the spokes of the rim fitted, as the player's)
+            let spoke_x = wheels.as_ref().or(model.wheels.as_ref()).map_or(-0.2, |w| w.spoke_x);
+            if let Some(bdir) = d.brake.as_ref().map(|n| world.assets.root.join("resources/brakes").join(n)).filter(|p| p.is_dir()) {
+                let (k, shift) = (model.rim_ratio * ROTOR_OF_RIM, brake_shift(spoke_x));
+                let key = (bdir.clone(), (k * 200.0).round() as u32, (shift * 200.0).round() as i32);
+                brake = match self.brake_cache.get(&key) {
+                    Some(b) => Some(b.clone()),
+                    None => {
+                        let b = load_brakes(gpu, world, &bdir, k, shift).map(Arc::new);
+                        if let Some(b) = b.as_ref() {
+                            self.brake_cache.insert(key, b.clone());
+                        }
+                        b
+                    }
+                };
+            }
+        }
+        let c = &mut self.cars[i];
+        c.model = model;
+        if wheels.is_some() {
+            c.wheels = wheels;
+        }
+        log::info!("vehicles: {} wears its set-up {}: rim {:?} at {} in, tires {:?}, brake {:?}, paint type {}, upgrades {:?}", name, c.vinyl_name, d.rim_dir.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string()), d.inches, d.tire, d.brake, d.look.paint_type, d.perf);
+        c.brake = brake;
+        c.color = d.color;
+        c.look = Some(Arc::new(d.look));
+        // (step 19e: and the set-up's plate)
+        if !d.plate.is_empty() && c.plate_text != d.plate {
+            c.plate_text = d.plate.clone();
+            c.plate = None;
+        }
+        // (a car that was given its share when it was made - a hookman's mod value - keeps it)
+        if let Some(p) = d.perf.filter(|_| c.perf == 0.0) {
+            c.set_perf(p);
+        }
+        Some(i)
+    }
+
+    pub fn spawn(&mut self, gpu: &Gpu, model: Arc<CarModel>, pos: Vec3, yaw: f32, color: [f32; 4], is_player: bool) -> usize {
+        let binding = gpu.new_object(&ObjectUniform::default());
+        let wheel_bindings = (0..4).map(|_| gpu.new_object(&ObjectUniform::default())).collect();
+        let caliper_bindings = (0..4).map(|_| gpu.new_object(&ObjectUniform::default())).collect();
+        let mut ai = None;
+        if !is_player {
+            let mut d = AiDriver::new(self.rng ^ 0x9e3779b9);
+            // (ambient traffic keeps to the road's speed - 40 mph on nearly every road, which is
+            // also every ambient type's fMaxSpeed - some a little under it)
+            d.target_speed = 17.88 * (0.86 + self.rand() * 0.14);
+            ai = Some(d);
+        }
+        self.cars.push(CarInstance { sst: 0.0, model, binding, wheel_bindings, caliper_bindings, state: CarState::new(pos, yaw), input: CarInput::default(), color, ai, placed: false, is_player, wheels: None, lean: 0.0, perf: 0.0, tuned: None, cop: false, stunned: 0.0, parked: None, settle: 0.0, racer: false, pinned: false, boost: 0.0, driver: String::new(), plate_text: String::new(), plate: None, vinyl_name: String::new(), vinyl: None, vinyl_done: false, setup: None, pose_history: Default::default(), inflict: 1.0, goon: false, look: None, brake: None, dressed: false, driver_set: String::new(), pu_ctl: 0, pu_ghost: false, pu_mirror: 0.0, pu_stealth: false });
+        self.cars.len() - 1
+    }
+
+    /// Swap the player's model/colour/kit (garage).
+    pub fn replace_player(&mut self, gpu: &mut Gpu, world: &mut World, dir: &Path, color: [f32; 4], cfg: &CarConfig, rim_dir: Option<&Path>) -> Result<()> {
+        let name = dir.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let model = match self.models.iter().find(|m| m.name == name && m.cfg == *cfg) {
+            Some(m) => m.clone(),
+            None => self.load_model_cfg(gpu, world, dir, cfg)?,
+        };
+        // aftermarket rims only when one is chosen; otherwise the car keeps its stock wheels
+        let ratio = if self.player_rim_inches > 0 { rim_ratio_for(self.player_rim_inches as f32, model.params.wheel_radius) } else { model.rim_ratio };
+        self.tire_now = self.player_tire.clone();
+        self.player_rim = match rim_dir {
+            Some(rd) if !rd.as_os_str().is_empty() && !model.bike => Some((rd.to_path_buf(), ratio)),
+            _ => model.rim_dir.clone().filter(|_| !model.bike).map(|d| (d, ratio)),
+        };
+        let custom = match rim_dir {
+            // (the stock rims with the tires chosen)
+            None if !model.bike && !self.player_tire.is_empty() => match model.rim_dir.clone() {
+                Some(rd) => self.wheel_set(gpu, world, &rd, "tir_car", ratio),
+                None => None,
+            },
+            Some(rd) if rd.as_os_str().is_empty() && !model.bike && !self.player_tire.is_empty() => match model.rim_dir.clone() {
+                Some(rd) => self.wheel_set(gpu, world, &rd, "tir_car", ratio),
+                None => None,
+            },
+            Some(rd) if !rd.as_os_str().is_empty() && !model.bike => self.wheel_set(gpu, world, rd, "tir_car", ratio),
+            // the stock rims in another size
+            _ if !model.bike && (ratio - model.rim_ratio).abs() > 0.004 => match model.rim_dir.clone() {
+                Some(rd) => self.wheel_set(gpu, world, &rd, "tir_car", ratio),
+                None => None,
+            },
+            _ => None,
+        };
+        self.tire_now.clear();
+        if let Some(p) = self.cars.iter_mut().find(|c| c.is_player) {
+            let pos = p.state.pos + Vec3::Y * 0.5;
+            let f = p.state.forward();
+            let yaw = (-f.x).atan2(-f.z);
+            p.model = model;
+            p.wheels = custom;
+            p.tuned = None;
+            p.setup = None;
+            let perf = p.perf;
+            p.set_perf(perf);
+            p.color = color;
+            p.state = CarState::new(pos, yaw);
+            p.pose_history.reset();
+            p.placed = false;
+        }
+        Ok(())
+    }
+
+    pub fn player(&self) -> Option<&CarInstance> {
+        self.cars.iter().find(|c| c.is_player)
+    }
+    pub fn player_mut(&mut self) -> Option<&mut CarInstance> {
+        self.cars.iter_mut().find(|c| c.is_player)
+    }
+
+    /// Cars that left the world (through a hole, or off the edge of what is loaded).
+    pub fn rescue_fallen(&mut self, world: &World, center: Vec3) {
+        // a car that dropped through a hole in the world: traffic is taken away, anything that
+        // matters goes back onto the road nearest to where it left the ground
+        for c in self.cars.iter_mut() {
+            if c.state.vel.y > -50.0 {
+                continue;
+            }
+            let from = c.state.pos + Vec3::Y * (c.state.vel.y * c.state.vel.y / 27.0);
+            let keep = c.is_player || c.pinned || c.racer || c.cop;
+            let spot = world.nav.as_ref().and_then(|nav| nav.nearest_link(from).map(|(i, t, _)| (nav.links[i].point_at(t), nav.links[i].b - nav.links[i].a)));
+if keep || c.state.pos.distance(center) < 450.0 {
+                log::warn!("car {} ({:.0} m away, parked {}, vel {:.0} {:.0} {:.0}) fell out of the world at {:.0} {:.0} {:.0}: {}", c.model.name, c.state.pos.distance(center), c.parked.is_some(), c.state.vel.x, c.state.vel.y, c.state.vel.z, c.state.pos.x, c.state.pos.y, c.state.pos.z, if keep { "back on the road" } else { "removed" });
+            }
+            match spot {
+                Some((p, dir)) if keep => {
+                    c.state.relocate(p + Vec3::Y * 0.6, glam::Quat::from_rotation_y((-dir.x).atan2(-dir.z)));
+                    c.state.vel = Vec3::ZERO;
+                    c.state.ang_vel = Vec3::ZERO;
+                    c.state.veh = None;
+                    c.placed = false;
+                    c.pose_history.reset();
+                }
+                _ => c.state.pos = center + Vec3::splat(1.0e5),
+            }
+        }
+        self.cars.retain(|c| c.is_player || c.pinned || c.racer || c.cop || c.state.pos.distance(center) < 1.0e4);
+    }
+
+    /// Keep `traffic_target` AI cars alive around `center`.
+    pub fn manage_traffic(&mut self, gpu: &Gpu, world: &World, center: Vec3, dt: f32) {
+        // despawn far cars
+        self.cars.retain(|c| c.is_player || c.pinned || c.parked.is_some() || c.state.pos.distance(center) < 420.0);
+        self.spawn_timer -= dt;
+        let n_traffic = self.cars.iter().filter(|c| !c.is_player && !c.cop && !c.racer && !c.pinned && c.parked.is_none()).count();
+        // the roads empty out at night (density over the day from the ambient tables)
+        let target = if self.traffic_target == 0 { 0 } else { ((self.traffic_target as f32 * self.ambient.density.at(self.hour)).round() as usize).max(1) };
+        if n_traffic >= target || self.spawn_timer > 0.0 || self.models.is_empty() {
+            return;
+        }
+        let Some(nav) = world.nav.as_ref() else { return };
+        // pick a random connected link 120..300 m away
+        let cands: Vec<usize> = nav.links_near(center, 300.0).filter(|&i| {
+            let l = &nav.links[i];
+            let d = l.a.distance(center);
+            !l.next.is_empty() && !l.prev.is_empty() && d > 110.0 && d < 300.0 && l.len > 20.0
+        }).collect();
+        if cands.is_empty() {
+            self.spawn_timer = 0.5;
+            return;
+        }
+        // roads a race script has thinned out or filled up
+        for (p, d) in std::mem::take(&mut self.road_density_new) {
+            for i in nav.links_near(p, 30.0) {
+                let l = &nav.links[i];
+                let ab = l.b - l.a;
+                let t = ((p - l.a).dot(ab) / ab.length_squared().max(1e-3)).clamp(0.0, 1.0);
+                let q = l.a + ab * t;
+                if (q.y - p.y).abs() < 7.0 && Vec3::new(q.x - p.x, 0.0, q.z - p.z).length() < 13.0 {
+                    self.road_density.insert(l.lane, d);
+                }
+            }
+        }
+        let li = cands[(self.rand() * cands.len() as f32) as usize % cands.len()];
+        let l = &nav.links[li];
+        if let Some(&d) = self.road_density.get(&l.lane) {
+            // 0 = kept clear, 3 and up = as busy as the city gets
+            if self.rand() >= d as f32 * 0.34 {
+                self.spawn_timer = 0.05;
+                return;
+            }
+        }
+        let t = 0.2 + self.rand() * 0.6;
+        let pos = l.point_at(t) + Vec3::Y * 0.8;
+        // keep distance from other cars
+        if self.cars.iter().any(|c| c.state.pos.distance(pos) < 25.0) {
+            self.spawn_timer = 0.2;
+            return;
+        }
+        let dir = l.dir();
+        let yaw = (-dir.x).atan2(-dir.z);
+        // ambient traffic uses the game's "va_" vehicles when they are loaded
+        let ambient: Vec<usize> = (0..self.models.len()).filter(|&i| self.models[i].name.starts_with("va_") && !is_trailer(&self.models[i].name)).collect();
+        let pool: Vec<usize> = if ambient.is_empty() { (0..self.models.len()).filter(|&i| !self.models[i].name.contains("police")).collect() } else { ambient };
+        if pool.is_empty() {
+            return;
+        }
+        let mut mi = pool[(self.rand() * pool.len() as f32) as usize % pool.len()];
+        // what drives in this district at this hour
+        let r = self.rand();
+        let models = &self.models;
+        if let Some(name) = self.ambient.pick(pos, self.hour, r, &|n| !is_trailer(n) && models.iter().any(|m| m.name.eq_ignore_ascii_case(n))) {
+            if let Some(i) = models.iter().position(|m| m.name.eq_ignore_ascii_case(name)) {
+                mi = i;
+            }
+        }
+        let model = self.models[mi].clone();
+        let color = if model.name.contains("taxi") {
+            [0.95, 0.72, 0.05, 0.0]
+        } else {
+            TRAFFIC_PALETTE[(self.rand() * TRAFFIC_PALETTE.len() as f32) as usize % TRAFFIC_PALETTE.len()]
+        };
+        let idx = self.spawn(gpu, model, pos, yaw, color, false);
+        if std::env::var("MCLA_SPAWN_DUMP").is_ok() {
+            log::info!("traffic spawn: link dir {:?} car forward {:?} dot {:.2}", dir, self.cars[idx].state.forward(), dir.dot(self.cars[idx].state.forward()));
+        }
+        if let Some(ai) = self.cars[idx].ai.as_mut() {
+            ai.link = Some(li);
+            ai.t = t;
+        }
+        self.spawn_timer = 0.3;
+    }
+
+    pub fn load_parking(&mut self, data_dir: &str) {
+        let p = std::path::Path::new(data_dir).join("resources/city/sc/0x2e3038ce.r62");
+        if let Ok(res) = crate::assets::load_resource_file(&p) {
+            self.parking = mcla_formats::rage::parking::parse_parking(&res);
+            self.park_grid.clear();
+            for (i, sp) in self.parking.iter().enumerate() {
+                self.park_grid.entry(((sp.pos.x / 64.0).floor() as i32, (sp.pos.z / 64.0).floor() as i32)).or_default().push(i);
+            }
+            log::info!("parking: {} spots", self.parking.len());
+        }
+        let root = std::path::Path::new(data_dir);
+        self.ambient = crate::ambient::Distribution::load(root, "va_");
+        self.park_small = crate::ambient::parked_small_spots(root);
+        self.hour = 12.0;
+        log::info!("ambient: {} traffic districts, {} small-car parking spots", self.ambient.types.len(), self.park_small.len());
+    }
+
+    /// Keep parked cars on the spots around `center` (a fixed share of the spots is
+    /// occupied, chosen by spot index so the city looks the same on every visit).
+    pub fn manage_parked(&mut self, gpu: &Gpu, center: Vec3) {
+        if self.parking.is_empty() || self.parked_target == 0 {
+            return;
+        }
+        self.cars.retain(|c| c.parked.is_none() || c.pinned || c.state.pos.distance(center) < 260.0);
+        let n_parked = self.cars.iter().filter(|c| c.parked.is_some()).count();
+        if n_parked >= self.parked_target {
+            return;
+        }
+        let pool: Vec<usize> = (0..self.models.len())
+            .filter(|&i| {
+                let n = &self.models[i].name;
+                n.starts_with("va_") && !is_large(n)
+            })
+            .collect();
+        if pool.is_empty() {
+            return;
+        }
+        let (cx, cz) = ((center.x / 64.0).floor() as i32, (center.z / 64.0).floor() as i32);
+        let mut spawned = 0;
+        'outer: for dx in -3..=3 {
+            for dz in -3..=3 {
+                let Some(list) = self.park_grid.get(&(cx + dx, cz + dz)).cloned() else { continue };
+                for si in list {
+                    // a quarter of the spots is taken (fParkedCarDensityFactor)
+                    let h = (si as u32).wrapping_mul(2654435761) >> 8;
+                    if h % 100 >= 25 {
+                        continue;
+                    }
+                    let sp = self.parking[si];
+                    let d = sp.pos.distance(center);
+                    if d > 190.0 || d < 25.0 {
+                        continue;
+                    }
+                    if self.cars.iter().any(|c| c.parked == Some(si) || c.state.pos.distance(sp.pos) < 4.5) {
+                        continue;
+                    }
+                    let mut mi = pool[(h / 100) as usize % pool.len()];
+                    let models = &self.models;
+                    let small = self.park_small.is_empty() || self.park_small.contains(&((sp.pos.x * 10.0).round() as i32, (sp.pos.z * 10.0).round() as i32));
+                    if small {
+                        // a random small car of the district
+                        let r = ((h / 31) % 1000) as f32 / 1000.0;
+                        if let Some(name) = self.ambient.pick(sp.pos, self.hour, r, &|n| !is_large(n) && models.iter().any(|m| m.name.eq_ignore_ascii_case(n))) {
+                            mi = models.iter().position(|m| m.name.eq_ignore_ascii_case(name)).unwrap_or(mi);
+                        }
+                    } else if let Some(i) = models.iter().position(|m| m.name.eq_ignore_ascii_case("va_cad_escalade_03")) {
+                        mi = i;
+                    }
+                    let model = self.models[mi].clone();
+                    let color = if model.name.contains("taxi") { [0.95, 0.72, 0.05, 0.0] } else { TRAFFIC_PALETTE[(h / 7) as usize % TRAFFIC_PALETTE.len()] };
+                    // the heading runs from +x towards +z; our yaw has forward = (-sin, 0, -cos)
+                    let flip = if (h / 13) % 2 == 0 { 0.0 } else { std::f32::consts::PI };
+                    let yaw = -(sp.heading + std::f32::consts::FRAC_PI_2) + flip;
+                    let idx = self.spawn(gpu, model, sp.pos + Vec3::Y * 0.9, yaw, color, false);
+                    self.cars[idx].ai = None;
+                    self.cars[idx].parked = Some(si);
+                    self.cars[idx].settle = 2.0;
+                    spawned += 1;
+                    if spawned >= 2 || n_parked + spawned >= self.parked_target {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Which livery file belongs to which car set-up (read once, then kept in a small index file).
+    fn ensure_vinyl_index(&mut self, world: &World) {
+        let root = &world.assets.root;
+        if self.vinyl_index.is_none() {
+            // which file is which set-up: read once, then kept in a small index file
+            let mut map = hashbrown::HashMap::new();
+            // (name, file, "1" if anything is painted on it: many set-ups are blank)
+            let index = root.join("opponent_vinyls2.tsv");
+            if let Ok(t) = std::fs::read_to_string(&index) {
+                for line in t.lines() {
+                    let mut it = line.split('\t');
+                    if let (Some(k), Some(f)) = (it.next(), it.next()) {
+                        map.insert(k.to_string(), std::path::PathBuf::from(f));
+                        if it.next() == Some("1") {
+                            self.vinyl_painted.insert(k.to_string());
+                        }
+                    }
+                }
+            }
+            if map.is_empty() {
+                let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(root.join("resources/opponent_vinyls")).map(|d| d.flatten().map(|e| e.path()).collect()).unwrap_or_default();
+                files.sort();
+                let mut out = String::new();
+                for f in files {
+                    let Ok(res) = crate::assets::load_resource_file(&f) else { continue };
+                    let rd = mcla_formats::rage::Rd::new(&res);
+                    let Some(t) = rd.ptr(8).and_then(|o| mcla_formats::rage::texture::Texture::parse(&rd, o).ok()) else { continue };
+                    let name = t.name.rsplit(['/', '\\']).next().unwrap_or("").split('.').next().unwrap_or("").to_ascii_lowercase();
+                    if !name.is_empty() {
+                        let painted = t.to_rgba8().chunks_exact(4).filter(|p| p[3] > 40).count() > 600;
+                        out.push_str(&format!("{}\t{}\t{}\n", name, f.display(), painted as u8));
+                        if painted {
+                            self.vinyl_painted.insert(name.clone());
+                        }
+                        map.insert(name, f);
+                    }
+                }
+                let _ = std::fs::write(&index, out);
+            }
+            log::info!("vehicles: {} opponent liveries", map.len());
+            self.vinyl_index = Some(map);
+        }
+    }
+
+    /// Is a livery of this name ready (loaded or painted)?
+    pub fn has_vinyl(&self, name: &str) -> bool {
+        self.vinyls.get(&name.to_ascii_lowercase()).map_or(false, |v| v.is_some())
+    }
+
+    /// Forget the painted liveries whose name starts with `prefix`, except `keep`.
+    pub fn drop_vinyls(&mut self, prefix: &str, keep: &str) {
+        let (prefix, keep) = (prefix.to_ascii_lowercase(), keep.to_ascii_lowercase());
+        self.vinyls.retain(|k, _| !k.starts_with(&prefix) || *k == keep);
+    }
+
+    /// Add a livery painted at run time (plain colour RGBA in the body's unwrap).
+    pub fn add_vinyl_texture(&mut self, gpu: &mut Gpu, name: &str, w: u32, h: u32, px: &[u8]) {
+        let name = name.to_ascii_lowercase();
+        let tex = Arc::new(crate::render::create_rgba(&gpu.device, &gpu.queue, w, h, px, "vinyl"));
+        let white = gpu.white.clone();
+        let key = mcla_formats::hash::joaat(&format!("vinyl:{name}")) | 1;
+        let bind = gpu.texture_bind_group3(&white, &white, &tex, key, key, key);
+        self.vinyls.insert(name, Some(bind));
+    }
+
+    /// The ready-made liveries the disc has for a car (set-up names, sorted).
+    pub fn vinyl_presets(&mut self, world: &World, car: &str) -> Vec<String> {
+        self.ensure_vinyl_index(world);
+        let tail = format!("_{}", car.to_ascii_lowercase());
+        let mut v: Vec<String> = self.vinyl_index.as_ref().map(|m| m.keys().filter(|k| k.ends_with(&tail) && self.vinyl_painted.contains(*k)).cloned().collect()).unwrap_or_default();
+        v.sort();
+        v
+    }
+
+    /// Liveries of named opponents: `resources/opponent_vinyls` holds one finished vinyl
+    /// texture per car set-up (stripes, sponsor logos), laid out in the body's unwrap
+    /// (first UV set; unpainted-side parts all point at one empty corner texel).
+    pub fn assign_vinyls(&mut self, gpu: &mut Gpu, world: &mut World) {
+        if !self.cars.iter().any(|c| !c.vinyl_done && !c.vinyl_name.is_empty()) {
+            return;
+        }
+        self.ensure_vinyl_index(world);
+        for i in 0..self.cars.len() {
+            if self.cars[i].vinyl_done || self.cars[i].vinyl_name.is_empty() {
+                continue;
+            }
+            self.cars[i].vinyl_done = true;
+            let name = self.cars[i].vinyl_name.to_ascii_lowercase();
+            // the set-up's wheels: tyre sizes, track and ride height
+            if let Ok(cfg) = std::fs::read(world.assets.root.join("resources/vehicle/configs").join(format!("{name}.xcc"))) {
+                self.cars[i].set_setup(&cfg);
+            }
+            // the set-up's rim size (the rivals run 19 to 24 inch rims)
+            let model = self.cars[i].model.clone();
+            if let (Some(dir), false, Some(inches)) = (model.rim_dir.as_ref(), model.bike, config_rim_inches(&world.assets.root, &name)) {
+                let ratio = rim_ratio_for(inches, model.params.wheel_radius);
+                if (ratio - model.rim_ratio).abs() > 0.01 {
+                    self.cars[i].wheels = self.wheel_set(gpu, world, dir, "tir_car", ratio);
+                }
+            }
+            if !self.vinyls.contains_key(&name) {
+                let tex = self.vinyl_index.as_ref().and_then(|m| m.get(&name)).and_then(|f| crate::assets::load_resource_file(f).ok()).and_then(|res| {
+                    let rd = mcla_formats::rage::Rd::new(&res);
+                    rd.ptr(8).and_then(|o| mcla_formats::rage::texture::Texture::parse(&rd, o).ok()).map(|t| (t.width, t.height, t.to_rgba8()))
+                });
+                let bind = tex.map(|(w, h, mut px)| {
+                    // the finished liveries hold colour times alpha: back to plain colour
+                    for p in px.chunks_exact_mut(4) {
+                        let a = p[3] as u32;
+                        if a > 0 && a < 255 {
+                            for c in &mut p[..3] {
+                                *c = ((*c as u32 * 255 + a / 2) / a).min(255) as u8;
+                            }
+                        }
+                    }
+                    let tex = Arc::new(crate::render::create_rgba(&gpu.device, &gpu.queue, w, h, &px, "vinyl"));
+                    let white = gpu.white.clone();
+                    let key = mcla_formats::hash::joaat(&format!("vinyl:{name}")) | 1;
+                    gpu.texture_bind_group3(&white, &white, &tex, key, key, key)
+                });
+                log::info!("vehicles: livery {} {}", name, if bind.is_some() { "loaded" } else { "not found" });
+                self.vinyls.insert(name.clone(), bind);
+            }
+            self.cars[i].vinyl = self.vinyls.get(&name).cloned().flatten();
+        }
+    }
+
+    /// Give every car that has none a plate: the Californian background of the disc with
+    /// the text set in the game's plate font (`vehicle/shared_font/fnt_license_plate.dds`:
+    /// 8 x 5 cells of 32 px, "0-9A-Z" then hand, plus, star, heart for "[\\]^").
+    pub fn assign_plates(&mut self, gpu: &mut Gpu, world: &World) {
+        if !self.cars.iter().any(|c| c.plate.is_none() && c.placed) {
+            return;
+        }
+        if self.plate_art.is_none() {
+            let root = &world.assets.root;
+            let font = std::fs::read(root.join("vehicle/shared_font/fnt_license_plate.dds")).ok().and_then(|d| mcla_formats::dds::parse_dds("fnt_license_plate", &d).ok()).filter(|t| t.width == 256 && t.height == 256).map(|t| t.to_rgba8());
+            let dir = root.join("resources/license_plates/backgrounds/plate_ca_00");
+            let file = std::fs::read_dir(&dir).ok().and_then(|rd| rd.flatten().map(|e| e.path()).find(|p| p.extension().map_or(false, |x| x == "r1")));
+            let bg = file.and_then(|f| crate::assets::load_resource_file(&f).ok()).and_then(|res| {
+                let rd = mcla_formats::rage::Rd::new(&res);
+                rd.ptr(0).and_then(|o| mcla_formats::rage::texture::Texture::parse(&rd, o).ok()).map(|t| (t.width, t.height, t.to_rgba8()))
+            });
+            self.plate_art = Some(match (bg, font) {
+                (Some((w, h, px)), Some(f)) => (w, h, px, f),
+                _ => (0, 0, Vec::new(), Vec::new()),
+            });
+        }
+        let Some((w, h, bg, font)) = self.plate_art.clone() else { return };
+        if w == 0 {
+            // no art: stop trying
+            let white = gpu.white.clone();
+            let b = gpu.texture_bind_group(&white, &white, 0, 0);
+            for c in self.cars.iter_mut().filter(|c| c.plate.is_none()) {
+                c.plate = Some(b.clone());
+            }
+            return;
+        }
+        for i in 0..self.cars.len() {
+            if self.cars[i].plate.is_some() || !self.cars[i].placed {
+                continue;
+            }
+            if self.cars[i].plate_text.is_empty() {
+                // "2BBE748": digit, three letters, three digits
+                self.plate_serial = self.plate_serial.wrapping_mul(1664525).wrapping_add(1013904223);
+                let mut r = self.plate_serial >> 4;
+                let mut next = |n: u32| {
+                    let v = r % n;
+                    r = r / n ^ (r << 7);
+                    v
+                };
+                let mut t = String::new();
+                t.push((b'1' + next(8) as u8) as char);
+                for _ in 0..3 {
+                    t.push((b'A' + next(26) as u8) as char);
+                }
+                for _ in 0..3 {
+                    t.push((b'0' + next(10) as u8) as char);
+                }
+                self.cars[i].plate_text = t;
+            }
+            let text = self.cars[i].plate_text.to_ascii_uppercase();
+            // (the player's plate on its own background)
+            let own_bg = self.player_plate_bg.clone().filter(|n| self.cars[i].is_player && n != "plate_ca_00").and_then(|n| {
+                let art = self.plate_bgs.entry(n.clone()).or_insert_with(|| {
+                    // (a background's folder holds two files; the texture is the one with an
+                    // object behind its root pointer - not always the first of the two)
+                    let dir = world.assets.root.join("resources/license_plates/backgrounds").join(&n);
+                    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir).ok().map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.extension().map_or(false, |x| x == "r1")).collect()).unwrap_or_default();
+                    files.sort();
+                    files.into_iter().find_map(|f| {
+                        let res = crate::assets::load_resource_file(&f).ok()?;
+                        let rd = mcla_formats::rage::Rd::new(&res);
+                        rd.ptr(0).and_then(|o| mcla_formats::rage::texture::Texture::parse(&rd, o).ok()).map(|t| (t.width, t.height, t.to_rgba8()))
+                    })
+                });
+                art.clone().map(|a| (n, a))
+            });
+            let (slot, w, h, bg) = match own_bg {
+                Some((n, (bw, bh, px))) => (format!("{text}@{n}"), bw, bh, px),
+                None => (text.clone(), w, h, bg.clone()),
+            };
+            if !self.plates.contains_key(&slot) {
+                let (w, h) = (w as usize, h as usize);
+                let mut px = bg.clone();
+                let chars: Vec<char> = text.chars().take(8).collect();
+                // glyphs fill the middle band of the plate
+                let ch = (h as f32 * 0.50) as usize;
+                let cw = ((w as f32 * 0.86) / chars.len().max(6) as f32).min(ch as f32 * 0.72) as usize;
+                let x0 = (w - cw * chars.len()) / 2;
+                let y0 = (h as f32 * 0.30) as usize;
+                for (k, c) in chars.iter().enumerate() {
+                    let cell = match *c {
+                        '0'..='9' => *c as usize - '0' as usize,
+                        'A'..='Z' => 10 + *c as usize - 'A' as usize,
+                        '[' => 36,
+                        '\\' => 37,
+                        ']' => 38,
+                        '^' => 39,
+                        _ => continue,
+                    };
+                    let (gx, gy) = (cell % 8 * 32, cell / 8 * 32);
+                    for y in 0..ch {
+                        for x in 0..cw {
+                            let (sx, sy) = (gx + x * 32 / cw, gy + y * 32 / ch);
+                            let a = font[(sy * 256 + sx) * 4 + 3] as u32;
+                            if a == 0 {
+                                continue;
+                            }
+                            let o = ((y0 + y) * w + x0 + k * cw + x) * 4;
+                            // embossed dark blue characters (PS_Plate's letter colour, c109: 0.1412 0.1647 0.3412)
+                            for (j, ink) in [36u32, 42, 87].iter().enumerate() {
+                                px[o + j] = ((px[o + j] as u32 * (255 - a) + ink * a) / 255) as u8;
+                            }
+                        }
+                    }
+                }
+                let tex = Arc::new(crate::render::create_rgba(&gpu.device, &gpu.queue, w as u32, h as u32, &px, "plate"));
+                let key = mcla_formats::hash::joaat(&format!("plate:{slot}")) | 1;
+                let bind = gpu.texture_bind_group(&tex, &tex, key, key);
+                self.plates.insert(slot.clone(), bind);
+            }
+            self.cars[i].plate = self.plates.get(&slot).cloned();
+        }
+    }
+
+    /// Physics + AI for every car.
+    pub fn update(&mut self, world: &World, player_input: CarInput, dt: f32) {
+        self.clock += dt;
+        let n = self.cars.len();
+        // AI inputs (with simple car-ahead avoidance)
+        let positions: Vec<(Vec3, Vec3, f32)> = self.cars.iter().map(|c| (c.state.pos, c.state.forward(), c.state.speed())).collect();
+        for i in 0..n {
+            let (pos, fwd, _) = positions[i];
+            let st = self.cars[i].state.clone();
+            let mut input = if self.cars[i].parked.is_some() {
+                CarInput { brake: 1.0, handbrake: true, ..Default::default() }
+            } else if self.frozen {
+                if let Some(ai) = self.cars[i].ai.as_mut() {
+                    ai.stuck_timer = 0.0;
+                    ai.reverse_timer = 0.0;
+                }
+                CarInput { brake: 1.0, ..Default::default() }
+            } else if self.cars[i].is_player {
+                player_input
+            } else if let (Some(nav), true) = (world.nav.as_ref(), self.cars[i].ai.is_some()) {
+                // (the driver knows its car from the game's calibration tables, at this car's state of tune)
+                if self.cars[i].ai.as_ref().map_or(false, |a| a.tune.is_none()) && self.cars[i].state.veh.is_some() {
+                    if let Some(t) = self.cars[i].model.aitunes.clone() {
+                        let perf = self.cars[i].perf;
+                        self.cars[i].ai.as_mut().unwrap().tune = Some(Arc::new(mcla_formats::rage::aitune::AiTune::lerp(&t.base, &t.mods, perf)));
+                    }
+                }
+                self.cars[i].ai.as_mut().unwrap().drive(nav, &st, dt)
+            } else {
+                CarInput::default()
+            };
+            let pursuing = self.cars[i].cop && self.cars[i].ai.as_ref().map_or(false, |a| a.chase.is_some());
+            // Racers do not queue behind traffic: they pull out and pass, on whichever side
+            // is free of cars and walls.
+            let racing = ((!self.cars[i].is_player && self.cars[i].pinned) || (self.cars[i].is_player && self.auto_player)) && self.cars[i].parked.is_none() && !self.frozen && !self.cars[i].driver.starts_with(crate::racescript::TAG) && self.cars[i].ai.as_ref().map_or(false, |a| a.path.is_some());
+            let mut passing = false;
+            if racing {
+                let v = positions[i].2;
+                let right = Vec3::new(-fwd.z, 0.0, fwd.x).normalize_or(Vec3::X);
+                let reach = 12.0 + v * 1.3;
+                // the nearest thing in the way: a slower (or standing) car, a trunk, a mast
+                // (how far ahead, how far to the side, and the room it needs)
+                let mut block: Option<(f32, f32, f32)> = None;
+                // (is what blocks standing still? then cars moving alongside do not close the gap)
+                let mut standing = false;
+                for j in 0..n {
+                    if i == j {
+                        continue;
+                    }
+                    let rel = positions[j].0 - pos;
+                    if rel.y.abs() > 4.0 {
+                        continue;
+                    }
+                    let ahead = rel.dot(fwd);
+                    let side = rel.dot(right);
+                    let closing = v - positions[j].1.dot(fwd) * positions[j].2;
+                    if ahead > 1.5 && ahead < reach.max(if positions[j].2 < 1.0 { 30.0 } else { 0.0 }) && side.abs() < 2.7 && (closing > 1.5 || positions[j].2 < 2.5) && block.map_or(true, |b| ahead < b.0) {
+                        block = Some((ahead, side, 3.3));
+                        standing = positions[j].2 < 1.0;
+                    }
+                }
+                for (c, rad) in self.solids.iter() {
+                    let rel = *c - pos;
+                    if rel.y.abs() > 5.0 {
+                        continue;
+                    }
+                    let ahead = rel.dot(fwd);
+                    let side = rel.dot(right);
+                    if ahead > 0.5 && ahead < reach && side.abs() < 1.5 + rad && block.map_or(true, |b| ahead < b.0) {
+                        block = Some((ahead, side, 2.2 + rad));
+                        standing = true;
+                    }
+                }
+                let cur = self.cars[i].ai.as_ref().map_or(0.0, |a| a.dodge);
+                let mut want = 0.0;
+                if let Some((ahead, side, room)) = block {
+                    // both ways round, the nearer one first
+                    let first = if side > 0.0 { side - room } else { side + room };
+                    let second = if side > 0.0 { side + room } else { side - room };
+                    let solids = &self.solids;
+                    let free = |d: f32| -> bool {
+                        // no car in that slot, nothing solid standing in it ...
+                        let taken = (0..n).any(|k| {
+                            if k == i {
+                                return false;
+                            }
+                            let rel = positions[k].0 - pos;
+                            let a = rel.dot(fwd);
+                            // (round something that stands, a car running alongside only counts
+                            // while it is right beside)
+                            if standing && positions[k].2 > 3.0 && !(a > -4.5 && a < 5.5) {
+                                return false;
+                            }
+                            rel.y.abs() < 4.0 && a > -3.0 && a < ahead + 14.0 && (rel.dot(right) - d).abs() < 2.1
+                        }) || solids.iter().any(|(c, rad)| {
+                            let rel = *c - pos;
+                            let a = rel.dot(fwd);
+                            rel.y.abs() < 5.0 && a > -1.0 && a < ahead + 10.0 && (rel.dot(right) - d).abs() < 1.3 + rad
+                        });
+                        // ... and no wall beside the road
+                        let from = pos + Vec3::Y * 0.7 + fwd * ahead.min(9.0);
+                        !taken && world.collider.raycast(from, right * d.signum(), d.abs() + 1.6).is_none() && world.collider.raycast(pos + Vec3::Y * 0.7, right * d.signum(), d.abs() + 1.2).is_none()
+                    };
+                    // one lane over either way, then two (a queue fills both lanes at a red light)
+                    for d in [first, second, first + 3.3 * first.signum(), second + 3.3 * second.signum()] {
+                        if free(d) {
+                            want = d;
+                            passing = true;
+                            break;
+                        }
+                    }
+                    if !passing && cur.abs() > 0.5 && free(cur) {
+                        want = cur;
+                        passing = true;
+                    }
+                    // too close to steer round at speed: lift (from a crawl just turn out)
+                    if passing && ahead < 5.0 && (side - cur).abs() < 1.9 && v > 4.0 {
+                        input.throttle = input.throttle.min(0.2);
+                        input.brake = input.brake.max(0.4);
+                    } else if passing && v < 4.0 && self.cars[i].ai.as_ref().map_or(true, |a| a.reverse_timer <= 0.0) {
+                        // (unless the driver is backing off something he ran into)
+                        input.throttle = input.throttle.max(0.5);
+                        input.brake = 0.0;
+                        input.handbrake = false;
+                    }
+                }
+                if let Some(ai) = self.cars[i].ai.as_mut() {
+                    let rate = if want.abs() > 0.1 { 7.0 } else { 2.5 } * dt;
+                    ai.dodge += (want - ai.dodge).clamp(-rate, rate);
+                }
+            }
+            let mut boxed_in = false;
+            if !self.cars[i].is_player && self.cars[i].parked.is_none() && !pursuing && !passing {
+                // brake for cars ahead
+                for j in 0..n {
+                    if i == j {
+                        continue;
+                    }
+                    let rel = positions[j].0 - pos;
+                    let ahead = rel.dot(fwd);
+                    let side = (rel - fwd * ahead).length();
+                    if ahead > 0.0 && ahead < 18.0 && side < 2.5 {
+                        let closing = positions[i].2 - positions[j].2;
+                        if ahead < 8.0 || closing > 2.0 {
+                            input.throttle = 0.0;
+                            input.brake = if ahead < 7.0 { 1.0 } else { 0.5 };
+                            if positions[i].2 < 0.8 {
+                                // queued up: stand still rather than back away
+                                input.brake = 0.0;
+                                input.handbrake = true;
+                                boxed_in = true;
+                            }
+                        }
+                    }
+                }
+            }
+            // a racer does not queue: boxed in behind something that stands, it backs off after a
+            // moment and comes round again with room to steer
+            if racing {
+                if let Some(ai) = self.cars[i].ai.as_mut() {
+                    if boxed_in && ai.reverse_timer <= 0.0 {
+                        ai.blocked += dt;
+                        if ai.blocked > 1.2 {
+                            ai.blocked = 0.0;
+                            ai.reverse_timer = 1.4;
+                        }
+                    } else if !boxed_in {
+                        ai.blocked = 0.0;
+                    }
+                    if ai.reverse_timer > 0.0 {
+                        // (the driver's own backing off rules while it lasts)
+                        let back = ai.reverse_timer;
+                        input.handbrake = false;
+                        input.throttle = 0.0;
+                        input.brake = 1.0;
+                        let _ = back;
+                    }
+                }
+            }
+            if std::env::var("MCLA_SIGNAL_TRACE").is_ok() && !self.cars[i].is_player && self.cars[i].parked.is_none() {
+                // follow the first car that comes to rest at a red light
+                let a = self.signals.ahead(pos, fwd, self.clock);
+                if self.trace_car.is_none() && positions[i].2 < 0.3 && a.map_or(false, |x| x.2 == 0 && x.1 < 4.0) {
+                    self.trace_car = Some((i, 0));
+                }
+                if let Some((ti, n)) = self.trace_car {
+                    if ti == i && n < 1500 {
+                        if n % 30 == 0 {
+                            log::info!("trace {}: speed {:.1} signal {:?} throttle {:.2} brake {:.2}", n, positions[i].2, a.map(|x| (x.1, x.2)), input.throttle, input.brake);
+                        }
+                        self.trace_car = Some((ti, n + 1));
+                    }
+                }
+            }
+            // ambient traffic stops for red lights
+            if !self.cars[i].is_player && !self.cars[i].cop && self.cars[i].parked.is_none() && self.cars[i].ai.as_ref().map_or(false, |a| a.path.is_none()) {
+                let v = positions[i].2;
+                if let Some((_, stop, state)) = self.signals.ahead(pos, fwd, self.clock) {
+                    // red, or yellow with room to stop
+                    let must = state == 0 || (state == 1 && stop > v * 1.2);
+                    if must && stop > -3.0 && stop < v * v / 5.0 + 9.0 {
+                        self.held_at_red += 1;
+                        if std::env::var("MCLA_SIGNAL_TEST").is_ok() && self.held_at_red % 400 == 0 {
+                            log::info!("signals: car {} stop {:.1} m, speed {:.1}, state {}", i, stop, v, state);
+                        }
+                        if v < 0.5 {
+                            self.stopped_at_red += 1;
+                        }
+                        input.throttle = 0.0;
+                        input.brake = if stop < 2.5 { 1.0 } else { (v * v / (2.0 * stop.max(1.0)) / 7.0).clamp(0.15, 1.0) };
+                        // at rest the brake pedal would select reverse: hold the car on the handbrake
+                        if v < 0.8 {
+                            input.brake = 0.0;
+                            input.handbrake = true;
+                        }
+                        if let Some(ai) = self.cars[i].ai.as_mut() {
+                            // waiting is not being stuck: no reversing out, no reset
+                            ai.stuck_timer = 0.0;
+                            ai.stuck_long = 0.0;
+                            ai.reverse_timer = 0.0;
+                            ai.stuck_anchor = pos;
+                        }
+                    }
+                }
+            }
+            if self.cars[i].stunned > 0.0 {
+                self.cars[i].stunned -= dt;
+                input = CarInput { brake: 0.15, ..Default::default() };
+            }
+            if self.cars[i].boost > 0.0 && !self.cars[i].is_player {
+                self.cars[i].boost -= dt;
+                if input.throttle > 0.3 {
+                    input.nitro = true;
+                    let st = &mut self.cars[i].state;
+                    st.nitro_shots = st.nitro_shots.max(1);
+                }
+            }
+            // racers in another car's slipstream (the envelope trailing it, see ability.rs): less
+            // drag, and a turbo that charges and is fired on the throttle when full
+            if self.cars[i].racer && !self.cars[i].is_player {
+                let (pos, v) = (self.cars[i].state.pos, self.cars[i].state.speed());
+                let sst = self.cars[i].model.simtunes.as_ref().map(|s| s.base.ss_turbo.clone()).unwrap_or_default();
+                let (len, width, min_speed) = (if sst.envelope_length > 1.0 { sst.envelope_length } else { 45.0 }, if sst.envelope_width2 > 0.1 { sst.envelope_width2 } else { 2.0 }, if sst.min_speed > 0.0 { sst.min_speed } else { 9.0 });
+                let mut inside = false;
+                if v >= min_speed {
+                    for (j, o) in self.cars.iter().enumerate() {
+                        let ov = o.state.vel.length();
+                        if j == i || o.parked.is_some() || ov < min_speed {
+                            continue;
+                        }
+                        let back = -o.state.vel / ov;
+                        let rel = pos - o.state.pos;
+                        let along = rel.dot(back);
+                        let off = rel - back * along;
+                        if along >= 0.0 && along <= len && off.y.abs() <= width && Vec3::new(off.x, 0.0, off.z).length() <= width {
+                            inside = true;
+                            break;
+                        }
+                    }
+                }
+                input.draft = inside;
+                let c = &mut self.cars[i];
+                if inside {
+                    c.sst = (c.sst + dt / sst.regen_time.max(0.2)).min(1.0);
+                } else {
+                    c.sst = (c.sst - dt / sst.falloff_time.max(0.2)).max(0.0);
+                }
+                if c.sst >= 1.0 && input.throttle > 0.8 && input.steer.abs() < 0.25 {
+                    if let Some(vs) = c.state.veh.as_mut() {
+                        if vs.sst_level <= 0.0 && vs.nitro_level <= 0.0 {
+                            vs.sst_level = 1.0;
+                            c.sst = 0.0;
+                        }
+                    }
+                }
+            }
+            // (step 19e: a power-up's hold on the car - Ice, Reverse Steering, Stop)
+            crate::powerups::apply_ctl(&mut input, self.cars[i].pu_ctl);
+            self.cars[i].input = CarInput { ai: input.ai || !self.cars[i].is_player, ..input };
+        }
+        for c in self.cars.iter_mut() {
+            if let Some((p, yaw)) = c.ai.as_mut().and_then(|a| a.reset_to.take()) {
+                c.state = CarState::new(p, yaw);
+                c.pose_history.reset();
+                c.placed = false;
+            }
+            // Already placed cars can outlive their streamed collision sectors.
+            // Suspend physical motion until they can be placed on resident ground
+            // again. The existing distant-racer path still advances kinematically.
+            if c.placed && !world.ready_at(c.state.pos) {
+                c.placed = false;
+                c.pose_history.reset();
+            }
+            // Racers outside the streamed-in part of the city have no ground to drive on:
+            // move them along the race line until the world around them is loaded.
+            if !c.is_player && !self.frozen && c.parked.is_none() && !world.ready_at(c.state.pos) {
+                if let Some(ai) = c.ai.as_mut() {
+                    if ai.path.is_some() {
+                        let v = ai.target_speed * 0.8;
+                        if let Some(p) = ai.path_ahead(c.state.pos, v * dt) {
+                            let d = p - c.state.pos;
+                            if d.length() > 1e-3 {
+                                let dir = d.normalize();
+                                let gear = c.state.gear;
+                                c.state = CarState::new(p, (-dir.x).atan2(-dir.z));
+                                c.pose_history.reset();
+                                c.state.vel = dir * v;
+                                c.state.gear = gear;
+                            }
+                            ai.stuck_long = 0.0;
+                            ai.stuck_anchor = p;
+                        }
+                        c.placed = false;
+                        continue;
+                    }
+                }
+            }
+            if !c.placed {
+                c.pose_history.reset();
+                if world.ready_at(c.state.pos) {
+                    // (the player's car, where roads are stacked: the first surface under the place asked for -
+                    // a tunnel's road, not the street above it; with nothing under it, the drop from above as before)
+                    let near = if c.is_player { world.collider.ground(c.state.pos, 2.0, 200.0) } else { None };
+                    if let Some(g) = near.or_else(|| world.collider.ground(c.state.pos + Vec3::Y * 2.0, 50.0, 200.0)) {
+                        // straight onto its springs (the model's origin is at road level), tilted with the road
+                        let fwd = c.state.forward();
+                        let n = g.normal;
+                        if n.y > 0.8 {
+                            let f = (fwd - n * fwd.dot(n)).normalize_or(fwd);
+                            let right = f.cross(n).normalize_or(Vec3::X);
+                            c.state.rot = Quat::from_mat3(&glam::Mat3::from_cols(right, n, -f)).normalize();
+                        }
+                        c.state.pos = g.point + Vec3::Y * 0.03;
+                        c.state.vel.y = 0.0;
+                    }
+                    c.placed = true;
+                } else {
+                    continue;
+                }
+            }
+            if c.parked.is_some() {
+                // let the suspension settle, then leave the car where it stands
+                if c.settle > 0.0 {
+                    c.settle -= dt;
+                    c.state.step(c.tuned.as_deref().unwrap_or(&c.model.params), CarInput { brake: 1.0, handbrake: true, ..Default::default() }, &world.collider, dt.min(1.0 / 30.0));
+                    c.state.vel.x = 0.0;
+                    c.state.vel.z = 0.0;
+                    c.state.ang_vel.y = 0.0;
+                } else {
+                    c.state.vel = Vec3::ZERO;
+                    c.state.ang_vel = Vec3::ZERO;
+                }
+                continue;
+            }
+            if self.frozen {
+                // settle onto the ground but do not drive
+                c.state.step(c.tuned.as_deref().unwrap_or(&c.model.params), CarInput { brake: 1.0, ..Default::default() }, &world.collider, dt.min(1.0 / 30.0));
+                c.state.vel.x = 0.0;
+                c.state.vel.z = 0.0;
+                c.state.ang_vel = Vec3::ZERO;
+                continue;
+            }
+            c.state.step(c.tuned.as_deref().unwrap_or(&c.model.params), c.input, &world.collider, dt.min(1.0 / 30.0));
+        }
+        // car-car separation (soft spheres)
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let r = 2.2;
+                let d = self.cars[j].state.pos - self.cars[i].state.pos;
+                let dist = d.length();
+                if dist < r && dist > 1e-3 {
+                    let nrm = d / dist;
+                    let (pi, pj) = (self.cars[i].parked.is_some(), self.cars[j].parked.is_some());
+                    if pi && pj {
+                        continue;
+                    }
+                    // (step 19f: MegaStealth - neither meets the other)
+                    if self.cars[i].pu_ghost || self.cars[j].pu_ghost {
+                        continue;
+                    }
+                    if pi || pj {
+                        // a parked car does not move: the other one takes the whole correction
+                        let (mov, sign) = if pi { (j, 1.0) } else { (i, -1.0) };
+                        self.cars[mov].state.correct_position(nrm * (r - dist) * sign);
+                        let vn = self.cars[mov].state.vel.dot(nrm) * sign;
+                        if vn < 0.0 {
+                            self.cars[mov].state.vel -= nrm * sign * vn * 1.3;
+                            if -vn > 3.0 {
+                                let p = self.cars[mov].tuned.as_deref().unwrap_or(&self.cars[mov].model.params).clone();
+                                self.cars[mov].state.take_hit(&p, -vn);
+                                let other = if pi { i } else { j };
+                                let at = (self.cars[mov].state.pos + self.cars[other].state.pos) * 0.5 + Vec3::Y * 0.5;
+                                self.cars[mov].state.add_dent(at, -vn);
+                            }
+                        }
+                        continue;
+                    }
+                    // Agro: the player is an unstoppable ram
+                    let (ai, aj) = (self.agro && self.cars[i].is_player, self.agro && self.cars[j].is_player);
+                    if ai || aj {
+                        let (ram, hit, sign) = if ai { (i, j, 1.0) } else { (j, i, -1.0) };
+                        let rv = self.cars[ram].state.vel;
+                        self.cars[hit].state.correct_position(nrm * sign * (r - dist));
+                        let closing = (rv - self.cars[hit].state.vel).dot(nrm * sign).max(0.0);
+                        self.cars[hit].state.vel += nrm * sign * (closing * 1.4 + 4.0) + Vec3::Y * (1.5 + closing * 0.08);
+                        self.cars[hit].state.ang_vel += Vec3::new(0.0, 2.5 * sign, 1.0);
+                        self.cars[hit].state.damage = (self.cars[hit].state.damage + 0.2).min(1.0);
+                        self.cars[hit].stunned = self.cars[hit].stunned.max(2.0);
+                        continue;
+                    }
+                    let push = (r - dist) * 0.5;
+                    self.cars[i].state.correct_position(-nrm * push);
+                    self.cars[j].state.correct_position(nrm * push);
+                    let vi = self.cars[i].state.vel.dot(nrm);
+                    let vj = self.cars[j].state.vel.dot(nrm);
+                    if vi - vj > 0.0 {
+                        let imp = (vi - vj) * 0.5;
+                        self.cars[i].state.vel -= nrm * imp;
+                        self.cars[j].state.vel += nrm * imp;
+                        // (step 19d: what a vehicle takes from another is its change of speed
+                        // times the other's "damage inflicted" factor - mcCarDamage's scale,
+                        // sub_82342EA8: the hitter's +20 times the victim's own +16, which is 1
+                        // without a multiplier flag - and counts above the ImpactThreshold:
+                        // sub_82343378 0x82343498. The payback sets the player's factor to 3,
+                        // the client's to 0.65 and, once he runs, 0.55.)
+                        if imp * self.cars[i].inflict.max(self.cars[j].inflict).max(1.0) > 2.0 {
+                            // (each car's change of speed)
+                            let at = (self.cars[i].state.pos + self.cars[j].state.pos) * 0.5 + Vec3::Y * 0.5;
+                            for (k, o) in [(i, j), (j, i)] {
+                                let mut dmg = self.cars[k].model.params.dmg;
+                                // (the payback's client: Racer_SetFatalBlow(client,
+                                // Racer_GetImpactThreshold(client)) - any blow that counts can
+                                // finish him)
+                                if self.fragile == Some(k) {
+                                    dmg[3] = dmg[2];
+                                }
+                                let p = CarParams { dmg, ..CarParams::default() };
+                                let hit = imp * self.cars[o].inflict;
+                                self.cars[k].state.take_hit(&p, hit);
+                                self.cars[k].state.add_dent(at, imp);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+    }
+
+    /// Put a car somewhere by hand (cutscenes): wheels follow, it stands still.
+    pub fn pose_car(&mut self, idx: usize, pos: Vec3, rot: Quat) {
+        let c = &mut self.cars[idx];
+        c.state.relocate(pos, rot);
+        c.state.vel = Vec3::ZERO;
+        c.state.ang_vel = Vec3::ZERO;
+        c.placed = true;
+        c.pose_history.reset();
+    }
+
+    pub fn begin_tick(&mut self) {
+        for c in &mut self.cars {
+            if c.placed { c.pose_history.begin(&c.state, c.lean); }
+            else { c.pose_history.reset(); }
+        }
+    }
+
+    pub fn finish_tick(&mut self, dt: f32) {
+        for c in &mut self.cars {
+            if c.model.bike {
+                if let Some(vs) = c.state.veh.as_ref() { c.lean = vs.lean; }
+                else {
+                    let lat = c.state.fwd_speed() * c.state.ang_vel.dot(c.state.up());
+                    let target = (lat / 9.81).atan().clamp(-0.85, 0.85);
+                    c.lean += (target - c.lean) * (dt * 6.0).min(1.0);
+                }
+            }
+            c.pose_history.finish(&c.state, c.lean);
+        }
+    }
+
+    /// Write every car's transform and lamp state to the GPU.
+    pub fn upload_uniforms(&mut self, gpu: &Gpu, night: f32) {
+        for c in self.cars.iter_mut() {
+            let pose = c.render_pose(self.render_alpha);
+            let mut m = Mat4::from_rotation_translation(pose.rot, pose.pos);
+            if self.hide_player && c.is_player {
+                m = m * Mat4::from_scale(Vec3::ZERO);
+            }
+            if c.model.bike {
+                m = m * Mat4::from_rotation_z(pose.lean);
+            }
+            // lamp state for the light shader: siren phase (0 off, 1 red, 2 blue) + 4 x reversing
+            let siren = if c.cop && self.sirens { 1.0 + ((self.clock * 5.0) as i32 % 2) as f32 } else { 0.0 };
+            let reversing = if c.state.gear < 0 { 4.0 } else { 0.0 };
+            // parked cars are dark, everything else drives with its lights on at night
+            let lights = if c.parked.is_some() || self.lights_off { 0.0 } else { night };
+            // (the night fill light at the car's place, added to its ambient - fillmap.rs; the
+            // player's car is left as it was: the original shows 0.4 of the sum there, unexplained)
+            // (pass 9: the player's car takes the sum too, with the recorded factor 0.4 on its whole ambient)
+            let car_fill = if c.is_player { crate::fillmap::player_now(m.w_axis.x, m.w_axis.z) } else { crate::fillmap::body_now(m.w_axis.x, m.w_axis.z) };
+            // (lighting diagnostics: MCLA_CAR_POSE_DUMP prints the player's body matrix - columns - once, at the 250th update)
+            if c.is_player && std::env::var("MCLA_CAR_POSE_DUMP").is_ok() {
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 250 {
+                    eprintln!("car pose: x {:?} y {:?} z {:?} at {:?}", m.x_axis.truncate(), m.y_axis.truncate(), m.z_axis.truncate(), m.w_axis.truncate());
+                }
+            }
+            // (the car's own lamp colours: its set-up's, else its traffic type's, else the Audi R8's - render/car_lamps.rs)
+            let lamp_rows = crate::render::car_lamps::for_car(&c.model.name, &c.vinyl_name).map_or_else(|| crate::render::car_lamps::R8.uniform(), |t| t.uniform());
+            // (step 19d: a car in a set-up is painted by it, as the player's by its record)
+            let s19d_look: (u8, [f32; 4], [f32; 4], [[f32; 4]; 5], [[f32; 4]; 5], [[f32; 4]; 5]) = match (c.is_player, c.look.as_ref()) {
+                (true, _) => (self.player_paint_type.min(5), self.player_paint_b, self.player_tint, self.player_interior, self.player_area_a, self.player_area_b),
+                (false, Some(l)) => (l.paint_type.min(5), l.color2, l.tint, l.interior, l.area_a, l.area_b),
+                (false, None) => (3, [0.0; 4], [0.0; 4], [[0.0; 4]; 5], [[0.0; 4]; 5], [[0.0; 4]; 5]),
+            };
+            gpu.update_object(&c.binding, &ObjectUniform { model: m.to_cols_array_2d(), color: c.color, params: [lights, c.input.brake, c.state.damage, siren + reversing + 16.0 + 32.0 * s19d_look.0 as f32], dents: if c.state.damage > 0.0 { c.state.dents } else { [[0.0; 4]; 6] }, color2: s19d_look.1, tint: s19d_look.2, interior: s19d_look.3, fade_min: c.model.min.extend(c.pu_mirror).to_array(), fade_size: (c.model.max - c.model.min).max(Vec3::splat(0.01)).extend(0.0).to_array(), fill: car_fill, lamp_a: lamp_rows.0, lamp_b: lamp_rows.1, area_a: s19d_look.4, area_b: s19d_look.5 });
+            for (i, b) in c.wheel_bindings.iter().enumerate() {
+                let left = i % 2 == 0;
+                let steer = Quat::from_rotation_y(-pose.steer[i]);
+                // the rim models face -x (hub cap at x = -0.24): left wheels as modelled, right
+                // wheels turned around; rolling forward (-z) is a negative rotation about x
+                let spin = Quat::from_rotation_x(if left { -pose.spin[i] } else { pose.spin[i] });
+                let flip = if left { Quat::IDENTITY } else { Quat::from_rotation_y(std::f32::consts::PI) };
+                let mut local = pose.hubs[i];
+                if c.model.bike {
+                    // Bike physical wheels and their visual mirrors share the center line.
+                    let lo = pose.hubs[i ^ 1];
+                    local = (local + lo) * 0.5;
+                }
+                let flip = if c.model.bike { Quat::IDENTITY } else { flip };
+                let spin = if c.model.bike { Quat::from_rotation_x(-pose.spin[i]) } else { spin };
+                // (the original draws each axle's own tyre: as wide as fitted, 6.35 mm larger than its physics radius)
+                let (tyre_w, tyre_r) = c.params().veh.as_ref().filter(|v| v.tyre_width[0] > 0.0 && !c.model.bike).map(|v| if i < 2 { (v.tyre_width[0], v.t.wheel_front.radius + 0.00635) } else { (v.tyre_width[1], v.t.wheel_back.radius + 0.00635) }).unwrap_or((c.model.params.wheel_width, c.model.params.wheel_radius));
+                let wm = m * Mat4::from_translation(local) * Mat4::from_quat(steer * flip * spin) * Mat4::from_scale(Vec3::new(tyre_w * 2.0, tyre_r * 2.0, tyre_r * 2.0));
+                // (a wheel has no dents: the first three slots carry its rim's finish)
+                let mut finish = [[0.0; 4]; 6];
+                if c.is_player {
+                    finish[..3].copy_from_slice(&self.player_rim_finish);
+                } else if let Some(l) = c.look.as_ref() {
+                    finish[..3].copy_from_slice(&l.rim_finish);
+                }
+                gpu.update_object(b, &ObjectUniform { model: wm.to_cols_array_2d(), color: [0.8, 0.8, 0.8, 1.0], params: [night, 0.0, 0.0, 0.0], dents: finish, fill: car_fill, ..Default::default() });
+                // the caliper: with the wheel but for its turning, on the rear of the disc on
+                // both sides (the right ones turned over instead of around)
+                if let (Some(cb), true) = (c.caliper_bindings.get(i), c.model.brakes.is_some() || c.brake.is_some()) {
+                    let side = if left { Quat::IDENTITY } else { Quat::from_rotation_y(std::f32::consts::PI) * Quat::from_rotation_x(std::f32::consts::PI) };
+                    let cm = m * Mat4::from_translation(local) * Mat4::from_quat(steer * side) * Mat4::from_scale(Vec3::new(tyre_w * 2.0, tyre_r * 2.0, tyre_r * 2.0));
+                    gpu.update_object(cb, &ObjectUniform { model: cm.to_cols_array_2d(), color: [0.8, 0.8, 0.8, 1.0], params: [night, 0.0, 0.0, 0.0], fill: car_fill, ..Default::default() });
+                }
+            }
+        }
+    }
+
+    /// The glow of every lit lamp near the camera, as the game's glow table rates them
+    /// (`tune/vehicle`: head 2, tail 2 - the player's 1 - brake 2 / 0.3, reverse 0.53, third
+    /// brake 0.35). A lamp glows towards where it points: head lamps ahead, the others astern.
+    pub fn update_glows(&mut self, gpu: &Gpu, night: f32, cam: Vec3) {
+        use crate::props::Inst;
+        const MAX: usize = 320;
+        let mut out: Vec<Inst> = Vec::new();
+        for c in &self.cars {
+            let pose = c.render_pose(self.render_alpha);
+            if pose.pos.distance_squared(cam) > 260.0 * 260.0 || (self.hide_player && c.is_player) {
+                continue;
+            }
+            let lights = if c.parked.is_some() || self.lights_off { 0.0 } else { night };
+            let braking = (c.input.brake * 4.0).clamp(0.0, 1.0);
+            let siren = if c.cop && self.sirens { 1 + (self.clock * 5.0) as i32 % 2 } else { 0 };
+            for (id, local) in &c.model.lamps {
+                let (k, col, size) = match *id {
+                    3 => (2.0 * lights, [1.0, 0.96, 0.86], 0.85),
+                    1 => ((if c.is_player { 1.0 } else { 2.0 }) * lights * 0.22, [1.0, 0.07, 0.04], 0.16),
+                    0 => ((if c.is_player { 0.6 } else { 2.0 }) * braking * 0.6, [1.0, 0.07, 0.04], 0.34),
+                    12 => (0.35 * braking, [1.0, 0.07, 0.04], 0.3),
+                    6 => (0.53 * if c.state.gear < 0 { 1.0 } else { 0.0 }, [1.0, 1.0, 0.95], 0.4),
+                    13 => (if siren == 1 { 2.5 } else { 0.0 }, [1.0, 0.08, 0.05], 0.9),
+                    14 => (if siren == 2 { 2.5 } else { 0.0 }, [0.1, 0.25, 1.0], 0.9),
+                    _ => (0.0, [0.0; 3], 0.0),
+                };
+                // (head, tail, brake and reversing lamps glow in the pass after the tone map now -
+                // `halo_lamps`, halo.rs; MCLA_DEBUG_VIEW=115: these sprites as before)
+                if k <= 0.02 || (matches!(*id, 0 | 1 | 3 | 6 | 12) && !crate::halo::old_look()) {
+                    continue;
+                }
+                // (the glow takes the lamp's own lit colour - bulb through cover - where the car has a lamp table: render/car_lamps.rs)
+                let col = if matches!(*id, 0 | 1 | 3 | 6 | 12) { crate::render::car_lamps::for_car(&c.model.name, &c.vinyl_name).map_or(col, |t| t.lit(*id as usize)) } else { col };
+                let p = pose.pos + pose.rot * *local;
+                // (police lights show all round)
+                let facing = if *id >= 13 {
+                    1.0
+                } else {
+                    let out_dir = if *id == 3 { pose.rot * Vec3::NEG_Z } else { -(pose.rot * Vec3::NEG_Z) };
+                    ((cam - p).normalize_or_zero().dot(out_dir) * 1.6).clamp(0.0, 1.0)
+                };
+                if facing > 0.02 && out.len() < MAX {
+                    out.push(Inst { pos_scale: [p.x, p.y, p.z, size], rot_tint: [col[0], col[1], col[2], k * facing], fill: [0; 4], ..Inst::NONE });
+                }
+            }
+        }
+        // (step 19e: the power-up sources - `powerups::PowerUps::glows`)
+        for g in &self.pu_glows {
+            if out.len() < MAX && Vec3::new(g[0], g[1], g[2]).distance_squared(cam) < 260.0 * 260.0 {
+                out.push(Inst { pos_scale: [g[0], g[1], g[2], g[3]], rot_tint: [g[4], g[5], g[6], g[7]], fill: [0; 4], ..Inst::NONE });
+            }
+        }
+        self.glow_count = out.len() as u32;
+        if out.is_empty() {
+            return;
+        }
+        out.resize(MAX, Inst { pos_scale: [0.0; 4], rot_tint: [0.0; 4], fill: [0; 4], ..Inst::NONE });
+        match self.glow_buf.as_ref() {
+            Some(b) => gpu.queue.write_buffer(b, 0, bytemuck::cast_slice(&out)),
+            None => {
+                use wgpu::util::DeviceExt;
+                self.glow_buf = Some(gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("lamp glows"), contents: bytemuck::cast_slice(&out), usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST }));
+            }
+        }
+    }
+
+    /// The cars' lit lamps for the glow pass after the tone map (render only; halo.rs, the
+    /// original's sub_8237AC90): the lamp's place, the way it faces, its lit colour, and its
+    /// level x the kind's factor of the executable's two tables (0x827E7688 other cars: brake 2,
+    /// tail 2, head 2, reversing 0.528, third brake 0.346; 0x827E76D8 the player's: brake 0.3,
+    /// tail 1.004, head 2, the others 1).
+    pub fn halo_lamps(&self, night: f32, cam: Vec3) -> Vec<(Vec3, Vec3, [f32; 3], f32)> {
+        let mut out = Vec::new();
+        let old_rule = std::env::var("MCLA_GLOW_OLD").is_ok();
+        for c in &self.cars {
+            let pose = c.render_pose(self.render_alpha);
+            if pose.pos.distance_squared(cam) > 260.0 * 260.0 || (self.hide_player && c.is_player) {
+                continue;
+            }
+            let lights = if c.parked.is_some() || self.lights_off { 0.0 } else { night };
+            let braking = (c.input.brake * 4.0).clamp(0.0, 1.0);
+            let pl = c.is_player;
+            // The original's light set (sub_8237AC90 walks it; the player's read out of the running game,
+            // work/lighting/fe_lset.py): one record for every `glow<kind>0` bone of the fitted parts'
+            // skeletons (the R8: four glowbrake0, two glowhead0, two glowhigh0, two glowreverse0, one
+            // glowthirdbrake0), its facing the bone's z row. Levels of the standing player's car at 23:30:
+            // brake 0.25, tail 0.25, signal 1, head 1, high beam 0, fog 1, reversing / third brake 0.
+            // Traffic (`va_*`) is NOT read: the captures' glow quads give tail and brake rows together at
+            // level x facing 0.383 at rest and brake / third brake at 1.155 braking (hl_L_23.5) - taken as
+            // 0.385 and 1.25. A car without such bones keeps one glow a side at its lamp meshes' mean.
+            let amb = c.model.name.starts_with("va_");
+            let rest = if amb { 0.385 } else { 0.25 };
+            let pedal = if amb { 1.25 * braking } else { braking };
+            let level = |id: u8| -> f32 {
+                match id {
+                    0 => (if pl { 0.3 } else { 2.0 }) * pedal.max(rest * lights),
+                    1 => (if pl { 1.004 } else { 2.0 }) * rest * lights,
+                    2 => (if pl { 1.0 } else { 1.002 }) * lights,
+                    3 => 2.0 * lights,
+                    6 => (if pl { 1.0 } else { 0.528 }) * if c.state.gear < 0 { 1.0 } else { 0.0 },
+                    8 => (if pl { 1.0 } else { 1.002 }) * lights,
+                    12 => (if pl { 1.0 } else { 0.346 }) * pedal,
+                    _ => 0.0,
+                }
+            };
+            // (the glow's colour is bulb x cover cut at 1, not brought to a full channel: the R8's
+            // brake row 3.804 3.8 3.4 x 0.9804 0.0314 0 is recorded as 255 30 0)
+            let rows = crate::render::car_lamps::for_car(&c.model.name, &c.vinyl_name);
+            let colour = |id: u8, dflt: [f32; 3]| -> [f32; 3] {
+                rows.as_ref().map_or(dflt, |t| {
+                    let i = (id as usize).min(crate::render::car_lamps::IDS - 1);
+                    [(t.bulb[i][0] * t.cover[i][0]).min(1.0), (t.bulb[i][1] * t.cover[i][1]).min(1.0), (t.bulb[i][2] * t.cover[i][2]).min(1.0)]
+                })
+            };
+            let dflt = |id: u8| -> [f32; 3] {
+                match id {
+                    3 | 8 => [1.0, 0.96, 0.86],
+                    6 => [1.0, 1.0, 0.95],
+                    2 => [1.0, 0.45, 0.0],
+                    _ => [1.0, 0.07, 0.04],
+                }
+            };
+            let has_bone = |id: u8| !old_rule && c.model.glow_bones.iter().any(|(k, _, _)| *k == id);
+            for (id, local, facing) in &c.model.glow_bones {
+                let k = level(*id);
+                if k <= 0.0 || old_rule {
+                    continue;
+                }
+                out.push((pose.pos + pose.rot * *local, pose.rot * *facing, colour(*id, dflt(*id)), k));
+            }
+            for (id, local) in &c.model.lamps {
+                if has_bone(*id) || !matches!(*id, 0 | 1 | 3 | 6 | 12) {
+                    continue;
+                }
+                let k = if old_rule && *id == 1 { (if pl { 1.004 } else { 2.0 }) * lights } else { level(*id) };
+                if k <= 0.0 {
+                    continue;
+                }
+                let out_dir = if *id == 3 { pose.rot * Vec3::NEG_Z } else { -(pose.rot * Vec3::NEG_Z) };
+                // (MCLA_GLOW_OLD: the R8's four brake glows from the recorded table, as until 2026-10-15)
+                if old_rule && *id == 0 && c.model.name == "vp_aud_r8_08" {
+                    let sx = if local.x < 0.0 { -1.0 } else { 1.0 };
+                    out.push((pose.pos + pose.rot * Vec3::new(0.701 * sx, 0.747, 1.803), out_dir, colour(*id, dflt(*id)), k));
+                    out.push((pose.pos + pose.rot * Vec3::new(0.526 * sx, 0.773, 1.902), out_dir, colour(*id, dflt(*id)), k));
+                    continue;
+                }
+                out.push((pose.pos + pose.rot * *local, out_dir, colour(*id, dflt(*id)), k));
+            }
+        }
+        out
+    }
+
+    /// Draw the lamp glows (after the opaque scene). Sets its own pipeline.
+    pub fn draw_glows<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, gpu: &'a Gpu) {
+        if let (Some(buf), true) = (self.glow_buf.as_ref(), self.glow_count > 0) {
+            pass.set_pipeline(&gpu.pipeline_glow);
+            pass.set_vertex_buffer(0, buf.slice(..));
+            pass.draw(0..4, 0..self.glow_count);
+        }
+    }
+
+    /// Draw all cars. `blend_pass` selects glass-only.
+    pub fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, gpu: &'a Gpu, blend_pass: bool, draws: &mut usize, range: Option<(Vec3, f32)>, frustum: Option<&crate::render::Frustum>) {
+        for c in &self.cars {
+            // (step 19g: a car under Stealth is not drawn in either pass of its own - pu_fx.rs)
+            if c.pu_stealth {
+                continue;
+            }
+            let mut wheels_visible = true;
+            let pos = c.render_pose(self.render_alpha).pos;
+            if let Some((eye, max)) = range {
+                let d = pos.distance(eye);
+                if d > max {
+                    continue;
+                }
+                // wheels are a few pixels beyond this
+                wheels_visible = d < max * 0.6;
+            }
+            if let Some(f) = frustum {
+                let r = Vec3::splat(c.model.params.body_half.length() + 1.0);
+                if !f.intersects_aabb(pos - r, pos + r) {
+                    continue;
+                }
+            }
+            pass.set_bind_group(3, &c.binding.bg, &[]);
+            // (the windows in two passes, as the original: all back faces, then all front faces, with depth
+            // writes; the lamps' lenses stay in the one pass. MCLA_GLASS_ONEPASS=1: as before. MCLA_GLASS_PASS=b / f:
+            // one of the two only, to look at them)
+            let glass2 = blend_pass && glass_two_pass() != 0;
+            if glass2 {
+                for (side, pl) in [(1u8, &gpu.pipeline_glass_back), (2u8, &gpu.pipeline_glass_front)] {
+                    if glass_two_pass() & side == 0 {
+                        continue;
+                    }
+                    pass.set_pipeline(pl);
+                    for b in &c.model.batches {
+                        if b.mode != MatMode::CarGlass || b.shader.to_ascii_lowercase().contains("bumped") {
+                            continue;
+                        }
+                        pass.set_bind_group(1, b.bind.as_ref(), &[]);
+                        pass.set_bind_group(2, &gpu.mat_bgs[&(b.mode as u32)], &[]);
+                        pass.set_vertex_buffer(0, b.vb.slice(..));
+                        pass.set_index_buffer(b.ib.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..b.count, 0, 0..1);
+                        *draws += 1;
+                    }
+                }
+                pass.set_pipeline(&gpu.pipeline_blend);
+            }
+            for b in &c.model.batches {
+                if b.mode.blended() != blend_pass {
+                    continue;
+                }
+                if glass2 && b.mode == MatMode::CarGlass && !b.shader.to_ascii_lowercase().contains("bumped") {
+                    continue;
+                }
+                // the car's own plate on the plate mesh
+                let bind = match c.plate.as_ref() {
+                    Some(p) if b.shader.eq_ignore_ascii_case("LicensePlate") => p,
+                    _ => match c.vinyl.as_ref() {
+                        Some(v) if b.mode == MatMode::Paint => v,
+                        _ => &b.bind,
+                    },
+                };
+                pass.set_bind_group(1, bind.as_ref(), &[]);
+                pass.set_bind_group(2, &gpu.mat_bgs[&(b.mode as u32)], &[]);
+                pass.set_vertex_buffer(0, b.vb.slice(..));
+                pass.set_index_buffer(b.ib.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..b.count, 0, 0..1);
+                *draws += 1;
+            }
+            if !blend_pass && wheels_visible {
+                // garage choice, else the car's stock wheels, else the generic set
+                if let Some(w) = c.wheels.as_ref().or(c.model.wheels.as_ref()).or(self.wheels.as_ref()) {
+                    for (wi, wb) in c.wheel_bindings.iter().enumerate() {
+                        if c.model.bike && wi % 2 == 1 {
+                            continue;
+                        }
+                        pass.set_bind_group(3, &wb.bg, &[]);
+                        for b in &w.batches {
+                            pass.set_bind_group(1, b.bind.as_ref(), &[]);
+                            pass.set_bind_group(2, &gpu.mat_bgs[&(b.mode as u32)], &[]);
+                            pass.set_vertex_buffer(0, b.vb.slice(..));
+                            pass.set_index_buffer(b.ib.slice(..), wgpu::IndexFormat::Uint32);
+                            pass.draw_indexed(0..b.count, 0, 0..1);
+                            *draws += 1;
+                        }
+                        // the brake behind the rim: the rotor with the wheel, the caliper still
+                        if let Some(br) = self.player_brake.as_ref().filter(|_| c.is_player).or(c.brake.as_ref()).or(c.model.brakes.as_ref()) {
+                            for (list, bg) in [(&br.rotor, Some(&wb.bg)), (&br.caliper, c.caliper_bindings.get(wi).map(|b| &b.bg))] {
+                                let Some(bg) = bg else { continue };
+                                pass.set_bind_group(3, bg, &[]);
+                                for b in list {
+                                    pass.set_bind_group(1, b.bind.as_ref(), &[]);
+                                    pass.set_bind_group(2, &gpu.mat_bgs[&(b.mode as u32)], &[]);
+                                    pass.set_vertex_buffer(0, b.vb.slice(..));
+                                    pass.set_index_buffer(b.ib.slice(..), wgpu::IndexFormat::Uint32);
+                                    pass.draw_indexed(0..b.count, 0, 0..1);
+                                    *draws += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Vehicles {
+    /// The cars' windows into a shadow pass (the caller's pipeline stays): the original's shadow passes draw
+    /// every mesh of the car with VS_CarShadowDepthLocal, the six CarGlass meshes among them - the cabin lies
+    /// in the car's own shade and the shadow on the road has no window holes. MCLA_GLASS_NOSHADOW=1: as before.
+    pub fn draw_glass_casters<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, gpu: &'a Gpu, draws: &mut usize, range: Option<(Vec3, f32)>) {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *OFF.get_or_init(|| std::env::var("MCLA_GLASS_NOSHADOW").is_ok()) {
+            return;
+        }
+        for c in &self.cars {
+            let pos = c.render_pose(self.render_alpha).pos;
+            if let Some((eye, max)) = range {
+                if pos.distance(eye) > max {
+                    continue;
+                }
+            }
+            pass.set_bind_group(3, &c.binding.bg, &[]);
+            for b in &c.model.batches {
+                if b.mode != MatMode::CarGlass || b.shader.to_ascii_lowercase().contains("bumped") {
+                    continue;
+                }
+                pass.set_bind_group(1, b.bind.as_ref(), &[]);
+                pass.set_bind_group(2, &gpu.mat_bgs[&(b.mode as u32)], &[]);
+                pass.set_vertex_buffer(0, b.vb.slice(..));
+                pass.set_index_buffer(b.ib.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..b.count, 0, 0..1);
+                *draws += 1;
+            }
+        }
+    }
+}
+
+impl Vehicles {
+    /// What the occlusion blobs' pass needs of every car (carblob.rs): the body's matrix, the model's box, the
+    /// wheels' foot, and the player's wheels (middle, axle, radius, width - as `upload_uniforms` draws them).
+    pub fn blob_cars(&self) -> Vec<crate::carblob::CarBlob> {
+        let mut out = Vec::new();
+        for c in &self.cars {
+            if c.model.bike || (self.hide_player && c.is_player) {
+                continue;
+            }
+            let pose = c.render_pose(self.render_alpha);
+            let m = Mat4::from_rotation_translation(pose.rot, pose.pos);
+            let mut wheels = Vec::new();
+            let mut ground_y = f32::MAX;
+            for i in 0..4 {
+                let (tyre_w, tyre_r) = c.params().veh.as_ref().filter(|v| v.tyre_width[0] > 0.0).map(|v| if i < 2 { (v.tyre_width[0], v.t.wheel_front.radius + 0.00635) } else { (v.tyre_width[1], v.t.wheel_back.radius + 0.00635) }).unwrap_or((c.model.params.wheel_width, c.model.params.wheel_radius));
+                ground_y = ground_y.min(pose.hubs[i].y - tyre_r);
+                if c.is_player {
+                    let axle = m.transform_vector3(Quat::from_rotation_y(-pose.steer[i]) * Vec3::X).normalize_or(Vec3::X);
+                    wheels.push((m.transform_point3(pose.hubs[i]), axle, tyre_r, tyre_w));
+                }
+            }
+            out.push(crate::carblob::CarBlob { m, min: c.model.min, max: c.model.max, ground_y, ambient: c.model.name.to_ascii_lowercase().starts_with("va_"), wheels });
+        }
+        out
+    }
+
+    /// Every blended batch of the cars (windows, lenses) with the caller's pipeline: the blobs' pass draws the
+    /// cars over its working value (the original's stencil test).
+    pub fn draw_blended_plain<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, gpu: &'a Gpu, range: Option<(Vec3, f32)>) {
+        for c in &self.cars {
+            let pos = c.render_pose(self.render_alpha).pos;
+            if let Some((eye, max)) = range {
+                if pos.distance(eye) > max {
+                    continue;
+                }
+            }
+            pass.set_bind_group(3, &c.binding.bg, &[]);
+            for b in &c.model.batches {
+                if !b.mode.blended() {
+                    continue;
+                }
+                pass.set_bind_group(1, b.bind.as_ref(), &[]);
+                pass.set_bind_group(2, &gpu.mat_bgs[&(b.mode as u32)], &[]);
+                pass.set_vertex_buffer(0, b.vb.slice(..));
+                pass.set_index_buffer(b.ib.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..b.count, 0, 0..1);
+            }
+        }
+    }
+}
+
+impl Vehicles {
+    /// What else the original's shadow passes draw for a car (carshadow.rs): the occluder box under the body, a
+    /// sphere in each wheel, and the lamps' lenses (its VS_Light meshes cast too). The caller's pipeline stays.
+    pub fn draw_solid_casters<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, gpu: &'a Gpu, draws: &mut usize, range: Option<(Vec3, f32)>) {
+        if crate::carshadow::off() {
+            return;
+        }
+        for c in &self.cars {
+            let pose = c.render_pose(self.render_alpha);
+            if let Some((eye, max)) = range {
+                if pose.pos.distance(eye) > max {
+                    continue;
+                }
+            }
+            if c.model.bike || (self.hide_player && c.is_player) {
+                continue;
+            }
+            let Some(b0) = c.model.batches.iter().find(|b| !b.mode.blended()) else { continue };
+            let wheel = |i: usize| c.params().veh.as_ref().filter(|v| v.tyre_width[0] > 0.0).map(|v| if i < 2 { (v.t.wheel_front.radius + 0.00635, v.tyre_width[0]) } else { (v.t.wheel_back.radius + 0.00635, v.tyre_width[1]) }).unwrap_or((c.model.params.wheel_radius, c.model.params.wheel_width));
+            let s = crate::carshadow::get(gpu, &c.model.name, pose.hubs, [wheel(0), wheel(2)]);
+            pass.set_bind_group(3, &c.binding.bg, &[]);
+            for b in &c.model.batches {
+                if b.mode != MatMode::CarGlass || !b.shader.to_ascii_lowercase().contains("bumped") {
+                    continue;
+                }
+                pass.set_bind_group(1, b.bind.as_ref(), &[]);
+                pass.set_bind_group(2, &gpu.mat_bgs[&(b.mode as u32)], &[]);
+                pass.set_vertex_buffer(0, b.vb.slice(..));
+                pass.set_index_buffer(b.ib.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..b.count, 0, 0..1);
+                *draws += 1;
+            }
+            pass.set_bind_group(1, b0.bind.as_ref(), &[]);
+            pass.set_bind_group(2, &gpu.mat_bgs[&(b0.mode as u32)], &[]);
+            pass.set_vertex_buffer(0, s.vb.slice(..));
+            pass.set_index_buffer(s.ib.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(s.ranges[0].0..s.ranges[0].1, 0, 0..1);
+            *draws += 1;
+            for (wi, wb) in c.wheel_bindings.iter().enumerate().take(4) {
+                let r = s.ranges[if wi < 2 { 1 } else { 2 }];
+                pass.set_bind_group(3, &wb.bg, &[]);
+                pass.draw_indexed(r.0..r.1, 0, 0..1);
+                *draws += 1;
+            }
+        }
+    }
+}
+
+/// Which of the windows' two passes are drawn (bit 0 back faces, bit 1 front faces; 0 = the one unculled
+/// pass of before): MCLA_GLASS_ONEPASS / MCLA_GLASS_PASS, lighting diagnostics.
+fn glass_two_pass() -> u8 {
+    static V: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        if std::env::var("MCLA_GLASS_ONEPASS").is_ok() {
+            return 0;
+        }
+        match std::env::var("MCLA_GLASS_PASS").ok().as_deref().map(str::trim) {
+            Some("b") => 1,
+            Some("f") => 2,
+            _ => 3,
+        }
+    })
+}
+
+fn load_wheels(gpu: &mut Gpu, world: &mut World) -> Option<WheelModel> {
+    let rim = world.assets.root.join("resources/rims/whl_am_amer_aero");
+    load_wheels_with(gpu, world, &rim, "tir_car", 0.812, Some("tir_car_bfg_kdw_blk"))
+}
+
+/// The rim's share of the wheel diameter for a rim of so many inches.
+fn rim_ratio_for(inches: f32, wheel_radius: f32) -> f32 {
+    // (leave at least 4.5 cm of tyre)
+    (inches * 0.0254 / (2.0 * wheel_radius)).clamp(0.5, (1.0 - 0.045 / wheel_radius).min(0.9))
+}
+
+/// Rim size a car set-up asks for (`resources/vehicle/configs/<name>.xcc`: front and rear
+/// rim diameter in inches at 0x83e).
+fn config_rim_inches(root: &Path, config: &str) -> Option<f32> {
+    let d = std::fs::read(root.join("resources/vehicle/configs").join(format!("{config}.xcc"))).ok()?;
+    let v = *d.get(0x83e)? as f32;
+    if (13.0..=26.0).contains(&v) { Some(v) } else { None }
+}
+
+/// Stock rim size of a car: the starter cars have a set-up file; the others get the
+/// size of their time (15 inch classics, 17 inch in the nineties, 19 inch since).
+fn stock_rim_ratio(root: &Path, car: &str, wheel_radius: f32) -> f32 {
+    let lower = car.to_ascii_lowercase();
+    let base = lower.replace("_dub", "");
+    let inches = config_rim_inches(root, &format!("starter_{base}")).unwrap_or_else(|| {
+        if lower.ends_with("_dub") {
+            return 22.0;
+        }
+        let yy: u32 = base.rsplit('_').next().and_then(|y| y.parse().ok()).unwrap_or(5);
+        let year = if yy <= 25 { 2000 + yy } else { 1900 + yy };
+        if year < 1990 { 15.0 } else if year < 2000 { 17.0 } else { 19.0 }
+    });
+    rim_ratio_for(inches, wheel_radius)
+}
+
+/// A tire set of `resources/tires/textures/<set>`: an object with two textures, `<set>_s`
+/// (+8: the lettering's colour on black) and `<set>_n` (+12: the side wall's relief).
+fn tire_textures(gpu: &mut Gpu, root: &Path, set: &str) -> Option<[(Arc<GpuTexture>, u32); 2]> {
+    use mcla_formats::rage::{texture::Texture, Rd};
+    let file = std::fs::read_dir(root.join("resources/tires/textures").join(set)).ok()?.flatten().map(|e| e.path()).find(|p| p.extension().map_or(false, |x| x == "r1"))?;
+    let res = crate::assets::load_resource_file(&file).ok()?;
+    let rd = Rd::new(&res);
+    let mut out = Vec::new();
+    for off in [8usize, 12] {
+        let t = Texture::parse(&rd, rd.ptr(off)?).ok()?;
+        let key = mcla_formats::hash::joaat(&t.name.to_ascii_lowercase());
+        out.push((gpu.upload_texture(key, &t), key));
+    }
+    let b = out.pop()?;
+    Some([out.pop()?, b])
+}
+
+pub fn load_wheels_with(gpu: &mut Gpu, world: &mut World, rim_dir: &Path, tyre: &str, rim_ratio: f32, tire_set: Option<&str>) -> Option<WheelModel> {
+    let root = world.assets.root.clone();
+    let tire_tex = tire_set.and_then(|s| tire_textures(gpu, &root, s));
+    let mut sources = Vec::new();
+    if let Ok(t) = std::env::var("MCLA_TIRE_DUMP") {
+        use mcla_formats::rage::{texture::Texture, Dictionary, Rd};
+        if let Ok(rdir) = std::fs::read_dir(root.join("resources/tires/textures").join(&t)) {
+            for e in rdir.flatten() {
+                let Ok(r) = crate::assets::load_resource_file(&e.path()) else { continue };
+                let rd = Rd::new(&r);
+                log::info!("tire dict {} vtable {:08x}", e.path().display(), rd.vtable(0));
+                for off in (0..64).step_by(4) {
+                    let at = if off == 0 { Some(0) } else { rd.ptr(off) };
+                    if let Some(Ok(tx)) = at.map(|o| Texture::parse(&rd, o)) {
+                        if tx.width > 0 && tx.width <= 4096 && tx.height > 0 {
+                            log::info!("tire texture at +{} -> {:?}: {} {}x{} {:?} means {:?}", off, at, tx.name, tx.width, tx.height, tx.format, tx.level_means().first());
+                        }
+                    }
+                }
+                match Dictionary::parse(&rd, 0) {
+                    Ok(d) => {
+                        log::info!("tire dict entries {} {:?}", d.len(), d.hashes.iter().map(|h| format!("{:08x}", h)).collect::<Vec<_>>());
+                        for (h, v) in d.hashes.iter().zip(d.values.iter()) {
+                            match v.map(|o| Texture::parse(&rd, o)) {
+                                Some(Ok(tx)) => log::info!("tire texture {:08x} {} {}x{} means {:?}", h, tx.name, tx.width, tx.height, tx.level_means().first()),
+                                Some(Err(e)) => log::info!("tire texture {:08x} error {:#}", h, e),
+                                None => log::info!("tire texture {:08x} none", h),
+                            }
+                        }
+                    }
+                    Err(e) => log::info!("tire dict error {:#}", e),
+                }
+            }
+        }
+    }
+    let dump_dir = std::env::var("MCLA_BRAKE_DUMP").ok().map(|d| root.join("resources/brakes").join(d));
+    for dir in [root.join("resources/tires/models").join(tyre), dump_dir.unwrap_or_else(|| rim_dir.to_path_buf())] {
+        let mut r63 = None;
+        let mut r83 = None;
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                match p.extension().and_then(|x| x.to_str()) {
+                    Some("r63") => r63 = Some(p),
+                    Some("r83") => r83 = Some(p),
+                    _ => {}
+                }
+            }
+        }
+        if let (Some(m), Some(sh)) = (r63, r83) {
+            // (the shaders and the rim's own texture are in the .r83)
+            let look = vehicle_model::load_simple(&sh, None).ok();
+            if let Ok(mut model) = vehicle_model::load_simple(&m, None) {
+                if let Some(look) = look {
+                    if std::env::var("MCLA_WHEEL_DUMP").is_ok() {
+                        log::info!("wheel look {}: model shaders {:?}, look shaders {:?}, look textures {:?}", dir.display(), model.shaders.iter().map(|s| (s.name.clone(), s.params.len(), s.textures().map(|t| format!("{:08x}={}", t.0, t.1)).collect::<Vec<_>>())).collect::<Vec<_>>(), look.shaders.iter().map(|s| (s.name.clone(), s.params.len(), s.textures().map(|t| format!("{:08x}={}", t.0, t.1)).collect::<Vec<_>>())).collect::<Vec<_>>(), look.textures.iter().map(|(h, t)| format!("{:08x}={} {}x{}", h, t.name, t.width, t.height)).collect::<Vec<_>>());
+                    }
+                    if model.shaders.is_empty() {
+                        model.shaders = look.shaders;
+                    }
+                    for (h, t) in look.textures {
+                        model.textures.entry(h).or_insert(t);
+                    }
+                }
+                sources.push(model);
+            }
+        }
+    }
+    if sources.is_empty() {
+        return None;
+    }
+    let mut batches = Vec::new();
+    // (where the rim's spokes stand: the mean x of its zone 1)
+    let spoke_x = sources.last().filter(|_| sources.len() > 1).and_then(|m| m.meshes.iter().max_by_key(|(mesh, _)| mesh.indices.len())).map_or(-0.2, |(mesh, _)| {
+        let (sum, n) = mesh.positions.iter().zip(mesh.uv1.iter()).filter(|(_, u)| u.x.round() == 1.0).fold((0.0f32, 0u32), |a, (p, _)| (a.0 + p.x, a.1 + 1));
+        if n > 0 { sum / n as f32 } else { -0.2 }
+    });
+    for (src_i, model) in sources.iter().enumerate() {
+        // (per shader: the rim's badge, a few triangles on the hub with the rim's own texture, is not a
+        // coarser level of the rim)
+        let mut seen_by: hashbrown::HashMap<u32, usize> = hashbrown::HashMap::new();
+        // Tyre and rim are both unit-diameter models. The rim is scaled to its size; the
+        // tyre's bead (modelled at radius 0.406, a 21 inch rim on most cars) is pulled in
+        // to meet it, which makes the side wall as tall as the rim leaves room for.
+        let is_rim = src_i + 1 == sources.len() && sources.len() > 1;
+        let xf = if is_rim { Mat4::from_scale(Vec3::new(1.0, rim_ratio, rim_ratio)) } else { Mat4::IDENTITY };
+        let bead = rim_ratio * 0.5;
+        for (mesh, si) in &model.meshes {
+            let mut morphed;
+            let mesh = if !is_rim && (bead - 0.406).abs() > 0.004 {
+                morphed = mesh.clone();
+                for p in morphed.positions.iter_mut() {
+                    let rad = (p.y * p.y + p.z * p.z).sqrt();
+                    if rad > 1e-4 {
+                        let to = if rad >= 0.406 { 0.5 - (0.5 - rad) * (0.5 - bead) / (0.5 - 0.406) } else { rad * bead / 0.406 };
+                        p.y *= to / rad;
+                        p.z *= to / rad;
+                    }
+                }
+                &morphed
+            } else {
+                mesh
+            };
+            let sname = model.shaders.get(*si as usize).map(|s| s.name.clone()).unwrap_or_default();
+            if std::env::var("MCLA_WHEEL_DUMP").is_ok() {
+                let mn = mesh.positions.iter().fold(Vec3::splat(1e9), |a, b| a.min(*b));
+                let mx = mesh.positions.iter().fold(Vec3::splat(-1e9), |a, b| a.max(*b));
+                log::info!("wheel mesh (all) src {} shader#{} {} tris {} bounds {:?}..{:?} uv0 {:?}..{:?}", src_i, si, sname, mesh.indices.len() / 3, mn, mx, mesh.uv0.iter().fold(glam::Vec2::splat(1e9), |a, b| a.min(*b)), mesh.uv0.iter().fold(glam::Vec2::splat(-1e9), |a, b| a.max(*b)));
+            }
+            let seen_tris = seen_by.entry(*si as u32).or_insert(0);
+            if *seen_tris > 0 && mesh.indices.len() / 3 <= *seen_tris / 2 {
+                continue;
+            }
+            *seen_tris = (*seen_tris).max(mesh.indices.len() / 3);
+            if log::log_enabled!(log::Level::Debug) {
+{
+                    let mut cols: hashbrown::HashMap<[u8; 4], u32> = hashbrown::HashMap::new();
+                    for c in &mesh.colors {
+                        *cols.entry(*c).or_insert(0) += 1;
+                    }
+                    let mut cv: Vec<_> = cols.into_iter().collect();
+                    cv.sort_by_key(|x| std::cmp::Reverse(x.1));
+                    cv.truncate(8);
+                    let mut u1: hashbrown::HashMap<(i32, i32), u32> = hashbrown::HashMap::new();
+                    for u in &mesh.uv1 {
+                        *u1.entry(((u.x * 10.0) as i32, (u.y * 10.0) as i32)).or_insert(0) += 1;
+                    }
+                    let mut uv: Vec<_> = u1.into_iter().collect();
+                    uv.sort_by_key(|x| std::cmp::Reverse(x.1));
+                    uv.truncate(8);
+                    log::debug!("wheel attrs src {} verts {} colors {:?} uv1x10 {:?} uv0 n {}", src_i, mesh.positions.len(), cv, uv, mesh.uv0.len());
+                }
+                                log::debug!("wheel mesh src {} tris {} shader {} params {:?}", src_i, mesh.indices.len() / 3, sname, model.shaders.get(*si as usize).map(|s| s.params.iter().map(|(h, p)| format!("{:08x}={:?}", h, p)).collect::<Vec<_>>()));
+            }
+            if std::env::var("MCLA_WHEEL_DUMP").is_ok() {
+                let mn = mesh.positions.iter().fold(Vec3::splat(1e9), |a, b| a.min(*b));
+                let mx = mesh.positions.iter().fold(Vec3::splat(-1e9), |a, b| a.max(*b));
+                log::info!("wheel mesh src {} shader {} tris {} bounds {:?}..{:?}", src_i, sname, mesh.indices.len() / 3, mn, mx);
+                let mut zx = [(0.0f32, 0u32); 4];
+                for (p, u) in mesh.positions.iter().zip(mesh.uv1.iter()) {
+                    let z = (u.x.round() as usize).min(3);
+                    zx[z].0 += p.x;
+                    zx[z].1 += 1;
+                }
+                log::info!("wheel zones mean x {:?} of {}", zx.iter().map(|(s, n)| if *n > 0 { s / *n as f32 } else { 9.0 }).collect::<Vec<_>>(), rim_dir.display());
+            }
+            // (a tyre with its set of textures goes through the rim's branch as zones 10, 11)
+            let rubber = sname.to_ascii_lowercase().contains("rubber");
+            // (RimBadge: the maker's mark on the hub, a cut-out of the rim's own texture. MCLA_RIM_BADGE_OLD: a mirror as before)
+            let badge = sname.eq_ignore_ascii_case("RimBadge") && std::env::var("MCLA_RIM_BADGE_OLD").is_err();
+            let mode = if rubber && tire_tex.is_none() { MatMode::Rubber } else if rubber || sname.eq_ignore_ascii_case("RimMain") { MatMode::Rim } else if badge { MatMode::AlphaTest } else { MatMode::Chrome };
+            let texname = model.shaders.get(*si as usize).and_then(|s| s.diffuse().map(|t| t.to_string()));
+            let k = texname.as_deref().map(mcla_formats::hash::joaat).unwrap_or(0);
+            // The model's own dictionary first (every rim's one picture, `whl_*.dds`, is only there),
+            // under the bare name hash as the car bodies' are. One name sits in two rims with different
+            // pictures (whl_am_bbs_lm.dds, in whl_am_bbs_rs_gt too): a picture that is not named after
+            // its folder is keyed with the folder.
+            // (MCLA_RIM_TEX_OLD: as it stood, for a comparison shot)
+            let own = texname.as_deref().filter(|_| k != 0 && std::env::var("MCLA_RIM_TEX_OLD").is_err()).and_then(|n| {
+                let l = n.to_ascii_lowercase();
+                let stem = l.trim_end_matches(".dds");
+                let t = model.textures.get(&k).or_else(|| model.textures.get(&mcla_formats::hash::joaat(stem)))?;
+                let folder = if src_i == 0 { tyre.to_ascii_lowercase() } else { rim_dir.file_name().map(|f| f.to_string_lossy().to_ascii_lowercase()).unwrap_or_default() };
+                Some((if folder == stem { k } else { k ^ mcla_formats::hash::joaat(&folder) }, t))
+            });
+            let k = own.map_or(k, |o| o.0);
+            let tex = match own {
+                Some((key, t)) => gpu.upload_texture(key, t),
+                None if k != 0 => world.texture_any(gpu, k).unwrap_or_else(|| gpu.white.clone()),
+                None => gpu.white.clone(),
+            };
+            if std::env::var("MCLA_WHEEL_DUMP").is_ok() {
+                log::info!("wheel texture src {} shader {} {:?} key {:08x} own {} {}x{}", src_i, sname, texname, k, own.is_some(), tex.width, tex.height);
+            }
+            let mut b = match tire_tex.as_ref().filter(|_| rubber) {
+                Some([s, n]) => mesh_to_batch_xf(gpu, mesh, &sname, mode, s.0.clone(), n.0.clone(), s.1, n.1, xf),
+                None => mesh_to_batch_xf(gpu, mesh, &sname, mode, tex.clone(), tex, k, k, xf),
+            };
+            if mode == MatMode::Rim || badge {
+                // rims need the baked occlusion (vertex colour alpha) the generic path drops; the badge, as
+                // the brakes' cut-outs, goes white (its colour channels are empty)
+                let n = mesh.positions.len();
+                let verts: Vec<Vertex> = (0..n)
+                    .map(|i| {
+                        let p = xf.transform_point3(mesh.positions[i]);
+                        let nr = xf.transform_vector3(mesh.normals.get(i).copied().unwrap_or(Vec3::Y)).normalize_or(Vec3::Y);
+                        let nr = car_binormal_mark(mesh, i, nr);
+                        let c = mesh.colors.get(i).copied().unwrap_or([255, 255, 255, 255]);
+                        let u1 = mesh.uv1.get(i).copied().unwrap_or_default();
+                        let (uv1, alpha) = if rubber { ([10.0 + u1.x.round().clamp(0.0, 1.0), u1.y], 255) } else if badge { (u1.to_array(), 255) } else { (u1.to_array(), c[0]) };
+                        Vertex { pos: p.to_array(), normal: nr.to_array(), uv0: mesh.uv0.get(i).copied().unwrap_or_default().to_array(), uv1, color: [255, 255, 255, alpha], color1: [0, 0, 0, 255], uv2: [0.0, 0.0] }
+                    })
+                    .collect();
+                b.vb = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("rim vb"), contents: bytemuck::cast_slice(&verts), usage: wgpu::BufferUsages::VERTEX });
+            }
+            batches.push(b);
+        }
+    }
+    Some(WheelModel { batches, spoke_x })
+}

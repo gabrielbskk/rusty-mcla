@@ -1,0 +1,34 @@
+[package]
+name = "mcla"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mcla"
+path = "src/main.rs"
+
+[dependencies]
+mcla-formats = { path = "../formats" }
+mcla-flash = { path = "../flash" }
+mcla-config = { path = "../config" }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+memmap2.workspace = true
+rayon.workspace = true
+glam.workspace = true
+bytemuck.workspace = true
+hashbrown.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+wgpu = "24"
+winit = "0.30"
+pollster = "0.4"
+egui = "0.31"
+egui-wgpu = "0.31"
+egui-winit = { version = "0.31", default-features = false, features = ["links"] }
+gilrs = "0.11"
+png = "0.17"
+rodio = { version = "0.20", default-features = false, features = ["symphonia-all"] }

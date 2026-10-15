@@ -1,0 +1,2588 @@
+//! Loose props as the car's hull meets them: what the original does when an active body
+//! reaches an INACTIVE instance of the physics level (work/veh/gjkfix/z4/z4_decode.md, the
+//! decodes in work/veh/gjkfix/p1/ and work/veh/gjk_exact.md part 10). The prop has no body when
+//! it is hit: the tick's velocity solve takes it for immovable, the breaking pass gives the car
+//! only a share of that impulse, turns the prop - or the group of it that broke off - into a
+//! body, and solves again.
+//!
+//! This file holds the props' data as the physics reads it (the fragment types and where they
+//! stand), the cache entries and pieces that have come loose, the narrow phase between a car's
+//! hull and a prop's parts, the breaking pass, and the pieces' own motion.
+
+use super::collision::{surface_touch, Surface};
+use super::exact::{self as ex, cross, dot3, fma, recip};
+use super::gjk::{convex_contact, HullCore, Nearest, PartCore, Support};
+use super::hull::HullShape;
+use super::solver::{self, Body, Pushed, Side, Touch};
+use glam::Vec3;
+use mcla_formats::rage::fragphys::{FragBound, FragInstance, FragType};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+/// The edge of the cells the instances are looked up by (m).
+const CELL: f32 = 16.0;
+
+/// Every prop of the level: the types and the instances, as the file has them.
+#[derive(Debug, Default)]
+pub struct LooseWorld {
+    pub types: Vec<FragType>,
+    /// each instance and the number of its type in `types`
+    pub instances: Vec<(FragInstance, usize)>,
+    cells: HashMap<(i32, i32), Vec<u32>>,
+}
+
+fn cell_of(x: f32, z: f32) -> (i32, i32) {
+    ((x / CELL).floor() as i32, (z / CELL).floor() as i32)
+}
+
+pub fn v(a: [f32; 3]) -> Vec3 {
+    Vec3::new(a[0], a[1], a[2])
+}
+
+fn m4(a: &[[f32; 3]; 4]) -> [Vec3; 4] {
+    [v(a[0]), v(a[1]), v(a[2]), v(a[3])]
+}
+
+/// A point of a frame carried into the world (a sum of four, vmsum4fp with the column).
+pub fn xf(m: &[Vec3; 4], p: Vec3) -> Vec3 {
+    Vec3::new((m[3].x + m[2].x * p.z) + (m[1].x * p.y + m[0].x * p.x), (m[3].y + m[2].y * p.z) + (m[1].y * p.y + m[0].y * p.x), (m[3].z + m[2].z * p.z) + (m[1].z * p.y + m[0].z * p.x))
+}
+
+/// A world vector in a frame's axes (three sums of three).
+pub fn inv(m: &[Vec3; 4], d: Vec3) -> Vec3 {
+    Vec3::new(dot3(m[0], d), dot3(m[1], d), dot3(m[2], d))
+}
+
+impl LooseWorld {
+    pub fn new(types: Vec<FragType>, instances: Vec<FragInstance>) -> LooseWorld {
+        let by_off: HashMap<usize, usize> = types.iter().enumerate().map(|(i, t)| (t.off, i)).collect();
+        let mut out = LooseWorld { types, instances: Vec::new(), cells: HashMap::new() };
+        for inst in instances {
+            let Some(&t) = by_off.get(&inst.frag) else { continue };
+            // (state 3 is never put into the level: the glow cards)
+            if inst.state == 3 || !inst.matrix[3].iter().all(|x| x.is_finite()) {
+                continue;
+            }
+            let i = out.instances.len() as u32;
+            out.cells.entry(cell_of(inst.matrix[3][0], inst.matrix[3][2])).or_default().push(i);
+            out.instances.push((inst, t));
+        }
+        out
+    }
+
+    /// The prop file of a data directory.
+    pub fn load(file: &std::path::Path) -> Option<Arc<LooseWorld>> {
+        let res = crate::assets::load_resource_file(file).ok()?;
+        let types = mcla_formats::rage::fragphys::parse_frag_types(&res);
+        let instances = mcla_formats::rage::fragphys::parse_frag_instances(&res);
+        if std::env::var_os("MCLA_DBG_LOOSELIST").is_some() {
+            for (n, i) in instances.iter().enumerate() {
+                eprintln!("LOOSEINST {n} state {} frag {:x} at {:?}", i.state, i.frag, i.matrix[3]);
+            }
+        }
+        Some(Arc::new(LooseWorld::new(types, instances)))
+    }
+
+    /// The instances whose place is within `r` of `p` on the map, in the file's order.
+    pub fn near(&self, p: Vec3, r: f32) -> Vec<u32> {
+        let (x0, z0) = cell_of(p.x - r, p.z - r);
+        let (x1, z1) = cell_of(p.x + r, p.z + r);
+        let mut out = Vec::new();
+        for cx in x0..=x1 {
+            for cz in z0..=z1 {
+                if let Some(list) = self.cells.get(&(cx, cz)) {
+                    for &i in list {
+                        let m = &self.instances[i as usize].0.matrix[3];
+                        if (m[0] - p.x).abs() <= r && (m[2] - p.z).abs() <= r {
+                            out.push(i);
+                        }
+                    }
+                }
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Cache entries: which groups of a prop an instance still holds, and what it weighs
+// (0x824A9130, 0x8259A580, 0x8259A390, 0x8258E858 / 0x825A4088; p1/break_decode.md 3.3, 3.4).
+
+/// A fragment cache entry: the groups it has lost, its age, and its mass properties.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Entry {
+    /// the groups NOT in it (+268)
+    pub absent: u64,
+    /// seconds since the prop first got an entry (+420)
+    pub age: f32,
+    /// the composite's centre of gravity (bound +80), the archetype's mass and moments
+    pub cg: Vec3,
+    pub mass: f32,
+    pub inv_mass: f32,
+    pub inertia: Vec3,
+    pub inv_inertia: Vec3,
+}
+
+fn group_of(t: &FragType, child: usize) -> usize {
+    t.children.get(child).map_or(0, |c| c.group as usize)
+}
+
+/// Is part `child` in an entry: the type has a bound there and its group has not left.
+pub fn part_present(t: &FragType, absent: u64, child: usize) -> bool {
+    t.parts.get(child).map_or(false, |p| p.bound.is_some()) && absent & (1 << group_of(t, child)) == 0
+}
+
+/// A group and everything that hangs on it, as a bit set.
+pub fn subtree(t: &FragType, g: usize) -> u64 {
+    let mut bits = 1u64 << g;
+    let grp = &t.groups[g];
+    for k in 0..grp.groups as usize {
+        bits |= subtree(t, grp.first_group as usize + k);
+    }
+    bits
+}
+
+/// The mass of what an entry holds (0x824A6DC8 / 0x824A9458): the children's, in their order.
+pub fn entry_mass(t: &FragType, absent: u64) -> f32 {
+    let mut m = 0.0f32;
+    for (c, child) in t.children.iter().enumerate() {
+        if absent & (1 << group_of(t, c)) == 0 {
+            m = child.mass + m;
+        }
+    }
+    m
+}
+
+/// 0x824A9130: the entry's centre of gravity (by the parts' volumes; shifted by the type's +0x40
+/// while the entry is younger than a quarter of a second), its mass, and its moments (each
+/// part's own about its place, carried to the centre without its turn; no moment under a
+/// twentieth of the largest).
+pub fn entry_refresh(t: &FragType, e: &mut Entry, mass: f32) {
+    let mut acc = Vec3::ZERO;
+    let mut tot = 0.0f32;
+    for (c, part) in t.parts.iter().enumerate() {
+        let Some(b) = part.bound.as_ref().filter(|_| part_present(t, e.absent, c)) else { continue };
+        let w = b.volume;
+        tot = w + tot;
+        let m = m4(&part.matrix);
+        let p = if b.flag6 { xf(&m, v(b.cg)) } else { m[3] };
+        acc = p * w + acc;
+    }
+    if tot > f32::from_bits(0x3586_37bd) {
+        acc = acc * recip(tot);
+    }
+    e.cg = acc;
+    if e.age < 0.25 {
+        e.cg = e.cg + v(t.cg_shift);
+    }
+    e.mass = mass;
+    e.inv_mass = if mass == 0.0 { 0.0 } else { 1.0 / mass };
+    let mut sum = 0.0f32;
+    let mut inertia = Vec3::ZERO;
+    for (c, part) in t.parts.iter().enumerate() {
+        let Some(b) = part.bound.as_ref().filter(|_| part_present(t, e.absent, c)) else { continue };
+        let (m, own) = (t.children[c].mass, v(t.children[c].inertia));
+        let d = (v(part.matrix[3]) + v(b.cg)) - e.cg;
+        sum = m + sum;
+        let (zz, yy, xx) = (d.z * d.z, d.y * d.y, d.x * d.x);
+        inertia = inertia + Vec3::new(fma(yy + zz, m, own.x), fma(xx + zz, m, own.y), fma(xx + yy, m, own.z));
+    }
+    if sum > f32::MIN_POSITIVE {
+        // (0x825A4088)
+        let mut i = inertia.to_array();
+        let big = if i[0] >= i[1] { if i[0] >= i[2] { 0 } else { 2 } } else if i[1] >= i[2] { 1 } else { 2 };
+        for j in 0..3 {
+            if j != big && i[j] * 20.0 < i[big] {
+                i[j] = i[big] * 0.05;
+            }
+        }
+        e.inertia = Vec3::from_array(i);
+        e.inv_inertia = Vec3::new(if i[0] == 0.0 { f32::MAX } else { recip(i[0]) }, if i[1] == 0.0 { f32::MAX } else { recip(i[1]) }, if i[2] == 0.0 { f32::MAX } else { recip(i[2]) });
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Bodies of what has come loose (the simulator's pool bodies, 672 bytes; p1/body_decode.md).
+
+/// The body of an activated prop or piece.
+#[derive(Clone, Copy, Debug)]
+pub struct PBody {
+    /// +256 and +208..: the centre of gravity in the world and the rows
+    pub at: Vec3,
+    pub rows: [Vec3; 3],
+    pub v: Vec3,
+    pub w: Vec3,
+    /// the momenta (+304, +320)
+    pub p: Vec3,
+    pub l: Vec3,
+    pub force: Vec3,
+    pub torque: Vec3,
+    /// the impulses not yet in the momenta (+368, +384)
+    pub jf: Vec3,
+    pub jt: Vec3,
+    /// what the push solve asks (+400, +416)
+    pub push: Vec3,
+    pub turn: Vec3,
+    /// the instance's matrix as the last collide is to have it (+96), and whether it is set (+660)
+    pub last: [Vec3; 4],
+    /// the instance's matrix before this tick's move (+32)
+    pub prev: [Vec3; 4],
+    pub last_set: bool,
+    pub deep: bool,
+    pub deep_count: u8,
+    pub mass: f32,
+    pub inv_mass: f32,
+    pub inertia: Vec3,
+    pub inv_inertia: Vec3,
+    pub max_speed: f32,
+    pub max_spin: f32,
+    /// moves since the rows were made square (+664)
+    pub moves: u32,
+}
+
+/// 0x8259BCC8 / 0x8259BD78: a velocity and its momentum cut back to the body's limit.
+fn capped(v: Vec3, p: Vec3, max: f32) -> (Vec3, Vec3) {
+    let l2 = fma(v.y, v.y, fma(v.z, v.z, v.x * v.x));
+    if l2 <= max * max {
+        return (v, p);
+    }
+    let mut e = (1.0 / (l2 as f64).sqrt()) as f32;
+    for _ in 0..2 {
+        e = fma(ex::fnms(e * e, l2, 1.0), e * 0.5, e);
+    }
+    let k = e * max;
+    (v * k, p * k)
+}
+
+impl PBody {
+    /// 0x8259E648 on an instance at `matrix` whose bound's centre of gravity is `cg`.
+    fn new(matrix: &[Vec3; 4], cg: Vec3, e: &Entry, max_speed: f32, max_spin: f32) -> PBody {
+        PBody {
+            at: xf(matrix, cg),
+            rows: [matrix[0], matrix[1], matrix[2]],
+            v: Vec3::ZERO,
+            w: Vec3::ZERO,
+            p: Vec3::ZERO,
+            l: Vec3::ZERO,
+            force: Vec3::ZERO,
+            torque: Vec3::ZERO,
+            jf: Vec3::ZERO,
+            jt: Vec3::ZERO,
+            push: Vec3::ZERO,
+            turn: Vec3::ZERO,
+            last: *matrix,
+            prev: *matrix,
+            last_set: false,
+            deep: false,
+            deep_count: 0,
+            mass: e.mass,
+            inv_mass: e.inv_mass,
+            inertia: e.inertia,
+            inv_inertia: e.inv_inertia,
+            max_speed,
+            max_spin,
+            moves: 0,
+        }
+    }
+
+    /// The angular momentum of a turning rate (0x8259E180).
+    fn momentum_of(&self, w: Vec3) -> Vec3 {
+        let iw = ex::world_inertia(&self.rows, self.inertia);
+        Vec3::new(dot3(Vec3::new(iw[0].x, iw[1].x, iw[2].x), w), dot3(Vec3::new(iw[0].y, iw[1].y, iw[2].y), w), dot3(Vec3::new(iw[0].z, iw[1].z, iw[2].z), w))
+    }
+
+    /// 0x8259DB98: an impulse at a point, taken into the momenta at once.
+    pub fn impulse_now(&mut self, vec: Vec3, point: Vec3) {
+        self.p = self.p + vec;
+        (self.v, self.p) = capped(self.p * self.inv_mass, self.p, self.max_speed);
+        let r = point - self.at;
+        self.l = self.l + cross(r, vec);
+        (self.w, self.l) = capped(ex::spin_of(self.l, &self.rows, self.inv_inertia), self.l, self.max_spin);
+    }
+
+    pub fn as_solver(&self) -> Body {
+        Body { at: self.at, rows: self.rows, vel: self.v, ang: self.w, inv_mass: self.inv_mass, inv_moments: self.inv_inertia, force: self.force, torque: self.torque }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The objects of the level that a car has had to do with.
+
+/// A prop instance or a piece broken off one.
+#[derive(Clone, Debug)]
+pub struct Obj {
+    pub ty: usize,
+    /// the prop instance this is (None: a piece, a cache entry's own instance)
+    pub inst: Option<u32>,
+    /// the instance's matrix (inst +16)
+    pub matrix: [Vec3; 4],
+    pub entry: Option<Entry>,
+    /// inst +80 bit 1: it has been moved or broken by the breaking pass
+    pub hit: bool,
+    pub body: Option<PBody>,
+    /// its place among the level's indices and among the instances' addresses, against the
+    /// car's (0): who is A in a pair, and whose contacts an island's rows begin with
+    pub level: i64,
+    pub addr: i64,
+    /// (stage R) another vehicle: its bound and what its archetype holds
+    pub veh: Option<VehObj>,
+}
+
+/// Who a contact's side is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Who {
+    Car,
+    Obj(usize),
+    /// the city (always side B)
+    City,
+}
+
+/// A contact of a pair of parts as the manifold keeps it.
+#[derive(Clone, Copy, Debug)]
+pub struct Slot2 {
+    pub t: Touch,
+    pub age: u16,
+    pub enabled: bool,
+    /// which triangle of the car's hull (for its material)
+    pub element: u16,
+    /// what the city's polygon is made of
+    pub surface: Surface,
+}
+
+/// The contacts of one part of an object with one part of the car (a sub-manifold).
+#[derive(Clone, Debug)]
+pub struct Mani {
+    pub a: Who,
+    pub b: Who,
+    pub part_a: u16,
+    pub part_b: u16,
+    /// the city's cell (side B the city)
+    pub cell: usize,
+    /// its parts' instance broke this tick: the pair it belonged to is no more
+    pub stale: bool,
+    /// the tick's collide has looked at this pair of parts
+    pub visited: bool,
+    /// the island the tick's collide put it in (the car's: 0), and its pair's place in the island's tree
+    pub island: usize,
+    pub order: usize,
+    pub slots: Vec<Slot2>,
+}
+
+impl Mani {
+    /// A new contact into the manifold (0x825C65E8 -> 0x825A37A8, 0x825A3028 / 0x825A3838): it
+    /// takes the place of the kept one within 2 cm of it, by A's point, that a refresh has seen -
+    /// and its multipliers, and its element if that one was the deeper - or is added.
+    fn insert(&mut self, fresh: Touch, element: u16, surface: Surface) {
+        let mut nearest = (f32::from_bits(0x39d1_b717), None);
+        for (i, s) in self.slots.iter().enumerate() {
+            let d = s.t.a.local - fresh.a.local;
+            let d2 = fma(d.x, d.x, fma(d.z, d.z, d.y * d.y));
+            if d2 < nearest.0 && s.age != 0 {
+                nearest = (d2, Some(i));
+            }
+        }
+        let slot = Slot2 { t: fresh, age: 0, enabled: true, element, surface };
+        match nearest.1 {
+            Some(i) => {
+                let old = self.slots[i];
+                self.slots[i] = Slot2 { t: Touch { kept: old.t.kept, pushed: old.t.pushed, ..fresh }, element: if old.t.depth >= fresh.depth { old.element } else { element }, surface: if old.t.depth >= fresh.depth { old.surface } else { surface }, ..slot };
+            }
+            None if self.slots.len() < 6 => self.slots.push(slot),
+            // (the seventh, 0x825A32C0)
+            None => {
+                let k = super::hull::seventh_contact(std::array::from_fn(|i| self.slots[i].t.a.local), fresh.a.local);
+                if k < 6 && !super::vehsim::dbg_flag("MCLA_DBG_RA3") {
+                    self.slots[k] = slot;
+                }
+            }
+        }
+    }
+}
+
+/// A part ready for the detector.
+struct Shape<'a> {
+    core: Core<'a>,
+    margin: f32,
+    cg: Vec3,
+    bbox: (Vec3, Vec3),
+    now: [Vec3; 4],
+    last: [Vec3; 4],
+}
+
+/// The two parts' boxes, each grown to hold itself at its last matrix too, tested along their
+/// six face axes (0x825CCE00's cull; a decision only, written plainly).
+fn boxes_meet(a: &Shape, b: &Shape) -> bool {
+    let swept = |s: &Shape| {
+        let (c, h) = ((s.bbox.1 + s.bbox.0) * 0.5, (s.bbox.1 - s.bbox.0) * 0.5);
+        let (m, l) = (&s.now, &s.last);
+        let r: [Vec3; 3] = std::array::from_fn(|i| inv(m, l[i]));
+        let t = inv(m, l[3] - m[3]);
+        let c2 = t + r[0] * c.x + r[1] * c.y + r[2] * c.z;
+        let e2 = r[0].abs() * h.x + r[1].abs() * h.y + r[2].abs() * h.z;
+        let (hi, lo) = ((c + h).max(c2 + e2), (c - h).min(c2 - e2));
+        let mid = (hi + lo) * 0.5;
+        (xf(m, mid), hi - mid)
+    };
+    let ((wa, ha), (wb, hb)) = (swept(a), swept(b));
+    let eps = Vec3::splat(1e-6);
+    let r: [Vec3; 3] = std::array::from_fn(|i| inv(&b.now, a.now[i]));
+    let ab: [Vec3; 3] = std::array::from_fn(|i| r[i].abs() + eps);
+    let t = inv(&b.now, wa - wb);
+    let q = -Vec3::new(r[0].dot(t), r[1].dot(t), r[2].dot(t));
+    let w = r[0] * q.x + r[1] * q.y + r[2] * q.z;
+    let col = |k: usize| Vec3::new(ab[0][k], ab[1][k], ab[2][k]);
+    (0..3).all(|i| ha[i] + ab[i].dot(hb) > q[i].abs()) && (0..3).all(|k| hb[k] + col(k).dot(ha) > w[k].abs())
+}
+
+/// What the car is, for the props' side of a tick.
+pub struct CarIn<'a> {
+    pub hull: &'a HullShape,
+    /// the hull bound's centre of gravity (bound +0x50) and margin
+    pub hull_cg: Vec3,
+    pub hull_margin: f32,
+    /// the car's matrix as the collide has it, and as its last one (body +96)
+    pub now: [Vec3; 4],
+    pub last: [Vec3; 4],
+    /// chassis +224
+    pub speed: f32,
+    /// the composite bound's box (min, max)
+    pub bound: (Vec3, Vec3),
+    /// the wheels' parts (the composite's parts 1..), None where there is none
+    pub wheels: Vec<Option<WheelIn>>,
+    /// (stage R, agent D) the body's velocity as the tick came in (collider +272 at the callbacks), BoundFriction /
+    /// BoundElasticity, and chassis +592 bits 0x10 / 0x04
+    pub vel: Vec3,
+    pub touch: (f32, f32),
+    pub wiped: bool,
+}
+
+/// A wheel's part of the car's bound for the props' side of a tick: its core where it stands, its matrix
+/// (part x instance) now and as the last collide is to have had it - the car's last matrix with the wheel
+/// at the top of its travel - and its box's half sizes.
+#[derive(Clone, Copy)]
+pub struct WheelIn {
+    pub core: super::gjk::WheelCore,
+    pub now: [Vec3; 4],
+    pub last: [Vec3; 4],
+    pub half: Vec3,
+}
+
+/// The car's momenta while the breaking pass hands out its shares.
+pub struct CarDyn<'a> {
+    pub p: &'a mut Vec3,
+    pub l: &'a mut Vec3,
+    pub mass: f32,
+    pub inverse: Vec3,
+    /// the rows the turning rate is taken through (+208..)
+    pub rows: [Vec3; 3],
+}
+
+/// Everything loose a car has met.
+#[derive(Clone, Debug, Default)]
+pub struct LooseState {
+    pub objs: Vec<Obj>,
+    by_inst: HashMap<u32, usize>,
+    pub manis: Vec<Mani>,
+    pieces_made: usize,
+    /// (debug) ticks
+    pub tick: u32,
+    /// the cache entries made so far: each took the next instance of the pool (0x90 bytes, downwards)
+    entries_made: i64,
+    /// the level indices handed out in the update `.0` so far
+    indices_taken: (i64, usize),
+    /// the place of the car's own pair with the city in its island's tree (None: no such pair this tick)
+    car_city_order: Option<usize>,
+}
+
+/// What a run does not let one derive (the level's indices and the heap's addresses), given per
+/// replay: `MCLA_LOOSE_HINTS` = words `b:<prop instance>` (the prop's level index is above the
+/// car's: the car is A against it), `after:<prop instance>` (its address is above the car's),
+/// `pb:<n>` / `pafter:<n>` the same for the n-th piece made.
+fn hint(kind: &str, n: usize) -> bool {
+    static H: std::sync::OnceLock<Vec<(String, usize)>> = std::sync::OnceLock::new();
+    H.get_or_init(|| {
+        std::env::var("MCLA_LOOSE_HINTS")
+            .unwrap_or_default()
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter_map(|w| w.split_once(':').and_then(|(k, n)| n.parse().ok().map(|n| (k.to_string(), n))))
+            .collect()
+    })
+    .iter()
+    .any(|(k, i)| k == kind && *i == n)
+}
+
+/// `MCLA_LOOSE_HINTS` words `l<object>:<rank>` / `a<object>:<rank>`: the level index / the address of
+/// the n-th object a replay comes to (props as the car nears them, pieces as they are made), as a
+/// rank against the car's 0.
+fn rank(kind: char, obj: usize) -> Option<i64> {
+    static H: std::sync::OnceLock<Vec<(char, usize, i64)>> = std::sync::OnceLock::new();
+    H.get_or_init(|| {
+        std::env::var("MCLA_LOOSE_HINTS")
+            .unwrap_or_default()
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter_map(|w| {
+                let (k, v) = w.split_once(':')?;
+                let kind = k.chars().next()?;
+                Some((kind, k[1..].parse().ok()?, v.parse().ok()?))
+            })
+            .collect()
+    })
+    .iter()
+    .find(|x| x.0 == kind && x.1 == obj)
+    .map(|x| x.2)
+}
+
+/// The update of the recording a replay is at (set by the replay's loop; i64::MIN: none).
+pub static REPLAY_K: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(i64::MIN);
+
+/// What a stage-R recording logs of the session's physics level (`MCLA_LOOSE_LEVEL` = a file that
+/// `veh_diff.py` writes from the side file): the car's level index and instance address, the
+/// instance address of every prop it logged (by level index), the first address of the pool the
+/// cache entries' instances come from, and per update the head of the level's free index list.
+#[derive(Debug, Default)]
+pub struct LevelHints {
+    pub car: (i64, i64),
+    pub addr: HashMap<i64, i64>,
+    pub pool: Option<i64>,
+    pub free: HashMap<i64, Vec<i64>>,
+}
+
+pub fn level_hints() -> Option<&'static LevelHints> {
+    static H: std::sync::OnceLock<Option<LevelHints>> = std::sync::OnceLock::new();
+    H.get_or_init(|| {
+        let text = std::fs::read_to_string(std::env::var_os("MCLA_LOOSE_LEVEL")?).ok()?;
+        let mut h = LevelHints::default();
+        let num = |w: &str| if let Some(x) = w.strip_prefix("0x") { i64::from_str_radix(x, 16).ok() } else { w.parse::<i64>().ok() };
+        for line in text.lines() {
+            let w: Vec<&str> = line.split_whitespace().collect();
+            let n: Vec<i64> = w.iter().skip(1).filter_map(|x| num(x)).collect();
+            match (w.first().copied(), n.len()) {
+                (Some("car"), 2..) => h.car = (n[0], n[1]),
+                (Some("obj"), 2..) => {
+                    h.addr.insert(n[0], n[1]);
+                }
+                (Some("pool"), 1..) => h.pool = Some(n[0]),
+                (Some("free"), 2..) => {
+                    h.free.insert(n[0], n[1..].to_vec());
+                }
+                _ => {}
+            }
+        }
+        Some(h)
+    })
+    .as_ref()
+}
+
+/// `MCLA_DBG_RA1`: the level indices and addresses by the older guesses, whatever the recording logs.
+fn r1() -> bool {
+    static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *D.get_or_init(|| std::env::var_os("MCLA_DBG_RA1").is_some())
+}
+
+fn dbg() -> bool {
+    static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *D.get_or_init(|| std::env::var_os("MCLA_DBG_LOOSE").is_some())
+}
+
+/// A convex part with its matrix: what the detector is handed.
+#[derive(Clone, Copy)]
+pub enum Core<'a> {
+    Part(PartCore),
+    Hull(HullCore<'a>),
+    Wheel(super::gjk::WheelCore),
+}
+
+impl Support for Core<'_> {
+    fn support(&self, dir: Vec3) -> Vec3 {
+        match self {
+            Core::Part(p) => p.support(dir),
+            Core::Hull(h) => h.support(dir),
+            Core::Wheel(w) => w.support(dir),
+        }
+    }
+    fn support_at(&self, dir: Vec3, by: Vec3, then: Vec3) -> Vec3 {
+        match self {
+            Core::Part(p) => p.support_at(dir, by, then),
+            Core::Hull(h) => h.support_at(dir, by, then),
+            Core::Wheel(w) => w.support_at(dir, by, then),
+        }
+    }
+    fn support_id(&self, dir: Vec3, by: Vec3, then: Vec3) -> (Vec3, u32) {
+        match self {
+            Core::Part(p) => p.support_id(dir, by, then),
+            Core::Hull(h) => h.support_id(dir, by, then),
+            Core::Wheel(w) => w.support_id(dir, by, then),
+        }
+    }
+}
+
+impl<'a> Core<'a> {
+    fn placed(&self, at: Vec3) -> Core<'a> {
+        match *self {
+            Core::Part(p) => Core::Part(PartCore { at, ..p }),
+            Core::Hull(h) => Core::Hull(HullCore { at, ..h }),
+            Core::Wheel(mut w) => {
+                w.centre = at;
+                Core::Wheel(w)
+            }
+        }
+    }
+}
+
+/// A part of a prop's bound at a matrix: its core, its margin, its centre of gravity.
+fn part_core(b: &FragBound, m: &[Vec3; 4]) -> (PartCore, f32) {
+    let rows = [m[0], m[1], m[2]];
+    match b.kind {
+        0 => (PartCore { kind: 0, centroid: v(b.centroid), half: Vec3::ZERO, rows, at: m[3] }, b.round),
+        1 => (PartCore { kind: 1, centroid: v(b.centroid), half: Vec3::splat(b.length), rows, at: m[3] }, b.round),
+        _ => {
+            // (0x825E03D4: half the box less the margin, each a rounded step)
+            let half = (v(b.max) - v(b.min)) * 0.5 - Vec3::splat(b.margin);
+            (PartCore { kind: 3, centroid: v(b.centroid), half, rows, at: m[3] }, b.margin)
+        }
+    }
+}
+
+/// What the swept test gives (0x825D9268): the touch's normal, the two points in the parts'
+/// frames, how far through the tick it is, and the corners the hull's side ended on.
+struct Swept {
+    normal: Vec3,
+    local_a: Vec3,
+    local_b: Vec3,
+    lambda: f32,
+    last: Nearest,
+}
+
+/// The swept test of two convex parts (0x825D9268; p1/swept_decode.md): each is carried from
+/// where its centre of gravity was to where it is, with the rows it has now; the detector is
+/// asked again and again until the parts are 2 cm apart.
+fn sweep(a: &Core, ma: f32, cga: Vec3, a_now: &[Vec3; 4], a_last: &[Vec3; 4], b: &Core, mb: f32, cgb: Vec3, b_now: &[Vec3; 4], b_last: &[Vec3; 4]) -> Option<Swept> {
+    let da = xf(a_now, cga) - xf(a_last, cga);
+    let db = xf(b_now, cgb) - xf(b_last, cgb);
+    let rel = db - da;
+    let (mut pa, mut pb) = (a_now[3] - da, b_now[3] - db);
+    let mut dir = Vec3::Z;
+    let mut r = convex_contact(&a.placed(pa), ma, &b.placed(pb), mb, &mut dir, true)?;
+    let (mut lambda, mut last) = (0.0f32, 0.0f32);
+    let tol = f32::from_bits(0x3a83_126f);
+    let stop = f32::from_bits(0x3ca3_d70a);
+    if r.distance > tol {
+        let mut gap = r.distance;
+        let mut steps = 0;
+        loop {
+            steps += 1;
+            if steps > 32 {
+                return None;
+            }
+            let proj = dot3(rel, r.normal) + 0.0;
+            let step = gap * if proj == 0.0 { f32::MAX } else { recip(proj) };
+            lambda = lambda + step;
+            if 0.0 > step || lambda > 1.0 {
+                return None;
+            }
+            if last >= lambda {
+                break;
+            }
+            last = lambda;
+            let k = 1.0 - lambda;
+            pb = -(db * k - b_now[3]);
+            pa = -(da * k - a_now[3]);
+            r = convex_contact(&a.placed(pa), ma, &b.placed(pb), mb, &mut dir, true)?;
+            if stop >= r.distance {
+                break;
+            }
+            gap = r.distance - stop;
+            if !(gap > tol) {
+                break;
+            }
+        }
+    }
+    let at = |m: &[Vec3; 4], p: Vec3| [m[0], m[1], m[2], p];
+    Some(Swept { normal: r.normal, local_a: inv(&at(a_now, pa), r.on_a - pa), local_b: inv(&at(b_now, pb), r.on_b - pb), lambda, last: r })
+}
+
+impl LooseState {
+    /// The object a prop instance is, made on first need.
+    fn obj_of(&mut self, world: &LooseWorld, inst: u32) -> usize {
+        if let Some(&i) = self.by_inst.get(&inst) {
+            return i;
+        }
+        let (fi, ty) = &world.instances[inst as usize];
+        let i = self.objs.len();
+        let n = inst as usize;
+        if let Some(h) = level_hints().filter(|_| !r1()) {
+            // (the level's order is the file's: the city 0, then every instance that is put in; the address is
+            // the heap's)
+            let level = 1 + n as i64;
+            let addr = h.addr.get(&level).copied().unwrap_or(0xA000_0000 + 0x100 * n as i64);
+            self.objs.push(Obj { ty: *ty, inst: Some(inst), matrix: m4(&fi.matrix), entry: None, hit: false, body: None, level, addr, veh: None });
+            self.by_inst.insert(inst, i);
+            return i;
+        }
+        self.objs.push(Obj {
+            ty: *ty,
+            inst: Some(inst),
+            matrix: m4(&fi.matrix),
+            entry: None,
+            hit: false,
+            body: None,
+            level: rank('l', i).unwrap_or(if hint("b", n) { 1 + n as i64 } else { -1_000_000_000 + n as i64 }),
+            addr: rank('a', i).unwrap_or(if hint("after", n) { 1 + n as i64 } else { -1_000_000_000 + n as i64 }),
+            veh: None,
+        });
+        self.by_inst.insert(inst, i);
+        i
+    }
+
+    /// Is part `c` of an object there to be met?
+    fn has_part(&self, world: &LooseWorld, o: usize, c: usize) -> bool {
+        let obj = &self.objs[o];
+        if obj.veh.is_some() {
+            return c == 0;
+        }
+        part_present(&world.types[obj.ty], obj.entry.map_or(0, |e| e.absent), c)
+    }
+
+    /// The centre of gravity of an object's whole bound (bound +80).
+    fn cg_of(&self, world: &LooseWorld, o: usize) -> Vec3 {
+        let obj = &self.objs[o];
+        if let Some(vh) = obj.veh {
+            return vh.cg;
+        }
+        obj.entry.map_or(v(world.types[obj.ty].cg), |e| e.cg)
+    }
+
+    /// An object's whole bound (0x8259ADA8 / 0x82599FB0 for an entry that has lost groups: the union of its
+    /// parts' boxes through their matrices, centroid = the box's middle, radius = its half diagonal; else the
+    /// file's): box min, max, centroid, radius.
+    fn whole_bound(&self, world: &LooseWorld, o: usize) -> (Vec3, Vec3, Vec3, f32) {
+        let obj = &self.objs[o];
+        if let Some(vh) = obj.veh {
+            let (lo, hi) = (vh.shape.min - Vec3::splat(0.041), vh.shape.max + Vec3::splat(0.041));
+            let c = (hi + lo) * 0.5;
+            return (lo, hi, c, (hi - c).length());
+        }
+        let t = &world.types[obj.ty];
+        let absent = obj.entry.map_or(0, |e| e.absent);
+        if absent == 0 {
+            return (v(t.min), v(t.max), v(t.centroid), t.radius);
+        }
+        let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(-f32::MAX));
+        let mut any = false;
+        for (c, part) in t.parts.iter().enumerate().rev() {
+            let Some(b) = part.bound.as_ref().filter(|_| part_present(t, absent, c)) else { continue };
+            let m = m4(&part.matrix);
+            let mid = (v(b.min) + v(b.max)) * 0.5;
+            let half = v(b.max) - mid;
+            let centre = xf(&m, mid);
+            let ext = Vec3::new(dot3(Vec3::new(m[0].x.abs(), m[1].x.abs(), m[2].x.abs()), half), dot3(Vec3::new(m[0].y.abs(), m[1].y.abs(), m[2].y.abs()), half), dot3(Vec3::new(m[0].z.abs(), m[1].z.abs(), m[2].z.abs()), half));
+            lo = lo.min(centre - ext);
+            hi = hi.max(ext + centre);
+            any = true;
+        }
+        if !any {
+            return (Vec3::ZERO, Vec3::ZERO, Vec3::ZERO, 0.0);
+        }
+        let centroid = (hi + lo) * 0.5;
+        let d = hi - centroid;
+        (lo, hi, centroid, fma(d.z, d.z, fma(d.y, d.y, d.x * d.x)).sqrt())
+    }
+
+    /// The level's broad phase for an ACTIVE object `own` and another (0x825BF438): own's sphere, moved half
+    /// the tick's way back and grown by half its length, against the other's as it stands; then the two whole
+    /// boxes - each grown to hold itself at its matrix before the move, if it is active - along their six face
+    /// axes. Each side: box min / max, centroid, radius, matrix now, matrix before the move (None: inactive).
+    fn broad(own: &(Vec3, Vec3, Vec3, f32, [Vec3; 4], Option<[Vec3; 4]>), other: &(Vec3, Vec3, Vec3, f32, [Vec3; 4], Option<[Vec3; 4]>)) -> bool {
+        let (m, n) = (&own.4, &other.4);
+        let mut centre = xf(m, own.2);
+        let mut radius = own.3;
+        if let Some(prev) = own.5.as_ref() {
+            let d = m[3] - prev[3];
+            centre = centre - d * 0.5;
+            let l2 = dot3(d, d);
+            radius = (if l2 == 0.0 { 0.0 } else { l2.sqrt() }) * 0.5 + radius;
+        }
+        let oc = xf(n, other.2);
+        let dd = centre - oc;
+        let sum = radius + other.3;
+        if !(sum * sum > dot3(dd, dd)) {
+            return false;
+        }
+        let swept = |s: &(Vec3, Vec3, Vec3, f32, [Vec3; 4], Option<[Vec3; 4]>)| {
+            let (mut h, mut c) = ((s.1 - s.0) * 0.5, (s.1 + s.0) * 0.5);
+            if let Some(l) = s.5.as_ref() {
+                let m = &s.4;
+                let r: [Vec3; 3] = std::array::from_fn(|i| inv(m, l[i]));
+                let t = inv(m, l[3] - m[3]);
+                let c2 = t + r[0] * c.x + r[1] * c.y + r[2] * c.z;
+                let e2 = r[0].abs() * h.x + r[1].abs() * h.y + r[2].abs() * h.z;
+                let (hi, lo) = ((c + h).max(c2 + e2), (c - h).min(c2 - e2));
+                c = (hi + lo) * 0.5;
+                h = hi - c;
+            }
+            (xf(&s.4, c), h)
+        };
+        let ((wa, ha), (wb, hb)) = (swept(own), swept(other));
+        let eps = Vec3::splat(1e-6);
+        let r: [Vec3; 3] = std::array::from_fn(|i| Vec3::new(dot3(m[i], n[0]), dot3(m[i], n[1]), dot3(m[i], n[2])));
+        let ab: [Vec3; 3] = std::array::from_fn(|i| r[i].abs() + eps);
+        let tw = wa - wb;
+        let t = Vec3::new(dot3(tw, n[0]), dot3(tw, n[1]), dot3(tw, n[2]));
+        let q = Vec3::ZERO - Vec3::new(dot3(r[0], t), dot3(r[1], t), dot3(r[2], t));
+        let w = Vec3::new(dot3(Vec3::new(r[0].x, r[1].x, r[2].x), q), dot3(Vec3::new(r[0].y, r[1].y, r[2].y), q), dot3(Vec3::new(r[0].z, r[1].z, r[2].z), q));
+        let col = |k: usize| Vec3::new(ab[0][k], ab[1][k], ab[2][k]);
+        (0..3).all(|i| ha[i] + dot3(ab[i], hb) > q[i].abs()) && (0..3).all(|k| hb[k] + dot3(col(k), ha) > w[k].abs())
+    }
+
+    fn broad_side(&self, world: &LooseWorld, o: usize) -> (Vec3, Vec3, Vec3, f32, [Vec3; 4], Option<[Vec3; 4]>) {
+        let (lo, hi, c, r) = self.whole_bound(world, o);
+        (lo, hi, c, r, self.objs[o].matrix, self.objs[o].body.as_ref().map(|b| b.prev))
+    }
+
+    /// One side's part as the detector needs it: its core and margin, its bound's centre of
+    /// gravity and box, its matrix now and as the last collide is to have had it.
+    fn shape<'a>(&self, world: &'a LooseWorld, car: &CarIn<'a>, who: Who, part: u16) -> Option<Shape<'a>> {
+        match who {
+            Who::Car if part != 0 => {
+                // (RA7: a wheel's part, the composite's parts 1..)
+                let w = car.wheels.get(part as usize - 1).copied().flatten()?;
+                Some(Shape { core: Core::Wheel(w.core), margin: super::gjk::WHEEL_MARGIN, cg: Vec3::ZERO, bbox: (Vec3::ZERO - w.half, w.half), now: w.now, last: w.last })
+            }
+            Who::Car => {
+                let core = Core::Hull(HullCore { corners: car.hull.scanned(), rows: [car.now[0], car.now[1], car.now[2]], at: car.now[3] });
+                Some(Shape { core, margin: car.hull_margin, cg: car.hull_cg, bbox: (car.hull.min - Vec3::splat(0.041), car.hull.max + Vec3::splat(0.041)), now: car.now, last: car.last })
+            }
+            Who::Obj(o) => {
+                let obj = &self.objs[o];
+                if let Some(vh) = obj.veh {
+                    // (stage R: a vehicle's one polyhedron, 0x825E0418 as the car's hull)
+                    if part != 0 || !vh.here {
+                        return None;
+                    }
+                    let now = obj.matrix;
+                    let core = Core::Hull(HullCore { corners: vh.shape.scanned(), rows: [now[0], now[1], now[2]], at: now[3] });
+                    return Some(Shape { core, margin: f32::from_bits(0x3d23_d70a), cg: vh.cg, bbox: (vh.shape.min - Vec3::splat(0.041), vh.shape.max + Vec3::splat(0.041)), now, last: obj.body.map_or(obj.matrix, |b| b.last) });
+                }
+                let t = &world.types[obj.ty];
+                if !part_present(t, obj.entry.map_or(0, |e| e.absent), part as usize) {
+                    return None;
+                }
+                let p = &t.parts[part as usize];
+                let b = p.bound.as_ref()?;
+                if !matches!(b.kind, 0 | 1 | 3) {
+                    return None;
+                }
+                let pm = m4(&p.matrix);
+                let now = super::gjk::world_matrix(&pm, &obj.matrix);
+                let last = super::gjk::world_matrix(&pm, &obj.body.map_or(obj.matrix, |b| b.last));
+                let (core, margin) = part_core(b, &now);
+                Some(Shape { core: Core::Part(core), margin, cg: v(b.cg), bbox: (v(b.min), v(b.max)), now, last })
+            }
+            Who::City => None,
+        }
+    }
+
+    fn parts_of(&self, world: &LooseWorld, car: &CarIn, who: Who) -> Vec<u16> {
+        match who {
+            Who::Obj(o) if self.objs[o].veh.is_some() => vec![0],
+            Who::Obj(o) => (0..world.types[self.objs[o].ty].parts.len() as u16).collect(),
+            Who::Car => (0..=car.wheels.len() as u16).collect(),
+            _ => vec![0],
+        }
+    }
+
+    /// The car's level index and its instance's address (0, 0 where no recording says).
+    pub fn car_place(&self) -> (i64, i64) {
+        level_hints().filter(|_| !r1()).map_or((0, 0), |h| h.car)
+    }
+
+    /// The instance a new cache entry gets (0x90 bytes each, from the top of their pool downwards).
+    fn entry_instance(&mut self) -> Option<i64> {
+        let n = self.entries_made;
+        self.entries_made += 1;
+        level_hints().filter(|_| !r1()).and_then(|h| h.pool).map(|top| top - 0x90 * n)
+    }
+
+    /// The level index a new object gets: the next of the level's free index list (0x82573200).
+    fn new_index(&mut self) -> Option<i64> {
+        let h = level_hints().filter(|_| !r1())?;
+        let k = REPLAY_K.load(std::sync::atomic::Ordering::Relaxed);
+        if self.indices_taken.0 != k {
+            self.indices_taken = (k, 0);
+        }
+        let n = self.indices_taken.1;
+        self.indices_taken.1 += 1;
+        h.free.get(&k).and_then(|f| f.get(n)).copied()
+    }
+
+    fn level(&self, who: Who) -> i64 {
+        match who {
+            Who::Car => self.car_place().0,
+            Who::Obj(o) => self.objs[o].level,
+            Who::City => i64::MIN,
+        }
+    }
+
+    /// The contacts of two objects' parts (0x825CCE00 with 0x825CC930 per pair of parts): B's
+    /// parts outside, A's inside; a pair of parts whose boxes meet, with no contact yet and one
+    /// of them a prop that has not broken, goes through the swept test, every other through the
+    /// detector.
+    fn pair(&mut self, world: &LooseWorld, car: &CarIn, a: Who, b: Who) {
+        // (record byte +280: an mcPropInst that stands loose has flag 2; a piece's own instance none)
+        let is_prop = |w: Who| matches!(w, Who::Obj(o) if self.objs[o].inst.is_some());
+        let sweeps = (is_prop(a) || is_prop(b)) && !(hint("x", 6) && a != Who::Car && b != Who::Car);
+        for pb in self.parts_of(world, car, b) {
+            let Some(sb) = self.shape(world, car, b, pb) else { continue };
+            for pa in self.parts_of(world, car, a) {
+                // (stage R: only the car's hull is taken against a vehicle - no wheel contact with one is kept
+                // in the recordings)
+                let veh_pair = [a, b].into_iter().any(|w| matches!(w, Who::Obj(o) if self.objs[o].veh.is_some()));
+                if veh_pair && ((a == Who::Car && pa != 0) || (b == Who::Car && pb != 0)) {
+                    continue;
+                }
+                let Some(sa) = self.shape(world, car, a, pa) else { continue };
+                let at = self.manis.iter().position(|m| m.a == a && m.b == b && m.part_a == pa && m.part_b == pb);
+                if !boxes_meet(&sa, &sb) && !hint("x", 7) {
+                    continue;
+                }
+                if let Some(k) = at {
+                    self.manis[k].visited = true;
+                }
+                let count = at.map_or(0, |k| self.manis[k].slots.len());
+                let found: Option<(Vec3, Vec3, Vec3, f32, Nearest)> = if count == 0 && sweeps {
+                    sweep(&sa.core, sa.margin, sa.cg, &sa.now, &sa.last, &sb.core, sb.margin, sb.cg, &sb.now, &sb.last).filter(|s| !(s.lambda >= 1.0)).map(|s| {
+                        let (qa, qb) = (xf(&sa.now, s.local_a), xf(&sb.now, s.local_b));
+                        (s.normal, qa, qb, 0.0 - dot3(s.normal, qb - qa), s.last)
+                    })
+                } else {
+                    let mut dir = Vec3::Z;
+                    convex_contact(&sa.core, sa.margin, &sb.core, sb.margin, &mut dir, true).map(|r| (r.normal, r.on_a, r.on_b, r.distance, r))
+                };
+                if dbg() {
+                    eprintln!("LOOSEPAIR tick {} {:?}/{pa} x {:?}/{pb} swept {} -> {:?}", self.tick, a, b, count == 0 && sweeps, found.map(|f| (f.0, f.3)));
+                }
+                let Some((normal, qa, qb, dist, r)) = found else { continue };
+                // (the sink, 0x825C65E8: nothing farther than 2 cm)
+                if !(f32::from_bits(0x3ca3_d70a) > dist) {
+                    continue;
+                }
+                let (local_a, local_b) = (inv(&sa.now, qa - sa.now[3]), inv(&sb.now, qb - sb.now[3]));
+                if dbg() {
+                    eprintln!("LOOSECON tick {} {:?}/{pa} x {:?}/{pb} depth {:?} la {:?} lb {:?} pa {:?} pb {:?} n {:?}", self.tick, a, b, 0.0 - dist, local_a, local_b, qa, qb, normal);
+                }
+                // (which of the hull's triangles: by the corners the loop ended on and the
+                // contact's direction in the hull's frame - away from the other part)
+                let element = if (b == Who::Car && pb != 0) || (a == Who::Car && pa != 0) {
+                    0
+                } else if b == Who::Car {
+                    car.hull.element(&r.corners_b.0[..r.corners_b.1], inv(&car.now, normal))
+                } else if a == Who::Car {
+                    car.hull.element(&r.corners.0[..r.corners.1], inv(&car.now, Vec3::ZERO - normal))
+                } else {
+                    0
+                };
+                if dbg() && ((a == Who::Car && pa == 0) || (b == Who::Car && pb == 0)) {
+                    eprintln!("LOOSEELEM tick {} element {element} deep {} corners {:?} / {:?}", self.tick, r.deep, &r.corners.0[..r.corners.1], &r.corners_b.0[..r.corners_b.1]);
+                }
+                // (stage R: and which of a vehicle's - side B: the direction +n in its frame)
+                let veh_surface = match (a, b) {
+                    (_, Who::Obj(o)) if self.objs[o].veh.is_some() => Some(self.objs[o].veh.unwrap().shape).map(|h| h.surface_of(h.element(&r.corners_b.0[..r.corners_b.1], inv(&sb.now, normal)))),
+                    (Who::Obj(o), _) if self.objs[o].veh.is_some() => Some(self.objs[o].veh.unwrap().shape).map(|h| h.surface_of(h.element(&r.corners.0[..r.corners.1], inv(&sa.now, Vec3::ZERO - normal)))),
+                    _ => None,
+                };
+                let side = |local: Vec3, point: Vec3| Side { body: None, point, local, rows: [Vec3::X, Vec3::Y, Vec3::Z], margin: 0.04, core: Vec3::ZERO };
+                let fresh = Touch { depth: 0.0 - dist, a: side(local_a, qa), b: side(local_b, qb), normal, back: Vec3::ZERO - normal, ..Default::default() };
+                let k = at.unwrap_or_else(|| {
+                    self.manis.push(Mani { a, b, part_a: pa, part_b: pb, cell: 0, stale: false, visited: true, island: 0, order: 0, slots: Vec::new() });
+                    self.manis.len() - 1
+                });
+                self.manis[k].insert(fresh, element, veh_surface.unwrap_or(Surface::Prop));
+            }
+        }
+    }
+
+    /// The tick's collide of everything loose (0x8258D9F0): the car's hull against the props and
+    /// pieces about it, the pieces against each other and against the props they reach, and
+    /// every loose body's parts against the city.
+    pub fn collide(&mut self, world: &LooseWorld, car: &CarIn, city: &super::collision::WorldCollider, car_city: bool) {
+        // (the manifolds of a pair whose instance broke last tick went with the pair)
+        self.manis.retain(|m| !m.stale);
+        for m in self.manis.iter_mut() {
+            m.visited = false;
+        }
+        // (the level's props about the car and about every loose body)
+        let mut about = vec![car.now[3]];
+        about.extend(self.objs.iter().filter(|o| o.body.is_some()).map(|o| o.matrix[3]));
+        for (k, p) in about.into_iter().enumerate() {
+            for inst in world.near(p, 8.0) {
+                let (fi, ty) = &world.instances[inst as usize];
+                // (only what can be knocked: level state 1)
+                if fi.state != 1 {
+                    continue;
+                }
+                let t = &world.types[*ty];
+                let centre = xf(&m4(&fi.matrix), v(t.centroid));
+                let reach = t.radius + if k == 0 { 3.2 } else { 1.5 };
+                // (stage R, agent D: MCLA_REPLAY_OTHERS_ONLY - a one-step check of vehicle ticks takes no prop in:
+                // what this port's own run knocked loose before the checked ticks is not the recording's)
+                if (centre - p).length_squared() <= reach * reach && !others_only() {
+                    self.obj_of(world, inst);
+                }
+            }
+        }
+        // (the pairs, the lower level index A)
+        let n = self.objs.len();
+        let mut pairs: Vec<(Who, Who)> = Vec::new();
+        let ball = |o: &Obj| {
+            let t = &world.types[o.ty];
+            (xf(&o.matrix, v(t.centroid)), t.radius)
+        };
+        // (RA8: the pairs by the level's own test, 0x825BF438 - MCLA_DBG_RA8: by plain balls, as before)
+        let exact_broad = !super::vehsim::dbg_flag("MCLA_DBG_RA8");
+        let car_side = {
+            let (lo, hi) = car.bound;
+            let c = (hi + lo) * 0.5;
+            let d = hi - c;
+            (lo, hi, c, fma(d.z, d.z, fma(d.y, d.y, d.x * d.x)).sqrt(), car.now, Some(car.last))
+        };
+        for o in 0..n {
+            if let Some(vh) = self.objs[o].veh {
+                // (stage R: a vehicle about the car - the parts' boxes decide)
+                if vh.here {
+                    pairs.push(if self.objs[o].level < self.car_place().0 { (Who::Obj(o), Who::Car) } else { (Who::Car, Who::Obj(o)) });
+                }
+                continue;
+            }
+            let (c, r) = ball(&self.objs[o]);
+            let near = if exact_broad {
+                // (two active ones: the lower index asks)
+                let side = self.broad_side(world, o);
+                if side.5.is_some() && self.objs[o].level < self.car_place().0 { Self::broad(&side, &car_side) } else { Self::broad(&car_side, &side) }
+            } else {
+                (c - car.now[3]).length_squared() <= (r + 3.2) * (r + 3.2)
+            };
+            if near {
+                pairs.push(if self.objs[o].level < self.car_place().0 { (Who::Obj(o), Who::Car) } else { (Who::Car, Who::Obj(o)) });
+            }
+        }
+        for o1 in 0..n {
+            for o2 in o1 + 1..n {
+                let (a, b) = (&self.objs[o1], &self.objs[o2]);
+                // (stage R: vehicle x prop, vehicle x vehicle: not ported)
+                if a.veh.is_some() || b.veh.is_some() {
+                    continue;
+                }
+                if a.body.is_none() && b.body.is_none() {
+                    continue;
+                }
+                let ((ca, ra), (cb, rb)) = (ball(a), ball(b));
+                if exact_broad {
+                    let (sa, sb) = (self.broad_side(world, o1), self.broad_side(world, o2));
+                    let found = match (sa.5.is_some(), sb.5.is_some()) {
+                        (true, true) => if a.level < b.level { Self::broad(&sa, &sb) } else { Self::broad(&sb, &sa) },
+                        (true, false) => Self::broad(&sa, &sb),
+                        _ => Self::broad(&sb, &sa),
+                    };
+                    if !found {
+                        continue;
+                    }
+                } else if (ca - cb).length_squared() > (ra + rb + 0.3) * (ra + rb + 0.3) {
+                    continue;
+                }
+                pairs.push(if a.level < b.level { (Who::Obj(o1), Who::Obj(o2)) } else { (Who::Obj(o2), Who::Obj(o1)) });
+            }
+        }
+        for (a, b) in pairs {
+            self.pair(world, car, a, b);
+        }
+        // (every loose body's parts against the city)
+        for o in 0..n {
+            // (stage R: a vehicle's own contacts with the city are not made)
+            if self.objs[o].body.is_none() || self.objs[o].veh.is_some() {
+                continue;
+            }
+            for c in self.parts_of(world, car, Who::Obj(o)) {
+                let Some(s) = self.shape(world, car, Who::Obj(o), c) else { continue };
+                let mut hits: Vec<super::hull::PartHit> = Vec::new();
+                super::hull::part_touches(&s.core, s.margin, s.bbox, &s.now, &s.last, city, |h| hits.push(h));
+                for m in self.manis.iter_mut() {
+                    if m.a == Who::Obj(o) && m.b == Who::City && m.part_a == c {
+                        m.visited = true;
+                    }
+                }
+                for h in hits {
+                    let a = Side { body: None, point: h.on_a, local: h.local, rows: [Vec3::X, Vec3::Y, Vec3::Z], margin: 0.04, core: Vec3::ZERO };
+                    let b = Side { body: None, point: h.on_b, local: h.on_b, rows: [Vec3::X, Vec3::Y, Vec3::Z], margin: 0.04, core: Vec3::ZERO };
+                    let fresh = Touch { depth: h.depth, a, b, normal: h.normal, back: Vec3::ZERO - h.normal, ..Default::default() };
+                    let k = self.manis.iter().position(|m| m.a == Who::Obj(o) && m.b == Who::City && m.part_a == c && m.cell == h.cell).unwrap_or_else(|| {
+                        self.manis.push(Mani { a: Who::Obj(o), b: Who::City, part_a: c, part_b: 0, cell: h.cell, stale: false, visited: true, island: 0, order: 0, slots: Vec::new() });
+                        self.manis.len() - 1
+                    });
+                    if dbg() {
+                        eprintln!("LOOSECITY tick {} obj {o} part {c} cell {} polygon {} depth {:?} n {:?} local {:?}", self.tick, h.cell, h.polygon, h.depth, h.normal, h.local);
+                    }
+                    self.manis[k].insert(fresh, 0, h.surface);
+                }
+            }
+        }
+        self.manis.retain(|m| m.visited && !m.slots.is_empty());
+        // (the islands, 0x825D80E0 at the end of the collide: every pair that holds a contact NOW joins its
+        // two objects - a contact that the update's refresh then drops has still joined them. The pairs come
+        // in the cache's order, (lower, higher level index); each is a node of a union-find forest whose
+        // roots are the islands; FIND 0x825D7FD0 hangs every node it passes under the root, at the tail of
+        // the root's children; UNION 0x825D8030 by rank. The update walks each tree in pre-order.)
+        let n_obj = self.objs.len() + 1;
+        let node = |w: Who| match w {
+            Who::Car => Some(0usize),
+            Who::Obj(o) => Some(o + 1),
+            Who::City => None,
+        };
+        let mut pairs: Vec<((i64, i64), Who, Who)> = Vec::new();
+        if car_city {
+            pairs.push(((i64::MIN, self.car_place().0), Who::Car, Who::City));
+        }
+        for m in self.manis.iter() {
+            let (la, lb) = (self.level(m.a), self.level(m.b));
+            let key = (la.min(lb), la.max(lb));
+            if !pairs.iter().any(|p| p.0 == key) {
+                pairs.push((key, m.a, m.b));
+            }
+        }
+        pairs.sort_by_key(|p| p.0);
+        let np = pairs.len();
+        let mut parent: Vec<Option<usize>> = vec![None; np];
+        let mut kids: Vec<Vec<usize>> = vec![Vec::new(); np];
+        let mut rank = vec![0u32; np];
+        let mut roots: Vec<usize> = Vec::new();
+        let mut link: Vec<Option<usize>> = vec![None; n_obj];
+        fn rehang(parent: &mut [Option<usize>], kids: &mut [Vec<usize>], roots: &mut Vec<usize>, nd: usize, to: usize) {
+            if parent[nd] == Some(to) {
+                return;
+            }
+            match parent[nd] {
+                Some(p) => kids[p].retain(|x| *x != nd),
+                None => roots.retain(|x| *x != nd),
+            }
+            parent[nd] = Some(to);
+            kids[to].push(nd);
+        }
+        fn find_root(parent: &mut [Option<usize>], kids: &mut [Vec<usize>], roots: &mut Vec<usize>, x: usize) -> usize {
+            if parent[x].is_none() {
+                return x;
+            }
+            let mut r = x;
+            while let Some(p) = parent[r] {
+                r = p;
+            }
+            let mut nd = x;
+            while nd != r {
+                let next = parent[nd].unwrap();
+                rehang(parent, kids, roots, nd, r);
+                nd = next;
+            }
+            r
+        }
+        fn union(parent: &mut [Option<usize>], kids: &mut [Vec<usize>], roots: &mut Vec<usize>, rank: &mut [u32], x: usize, y: usize) -> usize {
+            if x == y {
+                return x;
+            }
+            if rank[x] > rank[y] {
+                rehang(parent, kids, roots, y, x);
+                x
+            } else if rank[x] < rank[y] {
+                rehang(parent, kids, roots, x, y);
+                y
+            } else {
+                rehang(parent, kids, roots, y, x);
+                rank[x] += 1;
+                x
+            }
+        }
+        for k in 0..np {
+            roots.push(k);
+            let mut r = find_root(&mut parent, &mut kids, &mut roots, k);
+            let (a, b) = (node(pairs[k].1), node(pairs[k].2));
+            if let Some(a) = a {
+                if let Some(l) = link[a] {
+                    let x = find_root(&mut parent, &mut kids, &mut roots, l);
+                    r = union(&mut parent, &mut kids, &mut roots, &mut rank, x, r);
+                }
+                link[a] = Some(r);
+            }
+            if let Some(b) = b.filter(|b| Some(*b) != a) {
+                if let Some(l) = link[b] {
+                    let x = find_root(&mut parent, &mut kids, &mut roots, l);
+                    r = union(&mut parent, &mut kids, &mut roots, &mut rank, x, r);
+                }
+                link[b] = Some(r);
+                if let Some(a) = a {
+                    link[a] = Some(r);
+                }
+            }
+        }
+        // (pre-order; the island of the car is number 0, the others by their roots)
+        let mut place = vec![(0usize, 0usize); np];
+        let mut count = 0;
+        for &r in roots.iter() {
+            let mut stack = vec![r];
+            while let Some(nd) = stack.pop() {
+                place[nd] = (r + 1, count);
+                count += 1;
+                for c in kids[nd].iter().rev() {
+                    stack.push(*c);
+                }
+            }
+        }
+        let car_root = pairs.iter().position(|p| p.1 == Who::Car || p.2 == Who::Car).map(|k| place[k].0);
+        self.car_city_order = pairs.iter().position(|p| p.1 == Who::Car && p.2 == Who::City).map(|k| place[k].1);
+        for mi in 0..self.manis.len() {
+            let (la, lb) = (self.level(self.manis[mi].a), self.level(self.manis[mi].b));
+            let key = (la.min(lb), la.max(lb));
+            let k = pairs.iter().position(|p| p.0 == key).unwrap();
+            let m = &mut self.manis[mi];
+            m.island = if Some(place[k].0) == car_root { 0 } else { place[k].0 };
+            m.order = place[k].1;
+        }
+    }
+
+    /// The matrix of one side's part as the tick's update has it (0x825A38E0).
+    fn part_matrix(&self, world: &LooseWorld, who: Who, part: u16, car: &CarIn) -> [Vec3; 4] {
+        match who {
+            Who::Car if part != 0 => car.wheels.get(part as usize - 1).copied().flatten().map_or(car.now, |w| w.now),
+            Who::Car => car.now,
+            Who::Obj(o) => {
+                let obj = &self.objs[o];
+                if obj.veh.is_some() {
+                    return obj.matrix;
+                }
+                super::gjk::world_matrix(&m4(&world.types[obj.ty].parts[part as usize].matrix), &obj.matrix)
+            }
+            Who::City => [Vec3::X, Vec3::Y, Vec3::Z, Vec3::ZERO],
+        }
+    }
+
+    /// The kept contacts brought up to the two matrices as they stand (0x825A3070 with
+    /// 0x825A28C8), their materials (0x825A2C88) and the instances' callbacks: a prop's sets the
+    /// elasticity of its type on all its contacts (0x82735A90); the car's lays a normal flat
+    /// that would push it down against a prop that stands (0x82332D30) - and, fast enough,
+    /// feels nothing of a prop that broke two seconds ago and more (0x82332AC8).
+    pub fn refresh(&mut self, world: &LooseWorld, car: &CarIn) {
+        for k in 0..self.manis.len() {
+            let (ma, mb) = (self.part_matrix(world, self.manis[k].a, self.manis[k].part_a, car), self.part_matrix(world, self.manis[k].b, self.manis[k].part_b, car));
+            let m = &mut self.manis[k];
+            let city = m.b == Who::City;
+            for s in m.slots.iter_mut().rev() {
+                if s.age != 0 {
+                    s.t.a.point = xf(&ma, s.t.a.local);
+                    if city {
+                        s.t.b.point = s.t.b.local;
+                    } else {
+                        s.t.b.point = xf(&mb, s.t.b.local);
+                    }
+                    s.t.depth = dot3(s.t.a.point - s.t.b.point, s.t.back);
+                }
+                s.t.target = Vec3::ZERO;
+                s.age = s.age.saturating_add(1);
+            }
+            let mut worst = (0.0f32, None);
+            let mut i = 0;
+            while i < m.slots.len() {
+                let s = m.slots[i];
+                if !(s.t.depth > f32::from_bits(0xbd23_d70a)) {
+                    m.slots.swap_remove(i);
+                    continue;
+                }
+                if s.age > 1 {
+                    let q = -(s.t.back * s.t.depth - s.t.a.point);
+                    let slid = s.t.b.point - q;
+                    let d2 = dot3(slid, slid);
+                    if !(worst.0 >= d2) && !(f32::from_bits(0x39d1_b717) >= d2) {
+                        worst = (d2, Some(i));
+                    }
+                }
+                i += 1;
+            }
+            if let Some(i) = worst.1 {
+                m.slots.swap_remove(i);
+            }
+        }
+        self.manis.retain(|m| !m.slots.is_empty());
+        let prop = surface_touch(Surface::Prop);
+        for m in self.manis.iter_mut() {
+            let (who_a, who_b) = (m.a, m.b);
+            let car_is_a = who_a == Who::Car;
+            let with_car = car_is_a || who_b == Who::Car;
+            // (a wheel's contact with something loose: the wheel's callback 0x8255D028 takes it from the solver;
+            // it stays in the manifold)
+            let wheel = (car_is_a && m.part_a != 0) || (who_b == Who::Car && m.part_b != 0);
+            // (an mcPropInst on either side: its callback writes its type's elasticity)
+            let props: Vec<usize> = [who_a, who_b].into_iter().filter_map(|w| if let Who::Obj(o) = w { Some(o) } else { None }).filter(|o| self.objs[*o].inst.is_some()).collect();
+            // (stage R: a vehicle on the other side)
+            let other_veh = [who_a, who_b].into_iter().find_map(|w| if let Who::Obj(o) = w { self.objs[o].veh.map(|vh| (o, vh.class)) } else { None });
+            for s in m.slots.iter_mut() {
+                let of = |w: Who| match w {
+                    Who::Car => surface_touch(car.hull.surface_of(s.element)),
+                    Who::Obj(o) if self.objs[o].veh.is_some() => surface_touch(s.surface),
+                    Who::Obj(_) => prop,
+                    Who::City => surface_touch(s.surface),
+                };
+                let (ta, tb) = (of(who_a), of(who_b));
+                let f = ta.0 * tb.0;
+                s.t.friction = if f >= 0.0 { f } else { 0.0 };
+                let e = ta.1 * tb.1;
+                s.t.elasticity = if e - 1.0 >= 0.0 { 1.0 } else { e };
+                s.t.impulse = Vec3::ZERO;
+                s.enabled = true;
+                if wheel {
+                    s.enabled = false;
+                    continue;
+                }
+                for o in &props {
+                    s.t.elasticity = world.types[self.objs[*o].ty].elasticity;
+                }
+                if !with_car {
+                    continue;
+                }
+                if let Some((o, class)) = other_veh {
+                    car_meets_vehicle(car, &self.objs[o].matrix, class, car_is_a, &mut s.t);
+                    continue;
+                }
+                let Some(&o) = props.first() else { continue };
+                let obj = &self.objs[o];
+                let t = &world.types[obj.ty];
+                // (the car's, 0x82332AC8: a hull contact with a prop of a type that only breaks,
+                // broken more than two seconds ago, is not felt above 20 m/s)
+                if car.speed > 20.0 && t.min_move < 0.0 && obj.hit && obj.entry.map_or(false, |e| e.age > 2.0) {
+                    s.enabled = false;
+                    continue;
+                }
+                // (0x82332D30, against an mcPropInst: the normal as it pushes the car points down)
+                let mut n = if car_is_a { s.t.normal } else { Vec3::ZERO - s.t.normal };
+                if n.y < 0.0 {
+                    let k = 1.0 - (obj.matrix[1].y * car.now[1].y).abs();
+                    if k < 1.0 {
+                        let mut y2 = n.y * n.y;
+                        let rest = 1.0 - y2;
+                        if rest > 0.0 {
+                            n.y = k * n.y;
+                            y2 = n.y * n.y;
+                            let q = ((1.0 - y2) / rest).sqrt();
+                            n.x *= q;
+                            n.z *= q;
+                        }
+                        let l2 = fma(n.z, n.z, n.x * n.x) + y2;
+                        if l2 > f32::from_bits(0x3f67_0a3d) && l2 < f32::from_bits(0x3f8d_1eb7) {
+                            let d = dot3(n, n);
+                            let e = 1.0 / d.sqrt();
+                            let e = if e == f32::INFINITY { 0.0 } else { e };
+                            let unit = n * ((1.0 - d * (e * e)) * (0.5 * e) + e);
+                            let back = Vec3::ZERO - unit;
+                            if car_is_a {
+                                s.t.normal = unit;
+                                s.t.back = back;
+                            } else {
+                                s.t.back = unit;
+                                s.t.normal = back;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+}
+
+// ---------------------------------------------------------------------------------------------
+// The breaking pass (0x82593680, 0x82592D08, 0x825920F8; p1/break_decode.md).
+
+/// 0x8248C710: how much of the impulses on its parts (`comp`, by part) breaks or moves an
+/// instance: the share `t` and the group that leaves (255: the whole of it).
+fn break_strength(t: &FragType, obj: &Obj, comp: &[Vec3]) -> Option<(f32, u8)> {
+    let entry = obj.entry;
+    let present = |g: usize| entry.map_or(true, |e| e.absent & (1 << g) == 0);
+    if entry.is_none() && t.flags & 1 == 0 {
+        // (a prop that goes as a whole)
+        let f = t.min_move;
+        if f < 0.0 {
+            return None;
+        }
+        let mut tot = 0.0f32;
+        for c in comp.iter().take(t.parts.len()) {
+            tot = fma(c.y, c.y, fma(c.x, c.x, c.z * c.z)).sqrt() + tot;
+        }
+        if tot < f {
+            return None;
+        }
+        return Some((f / tot, 255));
+    }
+    let mut gi = vec![0.0f32; t.groups.len()];
+    let mut total = 0.0f32;
+    fn spread(t: &FragType, present: &dyn Fn(usize) -> bool, gi: &mut [f32], mut m: f32, mut g: usize, mut dir: i32) {
+        loop {
+            let grp = &t.groups[g];
+            if dir < 0 {
+                m = grp.down * m;
+            }
+            if present(g) {
+                gi[g] = gi[g] + m;
+            }
+            if dir <= 0 {
+                for k in 0..grp.groups as usize {
+                    let c = grp.first_group as usize + k;
+                    if present(c) {
+                        spread(t, present, gi, m, c, dir - 1);
+                    }
+                }
+                if dir < 0 {
+                    return;
+                }
+            }
+            let p = grp.parent as usize;
+            if grp.parent == 255 || !present(p) {
+                return;
+            }
+            m = grp.up * m;
+            dir += 1;
+            g = p;
+        }
+    }
+    for (p, c) in comp.iter().enumerate().take(t.parts.len()) {
+        if c.x == 0.0 && c.y == 0.0 && c.z == 0.0 {
+            continue;
+        }
+        let m = fma(c.y, c.y, fma(c.z, c.z, c.x * c.x)).sqrt();
+        let g = group_of(t, p);
+        if entry.is_some() && !present(g) {
+            continue;
+        }
+        total = m + total;
+        spread(t, &present, &mut gi, m, g, 0);
+    }
+    if !obj.hit && t.min_move >= 0.0 {
+        let x = t.groups[0].up * gi[0];
+        if x >= t.min_move {
+            return Some((t.min_move / x, 255));
+        }
+    }
+    let (mut best, mut win) = (0.0f32, 255u8);
+    for g in 0..t.groups.len() {
+        let x = gi[g];
+        if x <= 0.0 {
+            continue;
+        }
+        let grp = &t.groups[g];
+        let s = grp.strength;
+        if s < 0.0 && grp.latch == 0.0 {
+            continue;
+        }
+        let ok = if grp.parent != 255 { entry.is_none() || present(grp.parent as usize) } else { t.root_groups > 1 && (0..t.root_groups as usize).filter(|r| present(*r)).count() >= 2 };
+        if !ok {
+            continue;
+        }
+        let ratio = if s > f32::from_bits(0x3586_37bd) { x / s } else if s < 0.0 { 0.0 } else { f32::MAX };
+        if ratio > 1.0 && ratio > best {
+            win = g as u8;
+            best = ratio;
+        }
+    }
+    if win == 255 {
+        return None;
+    }
+    Some((t.groups[win as usize].strength / total, win))
+}
+
+/// The original's sort of an island's contact list (STLport std::sort, 0x82593F08: the introsort loop
+/// 0x82593CC8 with the partition 0x825934D8 while a range holds more than 16, then insertion sorts
+/// 0x82593928 / 0x825917B8): ascending by `key`, stable up to 16 elements, above that as its steps fall.
+pub fn stl_sort<T: Clone>(a: &mut Vec<T>, key: impl Fn(&T) -> i64) {
+    fn insertion<T: Clone>(a: &mut [T], lo: usize, hi: usize, key: &impl Fn(&T) -> i64) {
+        for i in lo + 1..hi {
+            let v = a[i].clone();
+            if key(&v) < key(&a[lo]) {
+                for j in (lo..i).rev() {
+                    a[j + 1] = a[j].clone();
+                }
+                a[lo] = v;
+            } else {
+                let mut j = i;
+                while key(&v) < key(&a[j - 1]) {
+                    a[j] = a[j - 1].clone();
+                    j -= 1;
+                }
+                a[j] = v;
+            }
+        }
+    }
+    fn quick<T: Clone>(a: &mut [T], first: usize, mut last: usize, key: &impl Fn(&T) -> i64) {
+        while last - first > 16 {
+            let n = last - first;
+            let (ka, kb, kc) = (key(&a[first]), key(&a[first + n / 2]), key(&a[last - 1]));
+            let m = if ka < kb {
+                if kb < kc { first + n / 2 } else if ka < kc { last - 1 } else { first }
+            } else if ka < kc {
+                first
+            } else if kb < kc {
+                last - 1
+            } else {
+                first + n / 2
+            };
+            let kp = key(&a[m]);
+            let (mut f, mut l) = (first, last);
+            loop {
+                while key(&a[f]) < kp {
+                    f += 1;
+                }
+                l -= 1;
+                while kp < key(&a[l]) {
+                    l -= 1;
+                }
+                if !(f < l) {
+                    break;
+                }
+                a.swap(f, l);
+                f += 1;
+            }
+            quick(a, f, last, key);
+            last = f;
+        }
+    }
+    let n = a.len();
+    if n > 16 {
+        quick(a, 0, n, &key);
+        insertion(a, 0, 16, &key);
+        // (the rest without the guard: the least stands in the first sixteen)
+        for i in 16..n {
+            let v = a[i].clone();
+            let mut j = i;
+            while j > 0 && key(&v) < key(&a[j - 1]) {
+                a[j] = a[j - 1].clone();
+                j -= 1;
+            }
+            a[j] = v;
+        }
+    } else {
+        insertion(a, 0, n, &key);
+    }
+}
+
+/// One contact of an island as the breaking pass sees it.
+#[derive(Clone, Copy, Debug)]
+pub struct Link {
+    pub a: Option<Who>,
+    pub b: Option<Who>,
+    pub part_a: u16,
+    pub part_b: u16,
+    /// where it is kept: a manifold of this state and its slot, or (None) the car's own
+    pub from: Option<(usize, usize)>,
+}
+
+/// What a car's island came to.
+pub struct IslandOut {
+    pub touches: Vec<Touch>,
+    pub links: Vec<Link>,
+    pub bodies: Vec<Body>,
+    /// which object each body after the car's (0) is
+    pub owners: Vec<usize>,
+    pub solved: solver::IslandSolved,
+    /// what the car's +368 / +384 gain
+    pub impulse: Vec3,
+    pub turning: Vec3,
+}
+
+impl LooseState {
+    /// Is an instance one the breaking pass lists (instance vtable[8], 0x8248AD40)?
+    fn breakable(&self, world: &LooseWorld, o: usize) -> bool {
+        let obj = &self.objs[o];
+        if obj.veh.is_some() {
+            return false;
+        }
+        if !obj.hit {
+            return true;
+        }
+        let Some(e) = obj.entry else { return false };
+        (0..world.types[obj.ty].groups.len()).filter(|g| e.absent & (1 << g) == 0).count() >= 2
+    }
+
+    /// The bodies of an island's contacts, the car's first, and each side's body number.
+    fn bodies_of(&self, car: &Body, links: &[Link], touches: &mut [Touch]) -> (Vec<Body>, Vec<usize>) {
+        let mut bodies = vec![*car];
+        let mut owners: Vec<usize> = Vec::new();
+        for (l, t) in links.iter().zip(touches.iter_mut()) {
+            for (who, side) in [(l.a, &mut t.a), (l.b, &mut t.b)] {
+                side.body = match who {
+                    Some(Who::Car) => Some(0),
+                    Some(Who::Obj(o)) => self.objs[o].body.map(|b| match owners.iter().position(|x| *x == o) {
+                        Some(k) => k + 1,
+                        None => {
+                            owners.push(o);
+                            bodies.push(b.as_solver());
+                            owners.len()
+                        }
+                    }),
+                    Some(Who::City) | None => None,
+                };
+            }
+        }
+        (bodies, owners)
+    }
+
+    /// The velocity solve of the car's island with what is loose in it, and the breaking pass
+    /// (0x825DE200 whose apply stands back, then 0x82593680): the solve with every prop that has
+    /// no body taken for immovable; the instances asked what of those impulses breaks them; the
+    /// winner's share given at once to the bodies; the break; and the solve again from where the
+    /// bodies then are, until nothing breaks. `city`: the car's own contacts with the world
+    /// (it is A, the world has no body), which stand first or last by the addresses.
+    pub fn solve_car_island(&mut self, world: &LooseWorld, car_in: &CarIn, car: &mut Body, dynm: &mut CarDyn, city: &[solver::Contact], city_rows: &[bool], ids: &[usize], dt: f32) -> IslandOut {
+        let _ = car_in;
+        let (car_level, car_addr) = self.car_place();
+        // (the island's contacts, 0x82594068: every contact of every manifold in the tree's pre-order - a
+        // pair's sub-manifolds by (B's part, A's part), a manifold's contacts by their number - the ones the
+        // callbacks disabled too; that list sorted by the address of each one's instance A with the
+        // original's own sort, which is not stable above 16; the enabled ones of it are the rows.
+        // `city_rows`: the car's contacts with the city in their order, false = one that is not enabled.
+        // MCLA_DBG_RA5: pairs by their indices and a stable sort, as before.)
+        let old_order = super::vehsim::dbg_flag("MCLA_DBG_RA5");
+        let car_order = self.car_city_order.unwrap_or(0);
+        let mut list: Vec<((i64, i64, u64, u64), i64, Option<(Link, Touch)>)> = Vec::new();
+        let mut next_city = 0;
+        let city_link = |c: &solver::Contact| {
+            let a = Side { body: Some(0), point: c.on_body, local: c.local, rows: car.rows, margin: 0.04, core: Vec3::ZERO };
+            let b = Side { body: None, point: c.on_world, local: c.on_world, rows: [Vec3::X, Vec3::Y, Vec3::Z], margin: 0.04, core: Vec3::ZERO };
+            (Link { a: Some(Who::Car), b: None, part_a: 0, part_b: 0, from: None }, Touch { depth: c.depth, friction: c.friction, elasticity: c.elasticity, a, b, normal: c.normal, back: Vec3::ZERO - c.normal, pushed: c.pushed, kept: c.kept, target: c.target, impulse: Vec3::ZERO })
+        };
+        if old_order || city_rows.is_empty() {
+            for (n, c) in city.iter().enumerate() {
+                list.push(((if old_order { i64::MIN } else { car_order as i64 }, car_level, 0, n as u64), car_addr, Some(city_link(c))));
+            }
+        } else {
+            for (n, on) in city_rows.iter().enumerate() {
+                let row = if *on {
+                    next_city += 1;
+                    city.get(next_city - 1).map(city_link)
+                } else {
+                    None
+                };
+                list.push(((car_order as i64, car_level, 0, n as u64), car_addr, row));
+            }
+        }
+        for &k in ids {
+            let m = &self.manis[k];
+            let (la, lb) = (self.level(m.a), self.level(m.b));
+            let pair = if old_order { (la.min(lb), la.max(lb), if m.b == Who::City { m.cell as u64 } else { m.part_b as u64 }, m.part_a as u64) } else { (m.order as i64, 0, if m.b == Who::City { m.cell as u64 } else { m.part_b as u64 }, m.part_a as u64) };
+            let key = match m.a {
+                Who::Obj(o) => self.objs[o].addr,
+                _ => car_addr,
+            };
+            let rows_of = |w: Who| match w {
+                Who::Car => car.rows,
+                Who::Obj(o) => [self.objs[o].matrix[0], self.objs[o].matrix[1], self.objs[o].matrix[2]],
+                Who::City => [Vec3::X, Vec3::Y, Vec3::Z],
+            };
+            for (i, s) in m.slots.iter().enumerate() {
+                if !s.enabled {
+                    if !old_order {
+                        list.push((pair, key, None));
+                    }
+                    continue;
+                }
+                let mut t = s.t;
+                t.a.rows = rows_of(m.a);
+                t.b.rows = rows_of(m.b);
+                // (the whole bound of either side is a composite or the city's grid: its margin +112)
+                t.a.margin = 0.04;
+                t.b.margin = 0.04;
+                // (stage R: a vehicle's whole bound is its polyhedron - the thickness from a corner of it)
+                if let Who::Obj(o) = m.a {
+                    if let Some(vh) = self.objs[o].veh {
+                        t.a.margin = f32::from_bits(0x3d23_d70a);
+                        t.a.core = veh_core(vh.shape, &t.a.rows, t.normal);
+                    }
+                }
+                if let Who::Obj(o) = m.b {
+                    if let Some(vh) = self.objs[o].veh {
+                        t.b.margin = f32::from_bits(0x3d23_d70a);
+                        t.b.core = veh_core(vh.shape, &t.b.rows, t.back);
+                    }
+                }
+                list.push((pair, key, Some((Link { a: Some(m.a), b: Some(m.b), part_a: m.part_a, part_b: m.part_b, from: Some((k, i)) }, t))));
+            }
+        }
+        list.sort_by_key(|x| x.0);
+        if dbg() {
+            eprintln!("LOOSEROWS tick {} n {} city_rows {:?} walk {:?}", self.tick, list.len(), city_rows, list.iter().map(|x| (x.0 .0, x.0 .2, x.0 .3, x.1, x.2.is_some())).collect::<Vec<_>>());
+        }
+        if old_order {
+            list.sort_by_key(|x| x.1);
+        } else {
+            stl_sort(&mut list, |x| x.1);
+        }
+        let list: Vec<(Link, Touch)> = list.into_iter().filter_map(|x| x.2).collect();
+        let mut links: Vec<Link> = list.iter().map(|x| x.0).collect();
+        let mut touches: Vec<Touch> = list.iter().map(|x| x.1).collect();
+        let inv_dt = 1.0 / dt;
+        let mut rounds_left = 64;
+        loop {
+            let (bodies, owners) = self.bodies_of(car, &links, &mut touches);
+            let solved = solver::island_solve(&bodies, &touches, dt, inv_dt);
+            solver::island_impulses(&solved, &mut touches);
+            if dbg() {
+                for (l, t) in links.iter().zip(touches.iter()) {
+                    eprintln!("LOOSESOLVE tick {} {:?}/{} x {:?}/{} depth {:?} mu {:?} e {:?} n {:?} P {:?} J {:?} |J| {}", self.tick, l.a, l.part_a, l.b, l.part_b, t.depth, t.friction, t.elasticity, t.normal, t.kept, t.impulse, t.impulse.length());
+                }
+            }
+            // ---- 0x825920F8: the rounds ----
+            let mut j: Vec<Vec3> = touches.iter().map(|t| t.impulse).collect();
+            let mut broke = false;
+            for _ in 0..33 {
+                // (0x825914B8: the breakable instances and the impulse on each of their parts)
+                let mut listed: Vec<(usize, Vec<Vec3>)> = Vec::new();
+                for (i, l) in links.iter().enumerate() {
+                    for (who, part, first_minus) in [(l.a, l.part_a, false), (l.b, l.part_b, true)] {
+                        let Some(Who::Obj(o)) = who else { continue };
+                        if !self.breakable(world, o) {
+                            continue;
+                        }
+                        match listed.iter().position(|x| x.0 == o) {
+                            Some(k) => listed[k].1[part as usize] = listed[k].1[part as usize] + j[i],
+                            None => {
+                                let mut comp = vec![Vec3::ZERO; 128];
+                                comp[part as usize] = if first_minus { Vec3::ZERO - j[i] } else { j[i] };
+                                listed.push((o, comp));
+                            }
+                        }
+                    }
+                }
+                // (0x82591708: the instance that breaks at the least share)
+                let mut win: Option<(usize, f32, u8)> = None;
+                let mut least = 1.0f32;
+                for (o, comp) in &listed {
+                    if let Some((tk, g)) = break_strength(&world.types[self.objs[*o].ty], &self.objs[*o], comp) {
+                        if tk < least {
+                            least = tk;
+                            win = Some((*o, tk, g));
+                        }
+                    }
+                }
+                let Some((w, share, group)) = win else { break };
+                if dbg() {
+                    eprintln!("LOOSEBREAK tick {} obj {w} group {group} t {:?} ({:08x})", self.tick, share, share.to_bits());
+                }
+                // (the winner's share of every contact of it, to its body - if it has one now -
+                // and, the other way, to the other's)
+                let w_has_body = self.objs[w].body.is_some();
+                for (i, l) in links.iter().enumerate() {
+                    let s = j[i] * share;
+                    for side in 0..2 {
+                        let who = if side == 0 { l.a } else { l.b };
+                        if who != Some(Who::Obj(w)) {
+                            continue;
+                        }
+                        let t = &touches[i];
+                        let (point, vec) = if side == 0 { (t.a.point, s) } else { (t.b.point, Vec3::ZERO - s) };
+                        if w_has_body {
+                            self.objs[w].body.as_mut().unwrap().impulse_now(vec, point);
+                        }
+                        let (other, opoint, ovec) = if side == 0 { (l.b, t.b.point, Vec3::ZERO - s) } else { (l.a, t.a.point, s) };
+                        match other {
+                            Some(Who::Car) => {
+                                *dynm.p = *dynm.p + ovec;
+                                let vel = *dynm.p * car.inv_mass;
+                                *dynm.l = *dynm.l + cross(opoint - car.at, ovec);
+                                let ang = ex::spin_of(*dynm.l, &dynm.rows, dynm.inverse);
+                                car.vel = vel;
+                                car.ang = ang;
+                            }
+                            Some(Who::Obj(o)) => {
+                                if let Some(b) = self.objs[o].body.as_mut() {
+                                    b.impulse_now(ovec, opoint);
+                                }
+                            }
+                            Some(Who::City) | None => {}
+                        }
+                    }
+                }
+                // (the break / the activation, 0x824900A8)
+                let target = self.break_apart(world, w, group);
+                // (the contacts of the parts that left now name the new instance, 0x82593030)
+                if let Some((new, bits)) = target {
+                    let t = &world.types[self.objs[w].ty];
+                    for l in links.iter_mut() {
+                        for (who, part) in [(&mut l.a, l.part_a), (&mut l.b, l.part_b)] {
+                            if *who == Some(Who::Obj(w)) && bits & (1 << group_of(t, part as usize)) != 0 {
+                                *who = Some(Who::Obj(new));
+                            }
+                        }
+                    }
+                    for m in self.manis.iter_mut() {
+                        if m.a == Who::Obj(w) && bits & (1 << group_of(t, m.part_a as usize)) != 0 {
+                            m.a = Who::Obj(new);
+                            m.stale = true;
+                        }
+                        if m.b == Who::Obj(w) && bits & (1 << group_of(t, m.part_b as usize)) != 0 {
+                            m.b = Who::Obj(new);
+                            m.stale = true;
+                        }
+                    }
+                }
+                let k1 = 1.0 - share;
+                for (i, l) in links.iter().enumerate() {
+                    if l.a == Some(Who::Obj(w)) || l.b == Some(Who::Obj(w)) {
+                        j[i] = j[i] * k1;
+                    }
+                }
+                broke = true;
+            }
+            rounds_left -= 1;
+            if broke && rounds_left > 0 {
+                continue;
+            }
+            // (nothing broke: the impulses go to the bodies' accumulators, 0x825A20E8)
+            let (bodies, owners2) = self.bodies_of(car, &links, &mut touches);
+            debug_assert_eq!(owners, owners2);
+            let given = solver::island_apply(&bodies, &touches);
+            for (k, o) in owners.iter().enumerate() {
+                let b = self.objs[*o].body.as_mut().unwrap();
+                b.jf = b.jf + given[k + 1].0;
+                b.jt = b.jt + given[k + 1].1;
+            }
+            // (stage R, MCLA_DBG_VEHCON: every contact with a vehicle as it was solved, the numbers' bits -
+            // tick, the vehicle's level index, depth, friction, elasticity, normal, A's point, B's point, impulse)
+            if vehcon() {
+                for (l, t) in links.iter().zip(touches.iter()) {
+                    let other = [l.a, l.b].into_iter().find_map(|w| if let Some(Who::Obj(o)) = w { self.objs[o].veh } else { None });
+                    if let Some(vh) = other {
+                        let h = |v: Vec3| format!("{:08x} {:08x} {:08x}", v.x.to_bits(), v.y.to_bits(), v.z.to_bits());
+                        eprintln!("VEHCON {} {} {:08x} {:08x} {:08x} {} {} {} {}", REPLAY_TICK.load(std::sync::atomic::Ordering::Relaxed), vh.index, t.depth.to_bits(), t.friction.to_bits(), t.elasticity.to_bits(), h(t.normal), h(t.a.point), h(t.b.point), h(t.impulse));
+                    }
+                }
+            }
+            // (the contacts' numbers back into what is kept)
+            for (l, t) in links.iter().zip(touches.iter()) {
+                if let Some((k, i)) = l.from {
+                    if let Some(s) = self.manis.get_mut(k).and_then(|m| m.slots.get_mut(i)) {
+                        s.t.kept = t.kept;
+                        s.t.impulse = t.impulse;
+                    }
+                }
+            }
+            return IslandOut { impulse: given[0].0, turning: given[0].1, touches, links, bodies, owners, solved };
+        }
+    }
+
+    /// 0x824900A8 -> 0x8248F320: an instance breaks at `group` (255: it goes as a whole). Gives
+    /// the new instance and the groups it took, if a piece came off.
+    fn break_apart(&mut self, world: &LooseWorld, w: usize, group: u8) -> Option<(usize, u64)> {
+        let ty = self.objs[w].ty;
+        let t = &world.types[ty];
+        let (max_speed, max_spin) = (500.0f32, f32::from_bits(0x40c9_0fdb));
+        if self.objs[w].entry.is_none() {
+            if t.flags & 1 == 0 {
+                // (it goes as it is, with the file's archetype)
+                let obj = &mut self.objs[w];
+                obj.hit = true;
+                if obj.body.is_none() {
+                    let a = &t.archetype;
+                    let e = Entry { absent: 0, age: 0.0, cg: v(t.cg), mass: a.mass, inv_mass: a.inv_mass, inertia: v(a.inertia), inv_inertia: v(a.inv_inertia) };
+                    obj.body = Some(PBody::new(&obj.matrix, e.cg, &e, a.max_speed, a.max_spin));
+                }
+                return None;
+            }
+            // (the prop gets an entry that holds every group, 0x8248A3B0)
+            let mut e = Entry::default();
+            let mass = entry_mass(t, 0);
+            entry_refresh(t, &mut e, mass);
+            self.objs[w].entry = Some(e);
+            // (the entry has an instance of its own, which a prop's does not use)
+            self.entry_instance();
+        }
+        if group == 255 {
+            let obj = &mut self.objs[w];
+            obj.hit = true;
+            if obj.body.is_none() {
+                let e = obj.entry.unwrap();
+                obj.body = Some(PBody::new(&obj.matrix, e.cg, &e, max_speed, max_spin));
+            }
+            return None;
+        }
+        let parent = self.objs[w].entry.unwrap();
+        let bits = subtree(t, group as usize) & !parent.absent;
+        let all: u64 = (0..t.groups.len()).fold(0, |b, g| b | 1 << g);
+        // (something must stay behind, else it goes as a whole)
+        if (all & !parent.absent) & !bits == 0 {
+            let obj = &mut self.objs[w];
+            obj.hit = true;
+            if obj.body.is_none() {
+                obj.body = Some(PBody::new(&obj.matrix, parent.cg, &parent, max_speed, max_spin));
+            }
+            return None;
+        }
+        // (the new entry: the parent's state, less everything outside the group's own tree)
+        let mut e = Entry { absent: all & !bits, age: parent.age, ..Default::default() };
+        let mass = entry_mass(t, e.absent);
+        entry_refresh(t, &mut e, mass);
+        let matrix = self.objs[w].matrix;
+        let mut body = PBody::new(&matrix, e.cg, &e, max_speed, max_spin);
+        // (broken off a moving parent it takes the parent's motion with it, 0x825A5AE8 / 0x825A5168)
+        if let Some(pb) = self.objs[w].body {
+            let pos = xf(&matrix, parent.cg);
+            let r = matrix[3] - pos;
+            let vel = cross(pb.w, r) + pb.v;
+            body.v = vel;
+            body.p = vel * body.mass;
+            body.w = pb.w;
+            body.l = body.momentum_of(pb.w);
+        }
+        self.pieces_made += 1;
+        let n = self.pieces_made;
+        let new = self.objs.len();
+        let (inst_addr, index) = (self.entry_instance(), self.new_index());
+        self.objs.push(Obj { ty, inst: None, matrix, entry: Some(e), hit: true, body: Some(body), level: index.unwrap_or(rank('l', new).unwrap_or(if hint("pb", n) { 2_000_000 + n as i64 } else { -1000 - n as i64 })), addr: inst_addr.unwrap_or(rank('a', new).unwrap_or(if hint("pafter", n) { 2_000_000 + n as i64 } else { -1000 - n as i64 })), veh: None });
+        if dbg() {
+            eprintln!("LOOSENEW tick {} obj {new} level {} addr {:x}", self.tick, self.objs[new].level, self.objs[new].addr);
+        }
+        // (the parent loses the groups, 0x824A9458 and 0x824A9130; a body keeps its velocities)
+        let mut pe = parent;
+        pe.absent |= bits;
+        let rest = entry_mass(t, pe.absent);
+        entry_refresh(t, &mut pe, rest);
+        let obj = &mut self.objs[w];
+        obj.entry = Some(pe);
+        if let Some(b) = obj.body.as_mut() {
+            b.rows = [obj.matrix[0], obj.matrix[1], obj.matrix[2]];
+            b.at = xf(&obj.matrix, pe.cg);
+            b.mass = pe.mass;
+            b.inv_mass = pe.inv_mass;
+            b.inertia = pe.inertia;
+            b.inv_inertia = pe.inv_inertia;
+            b.p = b.v * b.mass;
+            b.l = b.momentum_of(b.w);
+        }
+        if dbg() {
+            eprintln!("LOOSEPIECE tick {} from obj {w}: obj {new} groups {bits:b} mass {:?} cg {:?} inertia {:?}; the rest mass {:?} cg {:?}", self.tick, e.mass, e.cg, e.inertia, pe.mass, pe.cg);
+        }
+        Some((new, bits))
+    }
+
+    /// The island's push solve (0x82591108) and what it leaves on the loose bodies; gives the
+    /// car's push.
+    pub fn push_car_island(&mut self, out: &mut IslandOut, car: &Body, car_start: Pushed, dt: f32) -> Pushed {
+        // (the bodies as the integration left them: only their inverse masses and matrices
+        // enter - and those have not changed)
+        let mut bodies = out.bodies.clone();
+        bodies[0] = *car;
+        let mut pushes = vec![Pushed::default(); bodies.len()];
+        pushes[0] = car_start;
+        for (k, o) in out.owners.iter().enumerate() {
+            let b = self.objs[*o].body.unwrap();
+            pushes[k + 1] = Pushed { push: b.push, turn: b.turn, deep: false };
+        }
+        solver::island_push(&bodies, &mut out.touches, &mut out.solved, dt, 1.0 / dt, &mut pushes);
+        for (k, o) in out.owners.iter().enumerate() {
+            let b = self.objs[*o].body.as_mut().unwrap();
+            b.push = pushes[k + 1].push;
+            b.turn = pushes[k + 1].turn;
+            if pushes[k + 1].deep && !b.deep {
+                b.deep = true;
+                b.deep_count = b.deep_count.saturating_add(1).min(254);
+            }
+        }
+        for (l, t) in out.links.iter().zip(out.touches.iter()) {
+            if let Some((k, i)) = l.from {
+                if let Some(s) = self.manis.get_mut(k).and_then(|m| m.slots.get_mut(i)) {
+                    s.t.pushed = t.pushed;
+                }
+            }
+        }
+        pushes[0]
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The loose bodies' own tick (p1/body_decode.md): the move, gravity and damping ahead of the
+// collide (0x8259F300), the integration after the solves (0x8259BE30), the push applied
+// (0x8259E920), and the entries' ages (0x824AB680).
+
+const GRAVITY: f32 = f32::from_bits(0xc11c_cccd);
+
+impl LooseState {
+    /// The groups of manifolds that hang together through an object that can move or be moved
+    /// (the city joins nothing): the car's - empty if nothing loose touches it - and the rest.
+    fn islands(&self) -> (Vec<usize>, Vec<Vec<usize>>) {
+        if !super::vehsim::dbg_flag("MCLA_DBG_RA2") {
+            let live = |m: &Mani| m.slots.iter().any(|s| s.enabled);
+            let mut car = Vec::new();
+            let mut rest: Vec<(usize, Vec<usize>)> = Vec::new();
+            for (k, m) in self.manis.iter().enumerate() {
+                if m.island == 0 {
+                    car.push(k);
+                } else {
+                    match rest.iter().position(|x| x.0 == m.island) {
+                        Some(i) => rest[i].1.push(k),
+                        None => rest.push((m.island, vec![k])),
+                    }
+                }
+            }
+            // (an island's rows count the contacts that are not enabled too; one with none enabled is not solved)
+            if !car.iter().any(|k| live(&self.manis[*k])) {
+                car.clear();
+            }
+            rest.retain(|x| x.1.iter().any(|k| live(&self.manis[*k])));
+            return (car, rest.into_iter().map(|x| x.1).collect());
+        }
+        let n = self.objs.len() + 1;
+        let mut root: Vec<usize> = (0..n).collect();
+        fn find(root: &mut Vec<usize>, mut x: usize) -> usize {
+            while root[x] != x {
+                root[x] = root[root[x]];
+                x = root[x];
+            }
+            x
+        }
+        let node = |w: Who| match w {
+            Who::Car => Some(0),
+            Who::Obj(o) => Some(o + 1),
+            Who::City => None,
+        };
+        let live = |m: &Mani| m.slots.iter().any(|s| s.enabled);
+        for m in self.manis.iter().filter(|m| live(m)) {
+            if let (Some(a), Some(b)) = (node(m.a), node(m.b)) {
+                let (ra, rb) = (find(&mut root, a), find(&mut root, b));
+                if ra != rb {
+                    root[rb.max(ra)] = rb.min(ra);
+                }
+            }
+        }
+        let car_root = find(&mut root, 0);
+        let mut car = Vec::new();
+        let mut rest: Vec<(usize, Vec<usize>)> = Vec::new();
+        for (k, m) in self.manis.iter().enumerate() {
+            if !live(m) {
+                continue;
+            }
+            let r = find(&mut root, node(m.a).unwrap_or(0));
+            if r == car_root {
+                car.push(k);
+            } else {
+                match rest.iter().position(|x| x.0 == r) {
+                    Some(i) => rest[i].1.push(k),
+                    None => rest.push((r, vec![k])),
+                }
+            }
+        }
+        // (the car's own island holds something loose only if a manifold of the car is in it)
+        if !car.iter().any(|k| self.manis[*k].a == Who::Car || self.manis[*k].b == Who::Car) {
+            for k in car.drain(..) {
+                let r = node(self.manis[k].a).unwrap_or(0);
+                match rest.iter().position(|x| x.0 == r) {
+                    Some(i) => rest[i].1.push(k),
+                    None => rest.push((r, vec![k])),
+                }
+            }
+        }
+        (car, rest.into_iter().map(|x| x.1).collect())
+    }
+
+    /// For whoever draws the props (stage P4): the prop instances that have lost groups - the instance's number in
+    /// the file's order and the bit set of the groups gone - and every piece or loose prop that has a body: its
+    /// type, the groups it does NOT hold, and its instance's matrix (rows and place).
+    pub fn drawn(&self) -> (Vec<(u32, u64)>, Vec<(usize, u64, [Vec3; 4])>) {
+        let broken = self.objs.iter().filter_map(|o| Some((o.inst?, o.entry?.absent))).filter(|x| x.1 != 0).collect();
+        let moving = self.objs.iter().filter(|o| o.body.is_some()).map(|o| (o.ty, o.entry.map_or(0, |e| e.absent), o.matrix)).collect();
+        (broken, moving)
+    }
+
+    /// The manifolds of the car's island (empty: the car's island is the car and the city).
+    pub fn car_island(&self) -> Vec<usize> {
+        self.islands().0
+    }
+
+    /// Every island the car is not in: its solve, its breaking pass, and its push solve.
+    pub fn step_rest(&mut self, world: &LooseWorld, car_in: &CarIn, dt: f32) {
+        for ids in self.islands().1 {
+            let mut none = Body { at: Vec3::ZERO, rows: [Vec3::X, Vec3::Y, Vec3::Z], vel: Vec3::ZERO, ang: Vec3::ZERO, inv_mass: 0.0, inv_moments: Vec3::ZERO, force: Vec3::ZERO, torque: Vec3::ZERO };
+            let (mut p, mut l) = (Vec3::ZERO, Vec3::ZERO);
+            let mut dynm = CarDyn { p: &mut p, l: &mut l, mass: 0.0, inverse: Vec3::ZERO, rows: [Vec3::X, Vec3::Y, Vec3::Z] };
+            let mut out = self.solve_car_island(world, car_in, &mut none, &mut dynm, &[], &[], &ids, dt);
+            self.push_car_island(&mut out, &none, Pushed::default(), dt);
+        }
+    }
+
+    /// The instance's matrix from the body (0x8259D1E8).
+    fn matrix_from_body(&mut self, world: &LooseWorld, o: usize) {
+        let cg = self.cg_of(world, o);
+        let obj = &mut self.objs[o];
+        if let Some(b) = obj.body.as_ref() {
+            obj.matrix = [b.rows[0], b.rows[1], b.rows[2], ex::origin_of(b.at, &b.rows, cg)];
+        }
+    }
+
+    /// Ahead of the collide (0x8259F300): what the push solve left is applied, the body is moved
+    /// with the velocities the tick came in with, and gravity and the type's damping go into the
+    /// tick's force sums.
+    pub fn pre_collide(&mut self, world: &LooseWorld, dt: f32) {
+        let rs = super::gjk::rsqrt_as_original;
+        self.sync_others();
+        for o in 0..self.objs.len() {
+            let Some(mut b) = self.objs[o].body else { continue };
+            let veh = self.objs[o].veh;
+            let (gravity, damping) = match veh {
+                Some(vh) => (vh.gravity, VEH_DAMPING),
+                None => {
+                    let t = &world.types[self.objs[o].ty];
+                    (t.archetype.gravity, t.damping)
+                }
+            };
+            b.prev = self.objs[o].matrix;
+            // (0x8259E790 - normally nothing is pending)
+            b.at = b.at + b.push;
+            b.push = Vec3::ZERO;
+            if solver::turn_applies(b.turn) {
+                b.rows = solver::rows_pushed(&b.rows, b.turn);
+                b.turn = Vec3::ZERO;
+            }
+            // (0x8259E768)
+            b.at = b.v * dt + b.at;
+            let turn = b.w * dt;
+            if dot3(turn, turn) > f32::from_bits(0x2b8c_bccc) {
+                b.rows = ex::rows_turned(&b.rows, turn);
+                (b.w, b.l) = capped(ex::spin_of(b.l, &b.rows, b.inv_inertia), b.l, b.max_spin);
+            }
+            self.objs[o].body = Some(b);
+            self.matrix_from_body(world, o);
+            // (gravity, 0x8259D7F0: a force)
+            let g = Vec3::new(0.0 * gravity, GRAVITY * gravity, 0.0 * gravity);
+            b.force = b.force + g * b.mass;
+            // (damping, 0x8259D880: in the body's axes, of an entry's archetype)
+            if self.objs[o].entry.is_some() || veh.is_some() {
+                let inv_dt = recip(dt);
+                let cols = [Vec3::new(b.rows[0].x, b.rows[1].x, b.rows[2].x), Vec3::new(b.rows[0].y, b.rows[1].y, b.rows[2].y), Vec3::new(b.rows[0].z, b.rows[1].z, b.rows[2].z)];
+                let slow = |x: Vec3, c: Vec3, lin: Vec3, sq: Vec3| {
+                    let l = Vec3::new(dot3(b.rows[0], x), dot3(b.rows[1], x), dot3(b.rows[2], x));
+                    let l2 = dot3(l, l);
+                    let sp = if l2 == 0.0 { 0.0 } else { l2 * rs(l2) };
+                    let u = if l2 > f32::from_bits(0x3727_c5ac) { l * rs(l2) } else { Vec3::ZERO };
+                    let mut a = Vec3::ZERO - ((u * c) + (((l * sp) * sq) + (l * lin)));
+                    let n = a * dt + l;
+                    if 0.0 >= dot3(n, l) {
+                        a = -(l * inv_dt - Vec3::ZERO);
+                    }
+                    a
+                };
+                let d = &damping;
+                let fl = slow(b.v, v(d[0]), v(d[1]), v(d[2])) * b.mass;
+                b.force = b.force + Vec3::new(dot3(cols[0], fl), dot3(cols[1], fl), dot3(cols[2], fl));
+                let tl = slow(b.w, v(d[3]), v(d[4]), v(d[5])) * b.inertia;
+                b.torque = b.torque + Vec3::new(dot3(cols[0], tl), dot3(cols[1], tl), dot3(cols[2], tl));
+            }
+            b.moves += 1;
+            if b.moves > 32 {
+                b.rows = ex::rows_squared(&b.rows);
+                b.moves = 0;
+            }
+            self.objs[o].body = Some(b);
+            self.matrix_from_body(world, o);
+            if dbg() {
+                eprintln!("LOOSEBODY tick {} obj {o} at {:?} v {:?} w {:?} origin {:?} up {:?}", self.tick + 1, b.at, b.v, b.w, self.objs[o].matrix[3], b.rows[1]);
+            }
+        }
+    }
+
+    /// After the solves: the forces and impulses into the momenta (0x8259BE30), the push solve's
+    /// answer into the pose (0x8259E920), and every entry a tick older (0x824AB680).
+    pub fn end_tick(&mut self, world: &LooseWorld, dt: f32) {
+        for o in 0..self.objs.len() {
+            let Some(mut b) = self.objs[o].body else { continue };
+            b.jf = b.force * dt + b.jf;
+            b.jt = b.torque * dt + b.jt;
+            b.force = Vec3::ZERO;
+            b.torque = Vec3::ZERO;
+            if b.jf != Vec3::ZERO {
+                b.p = b.p + b.jf;
+                (b.v, b.p) = capped(b.p * b.inv_mass, b.p, b.max_speed);
+                b.jf = Vec3::ZERO;
+            }
+            if b.jt != Vec3::ZERO {
+                b.l = b.l + b.jt;
+                (b.w, b.l) = capped(ex::spin_of(b.l, &b.rows, b.inv_inertia), b.l, b.max_spin);
+                b.jt = Vec3::ZERO;
+            }
+            // (0x8259E790, then the instance's matrix and the collide's "last" one)
+            b.at = b.at + b.push;
+            b.push = Vec3::ZERO;
+            if solver::turn_applies(b.turn) {
+                b.rows = solver::rows_pushed(&b.rows, b.turn);
+                b.turn = Vec3::ZERO;
+            }
+            self.objs[o].body = Some(b);
+            self.matrix_from_body(world, o);
+            let now = self.objs[o].matrix;
+            let b = self.objs[o].body.as_mut().unwrap();
+            if !b.deep {
+                b.last = now;
+                b.last_set = true;
+                b.deep_count = 0;
+            } else {
+                if !b.last_set || b.deep_count > 8 {
+                    b.last = now;
+                }
+                b.deep = false;
+            }
+        }
+        // (the entries' ages; a quarter of a second after the first hit the centre of gravity
+        // goes back where the parts have it)
+        for o in 0..self.objs.len() {
+            let ty = self.objs[o].ty;
+            let Some(mut e) = self.objs[o].entry else { continue };
+            let t = &world.types[ty];
+            let age = e.age;
+            e.age = age + dt;
+            if age < 0.25 && e.age >= 0.25 && v(t.cg_shift) != Vec3::ZERO {
+                let mass = entry_mass(t, e.absent);
+                entry_refresh(t, &mut e, mass);
+                let obj = &mut self.objs[o];
+                if let Some(b) = obj.body.as_mut() {
+                    b.rows = [obj.matrix[0], obj.matrix[1], obj.matrix[2]];
+                    b.at = xf(&obj.matrix, e.cg);
+                    b.mass = e.mass;
+                    b.inv_mass = e.inv_mass;
+                    b.inertia = e.inertia;
+                    b.inv_inertia = e.inv_inertia;
+                    b.p = b.v * b.mass;
+                    b.l = b.momentum_of(b.w);
+                }
+            }
+            self.objs[o].entry = Some(e);
+        }
+        if dbg() {
+            let h = |v: Vec3| format!("{:08x} {:08x} {:08x}", v.x.to_bits(), v.y.to_bits(), v.z.to_bits());
+            for o in self.objs.iter() {
+                if let Some(b) = o.body.as_ref() {
+                    eprintln!("LOOSEEND k {} level {} age{:?}/{:08x} at {} v {} w {} p {} l {} m {} {} {} {}", REPLAY_K.load(std::sync::atomic::Ordering::Relaxed), o.level, o.entry.map(|e| e.age), dt.to_bits(), h(b.at), h(b.v), h(b.w), h(b.p), h(b.l), h(o.matrix[0]), h(o.matrix[1]), h(o.matrix[2]), h(o.matrix[3]));
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Stage R (agent D): another VEHICLE as a body of the car's island (flag `MCLA_DBG_RD1` = none).
+// An ambient traffic vehicle (instance class 0x820C4314, class number 6, collider class
+// 0x820C4114) is one polyhedron bound (type 4, `resources/ambients/<name>/*.r155`) on a body of
+// 600 kg whose archetype (phArchetypeDamp, made by 0x826E3EC8) has gravity factor 1.2 and the
+// damping (C, V, V2) = (0.01, 0.01, 0.001) for moving and for turning. Its own driving (the AI,
+// its ray suspension 0x826FA0F8 that leaves its forces in the body's sums for the next step) is
+// the session's: a replay hands the body's state before every tick (`MCLA_REPLAY_OTHERS`, written
+// by veh_diff.py from the recording's OBJ records); the move, gravity, damping, the contacts
+// with the car's hull, the car's callback 0x82332D30, the island's solve and the push are this
+// port's own.
+
+/// What a vehicle object is beyond a prop's `Obj`.
+#[derive(Clone, Copy, Debug)]
+pub struct VehObj {
+    pub shape: &'static HullShape,
+    /// instance vtable[1]: 6 ambient traffic, 8 an mcCar
+    pub class: u8,
+    /// archetype +48
+    pub gravity: f32,
+    /// bound +80 as the running game has it
+    pub cg: Vec3,
+    /// its level index
+    pub index: u32,
+    /// it is in this tick's list as an active object
+    pub here: bool,
+}
+
+#[derive(Clone, Debug)]
+struct OtherVeh {
+    index: u32,
+    addr: u32,
+    class: u8,
+    state: u32,
+    model: String,
+    matrix: [Vec3; 4],
+    body: PBody,
+    gravity: f32,
+    cg: Vec3,
+}
+
+/// A contact the pair car x vehicle kept from the tick before (one-step replays only).
+#[derive(Clone, Copy, Debug)]
+struct OtherKept {
+    index: u32,
+    local_a: Vec3,
+    local_b: Vec3,
+    normal: Vec3,
+    back: Vec3,
+    kept: Vec3,
+    depth: f32,
+    element: u16,
+    element_b: u16,
+}
+
+pub struct Others {
+    mine: u32,
+    car_addr: u32,
+    ticks: HashMap<usize, Vec<OtherVeh>>,
+    kept: HashMap<usize, Vec<OtherKept>>,
+    shapes: HashMap<String, HullShape>,
+    /// the kept contacts are the recording's before every tick (a one-step replay)
+    inject: bool,
+}
+
+static OTHERS: std::sync::OnceLock<Option<Others>> = std::sync::OnceLock::new();
+/// The line of the replay's input the tick in hand is (replay.rs).
+pub static REPLAY_TICK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+fn vehcon() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("MCLA_DBG_VEHCON").is_some())
+}
+
+fn others_only() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("MCLA_REPLAY_OTHERS_ONLY").is_some())
+}
+
+fn others() -> Option<&'static Others> {
+    OTHERS.get().and_then(|o| o.as_ref())
+}
+
+/// `MCLA_REPLAY_OTHERS=<file>`: lines of words, numbers as the hexadecimal bits:
+/// `H <car's level index> <car's instance address>`;
+/// `V <tick> <level index> <instance address> <class number> <level state> <model> <12 instance matrix>
+///    <3 place +256> <9 rows +208> <3 v> <3 w> <3 P> <3 L> <3 F +336> <3 T +352> <mass> <1/mass> <3 I> <3 1/I>
+///    <max speed> <max spin> <gravity factor> <3 cg> <moves +664> <12 last matrix +96> <3 push +400> <3 turn +416>`;
+/// `K <tick> <level index> <3 local A> <3 local B> <3 normal +80> <3 +96> <3 P +128> <depth> <element A> <element B>`.
+/// `hull_of`: the model's bound from the game's files.
+pub fn load_others(path: &str, inject: bool, hull_of: &dyn Fn(&str) -> Option<HullShape>) {
+    let _ = OTHERS.get_or_init(|| {
+        let text = std::fs::read_to_string(path).ok()?;
+        let mut o = Others { mine: 0, car_addr: 0, ticks: HashMap::new(), kept: HashMap::new(), shapes: HashMap::new(), inject };
+        for line in text.lines() {
+            let w: Vec<&str> = line.split_whitespace().collect();
+            let x = |i: usize| u32::from_str_radix(w.get(i).copied().unwrap_or("0"), 16).unwrap_or(0);
+            let f = |i: usize| f32::from_bits(x(i));
+            let v3 = |i: usize| Vec3::new(f(i), f(i + 1), f(i + 2));
+            match w.first().copied() {
+                Some("H") => {
+                    o.mine = x(1);
+                    o.car_addr = x(2);
+                }
+                Some("V") if w.len() >= 82 => {
+                    let model = w[6].to_string();
+                    if !o.shapes.contains_key(&model) {
+                        match hull_of(&model) {
+                            Some(h) => {
+                                o.shapes.insert(model.clone(), h);
+                            }
+                            None => {
+                                println!("replay: no bound for the vehicle {model}");
+                                continue;
+                            }
+                        }
+                    }
+                    let b = 7;
+                    let matrix = [v3(b), v3(b + 3), v3(b + 6), v3(b + 9)];
+                    let c = b + 12;
+                    let body = PBody {
+                        at: v3(c),
+                        rows: [v3(c + 3), v3(c + 6), v3(c + 9)],
+                        v: v3(c + 12),
+                        w: v3(c + 15),
+                        p: v3(c + 18),
+                        l: v3(c + 21),
+                        force: v3(c + 24),
+                        torque: v3(c + 27),
+                        jf: Vec3::ZERO,
+                        jt: Vec3::ZERO,
+                        push: v3(c + 57),
+                        turn: v3(c + 60),
+                        last: [v3(c + 45), v3(c + 48), v3(c + 51), v3(c + 54)],
+                        prev: [v3(c + 45), v3(c + 48), v3(c + 51), v3(c + 54)],
+                        last_set: true,
+                        deep: false,
+                        deep_count: 0,
+                        mass: f(c + 30),
+                        inv_mass: f(c + 31),
+                        inertia: v3(c + 32),
+                        inv_inertia: v3(c + 35),
+                        max_speed: f(c + 38),
+                        max_spin: f(c + 39),
+                        moves: x(c + 44),
+                    };
+                    o.ticks.entry(x(1) as usize).or_default().push(OtherVeh { index: x(2), addr: x(3), class: x(4) as u8, state: x(5), model, matrix, body, gravity: f(c + 40), cg: v3(c + 41) });
+                }
+                Some("K") if w.len() >= 21 => {
+                    o.kept.entry(x(1) as usize).or_default().push(OtherKept { index: x(2), local_a: v3(3), local_b: v3(6), normal: v3(9), back: v3(12), kept: v3(15), depth: f(18), element: x(19) as u16, element_b: x(20) as u16 });
+                }
+                _ => {}
+            }
+        }
+        println!("replay: other vehicles in {} ticks, {} bounds{}", o.ticks.len(), o.shapes.len(), if inject { ", kept contacts injected" } else { "" });
+        Some(o)
+    });
+}
+
+/// 0x8259D880's constants on a traffic vehicle's archetype (0x826E3EC8: 0x82002C60 = 0.01, 0x820022B4 = 0.001).
+const VEH_DAMPING: [[f32; 3]; 6] = [[0.01; 3], [0.01; 3], [0.001; 3], [0.01; 3], [0.01; 3], [0.001; 3]];
+
+/// A vector made unit as the callback does (vmsum3fp, vrsqrtefp, one step).
+fn unit_cb(n: Vec3) -> Vec3 {
+    let d = dot3(n, n);
+    let e = 1.0 / d.sqrt();
+    let e = if e == f32::INFINITY { 0.0 } else { e };
+    n * ((1.0 - d * (e * e)) * (0.5 * e) + e)
+}
+
+/// The car's callback 0x82332D30 on a contact whose other instance is a vehicle (class 6 or 8):
+/// the normal laid flat by how upright both stand; then by where the car is on the other and
+/// how it travels - in front of it and head-on (BoundFriction / BoundElasticity, each side's
+/// normal the other's axis, both points onto the two centre planes), behind it and the same
+/// way (normals likewise, both points the car's on its centre plane), or from the side and
+/// into it (the car's point onto its centre plane) - and, the car's own point rewritten on side
+/// A, the contact's limit (+60, the point's fourth lane) becomes 0: the island goes through the
+/// breaking pass, where nothing breaks. `om`: the other instance's matrix.
+fn car_meets_vehicle(car: &CarIn, om: &[Vec3; 4], class: u8, car_is_a: bool, t: &mut Touch) {
+    let mut n = if car_is_a { t.normal } else { Vec3::ZERO - t.normal };
+    let store = |t: &mut Touch, mine: Vec3, theirs: Vec3| {
+        if car_is_a {
+            t.normal = mine;
+            t.back = theirs;
+        } else {
+            t.back = mine;
+            t.normal = theirs;
+        }
+    };
+    let k = 1.0 - (om[1].y * car.now[1].y).abs();
+    if k < 1.0 {
+        let mut y2 = n.y * n.y;
+        let rest = 1.0 - y2;
+        if rest > 0.0 {
+            n.y = k * n.y;
+            y2 = n.y * n.y;
+            let q = ((1.0 - y2) / rest).sqrt();
+            n.x *= q;
+            n.z *= q;
+        }
+        let l2 = fma(n.z, n.z, n.x * n.x) + y2;
+        if l2 > f32::from_bits(0x3f67_0a3d) && l2 < f32::from_bits(0x3f8d_1eb7) {
+            n = unit_cb(n);
+            store(t, n, Vec3::ZERO - n);
+        }
+    }
+    let (me, back) = (car.now, car.now[2]);
+    let fwd = Vec3::ZERO - back;
+    let dir = if fma(car.vel.x, fwd.x, fma(car.vel.z, fwd.z, car.vel.y * fwd.y)) > 0.0 { unit_cb(fwd + car.vel) } else { fwd };
+    let ob = om[2];
+    let along = |a: Vec3| fma(a.x, ob.x, fma(ob.z, a.z, ob.y * a.y));
+    let onto = |m: &[Vec3; 4], p: Vec3| {
+        let d = p - m[3];
+        let s = -fma(m[0].x, d.x, fma(m[0].y, d.y, m[0].z * d.z));
+        m[0] * s + p
+    };
+    let c45 = ex::guest_cos(f64::from_bits(0x3FE9_21FB_6000_0000)) as f32;
+    let side_of = along(n);
+    let (mine, theirs) = if car_is_a { (t.a.point, t.b.point) } else { (t.b.point, t.a.point) };
+    let (mut mine, mut theirs) = (mine, theirs);
+    if side_of < f32::from_bits(0xbf33_3333) {
+        if along(dir) > c45 {
+            t.friction = car.touch.0;
+            t.elasticity = car.touch.1;
+            store(t, unit_cb(Vec3::new(-ob.x, n.y, -ob.z)), unit_cb(Vec3::new(-back.x, -n.y, -back.z)));
+            mine = onto(om, theirs);
+            theirs = onto(&me, mine);
+        }
+    } else if side_of > f32::from_bits(0x3f33_3333) {
+        if along(dir) < -c45 {
+            store(t, unit_cb(Vec3::new(ob.x, n.y, ob.z)), unit_cb(Vec3::new(-back.x, -n.y, -back.z)));
+            mine = onto(&me, mine);
+            theirs = mine;
+        }
+    } else if fma(dir.x, n.x, fma(dir.z, n.z, dir.y * n.y)) < -c45 {
+        mine = onto(&me, mine);
+    }
+    if car_is_a {
+        t.a.point = mine;
+        t.b.point = theirs;
+    } else {
+        t.b.point = mine;
+        t.a.point = theirs;
+    }
+    // (an mcCar partner; the car wiped out, chassis +592 bits 0x10 / 0x04)
+    if class == 8 || car.wiped {
+        t.friction = car.touch.0;
+        t.elasticity = car.touch.1;
+    }
+}
+
+/// The corner of a polyhedron bound the push solve measures a side's thickness from
+/// (0x825DCEB8, type 4: the last scanned corner unless an earlier one lies farther along).
+fn veh_core(shape: &HullShape, rows: &[Vec3; 3], n: Vec3) -> Vec3 {
+    let nl = Vec3::new(dot3(rows[0], n), dot3(rows[1], n), dot3(rows[2], n));
+    let c = shape.scanned();
+    let Some((&last, firsts)) = c.split_last() else { return Vec3::ZERO };
+    let (mut best, mut bd) = (last, dot3(nl, last));
+    for p in firsts {
+        let d = dot3(nl, *p);
+        if d > bd {
+            best = *p;
+            bd = d;
+        }
+    }
+    best
+}
+
+impl LooseState {
+    /// The other vehicles of the tick in hand, as the replay's file has them before it: each an
+    /// object with the logged body; those not in the list are gone, and their contacts with them.
+    fn sync_others(&mut self) {
+        let Some(ot) = others() else { return };
+        let tick = REPLAY_TICK.load(std::sync::atomic::Ordering::Relaxed);
+        for o in self.objs.iter_mut() {
+            if let Some(vh) = o.veh.as_mut() {
+                vh.here = false;
+                o.body = None;
+            }
+        }
+        for v in ot.ticks.get(&tick).into_iter().flatten() {
+            // (an inactive one is activated by its driver's code with a state no record holds: left out)
+            if v.state != 0 {
+                continue;
+            }
+            let Some(shape) = ot.shapes.get(&v.model) else { continue };
+            let i = match self.objs.iter().position(|o| o.veh.map_or(false, |x| x.index == v.index)) {
+                Some(i) => i,
+                None => {
+                    self.objs.push(Obj { ty: usize::MAX, inst: None, matrix: v.matrix, entry: None, hit: false, body: None, level: 0, addr: 0, veh: None });
+                    self.objs.len() - 1
+                }
+            };
+            // (its place among the level's indices and the heap's addresses, against the car's)
+            let (car_level, car_addr) = self.car_place();
+            let obj = &mut self.objs[i];
+            obj.level = v.index as i64 - ot.mine as i64 + car_level;
+            obj.addr = v.addr as i64 - ot.car_addr as i64 + car_addr;
+            obj.matrix = v.matrix;
+            obj.body = Some(v.body);
+            obj.veh = Some(VehObj { shape, class: v.class, gravity: v.gravity, cg: v.cg, index: v.index, here: true });
+        }
+        let gone = |w: Who, objs: &Vec<Obj>| matches!(w, Who::Obj(o) if objs[o].veh.map_or(false, |x| !x.here || ot.inject));
+        let objs = &self.objs;
+        self.manis.retain(|m| !gone(m.a, objs) && !gone(m.b, objs));
+        if ot.inject {
+            for k in ot.kept.get(&tick).into_iter().flatten() {
+                let Some(o) = self.objs.iter().position(|o| o.veh.map_or(false, |x| x.index == k.index && x.here)) else { continue };
+                let vh = self.objs[o].veh.unwrap();
+                let side = |local: Vec3| Side { body: None, point: Vec3::ZERO, local, rows: [Vec3::X, Vec3::Y, Vec3::Z], margin: 0.04, core: Vec3::ZERO };
+                let t = Touch { depth: k.depth, a: side(k.local_a), b: side(k.local_b), normal: k.normal, back: k.back, kept: k.kept, ..Default::default() };
+                let slot = Slot2 { t, age: 1, enabled: true, element: k.element, surface: vh.shape.surface_of(k.element_b) };
+                match self.manis.iter().position(|m| m.a == Who::Car && m.b == Who::Obj(o)) {
+                    Some(i) => self.manis[i].slots.push(slot),
+                    None => self.manis.push(Mani { a: Who::Car, b: Who::Obj(o), part_a: 0, part_b: 0, cell: 0, stale: false, visited: true, island: 0, order: 0, slots: vec![slot] }),
+                }
+            }
+        }
+    }
+}

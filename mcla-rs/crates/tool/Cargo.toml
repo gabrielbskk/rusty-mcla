@@ -1,0 +1,24 @@
+[package]
+name = "mcla-tool"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mcla-tool"
+path = "src/main.rs"
+
+[dependencies]
+mcla-formats = { path = "../formats" }
+mcla-flash = { path = "../flash" }
+mcla-install = { path = "../install" }
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+rayon.workspace = true
+memmap2.workspace = true
+lzxd.workspace = true
+aes.workspace = true
+png = "0.17"
+hashbrown.workspace = true
+glam.workspace = true

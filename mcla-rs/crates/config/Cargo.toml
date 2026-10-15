@@ -1,0 +1,12 @@
+[package]
+name = "mcla-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rusty MCLA settings.toml model shared by the game and the launcher (no game dependencies)"
+
+[dependencies]
+toml = { version = "1", default-features = false, features = ["std", "serde", "parse", "display"] }
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true

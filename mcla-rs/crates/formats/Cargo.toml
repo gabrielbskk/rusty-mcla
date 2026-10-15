@@ -1,0 +1,22 @@
+[package]
+name = "mcla-formats"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "mcla_formats"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+memmap2.workspace = true
+aes.workspace = true
+cipher.workspace = true
+lzxd.workspace = true
+flate2.workspace = true
+rayon.workspace = true
+hashbrown.workspace = true
+glam.workspace = true
+bytemuck.workspace = true

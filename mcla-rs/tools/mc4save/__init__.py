@@ -1,0 +1,1 @@
+﻿"""Decoders of the original save's entries (Stats, LocalOptions, EditorData, ColorData, UserVinylData, RubberbandMgr, Career, RaceFavorites, enableGps). Layout notes: D:/MCLA/work/save/decode/*/*.md"""

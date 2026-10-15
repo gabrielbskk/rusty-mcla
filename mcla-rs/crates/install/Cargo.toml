@@ -1,0 +1,21 @@
+[package]
+name = "mcla-install"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rusty MCLA install pipeline: ISO validation, extraction, audio/video conversion, ffmpeg handling"
+
+[lib]
+name = "mcla_install"
+path = "src/lib.rs"
+
+[dependencies]
+mcla-formats = { path = "../formats" }
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+sha2 = "0.10"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+ureq = { version = "2", default-features = false, features = ["tls"] }
+fs2 = "0.4"

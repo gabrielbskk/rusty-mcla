@@ -1,0 +1,236 @@
+//! Step 23b: the open list of steps 22b and 23 - the statistics the port did not count (the
+//! distance driven, on two wheels, in a wheelie, the jumps), the race goals of the race-end
+//! statistics (aAOR / aAAR / aARC), the showroom's test drive (tTST, aTDV), the photo album's
+//! slots (tPTS, aFAB) and the audio's slow-motion switch during the tutorials.
+//!
+//! The original (scratch `work/save/port/s23b/`):
+//! - The odometer (sub_82562480, once a frame for the player's vehicle): speed = |(vx, vz)| x
+//!   2.237 (mph); +20 += speed x the frame time x 1/3600 - miles; flushed into gkDS (add) by
+//!   sub_822A61B0 (with vkDT for the vehicle). aDST: gkDS >= 5000.
+//! - Two wheels (mcCarGyro sub_823663D0 0x823673D4..0x823674C0): while the gyro's lean state
+//!   (+18) is on and the tuning has Lean (> 0), for the player: gk2W += speed (+224, m/s) x
+//!   2.237 x frame time / 3600. a2WD: gk2W >= 50.
+//! - Wheelie (mcBikeGyro sub_823688B8 0x8236A33C..0x8236A3E0): while the stunt state (+16) is
+//!   above 0 (1 up, 99 coming down): gkWL += the same. aWHL: gkWL >= 50.
+//! - Jumps (sub_82330378 0x82330554..0x82330720): no wheel down - the air time (+584) grows by
+//!   the frame time; a wheel down with air time > 0 - for the player's vehicle gsJT += the air
+//!   time, gmJD = max(gmJD, the flat distance from where it left the ground (+640) to here),
+//!   then air time = -air time; a wheel down with air time <= 0 - air time 0, the take-off
+//!   point = here. aJTM: gsJT >= 600; aJDS: gmJD >= 310.896.
+//! - The race-end statistics (sub_822D0438 0x822D0BA0..0x822D0C0C -> sub_822CD720): won (place
+//!   1), the time under the race's GoalTargetTime x 1000 ms (the city table's +136), the damage
+//!   under a quarter of MaxDamage ((max - damage) > 0.75 max): rWIN / rBTT / rMDG of the race (max
+//!   1); all three: rCGL of the race, aAOR; then, by the race's content (+144: ContentID, else 4
+//!   for South Central, 1 otherwise), bit 0: aAAR once every Ordered / Circuit / Unordered / Blitz
+//!   race (sub types 1, 2, 3, 5) not DevOnly of content bit 0 has rCGL; bit 2: aARC the same for
+//!   content 4. (The races' GoalTargetTime / TargetDamage are those of the GOAL ATTACK mode
+//!   - ArcadeMenuGoalAttack, pause MODES' GOAL ATTACK; the check itself runs at every race end.)
+//! - The showroom's TEST DRIVE (sub_826A6330): tTST + 1; the vehicle table's +48
+//!   (ContentDownloadFlags, else ContentFlags - `tune/vehicle` lists) >= 4: aTDV (set once).
+//! - The photo album (sub_8263DCF8): a picture saved into slot k of the album (16 slots,
+//!   `PhotoAlbum.s0..s15`; PHOTO_ALBUM): a slot not used before raises the album's count (+856),
+//!   aFAB as it reaches 16; tPTS + 1 for every picture; the slot marked used (+860).
+
+use crate::game::{Game, Mode};
+use glam::Vec3;
+
+/// The player's vehicle as the statistics read it this frame.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct S23Drive {
+    pub present: bool,
+    /// |(vx, vz)| and |v| in m/s
+    pub vel_xz: f32,
+    pub speed: f32,
+    /// mcCarGyro's lean on (two wheels), mcBikeGyro's stunt state above 0 (a wheelie)
+    pub two: bool,
+    pub wheelie: bool,
+    /// no wheel down
+    pub airborne: bool,
+    pub pos: Vec3,
+}
+
+/// The player's vehicle (the port's state: the wheels' contact, vehsim's `two` and `wheelie`).
+pub fn drive_of(c: Option<&crate::vehicles::CarInstance>) -> S23Drive {
+    let Some(c) = c else { return S23Drive::default() };
+    let v = c.state.vel;
+    let vs = c.state.veh.as_ref();
+    S23Drive {
+        present: true,
+        vel_xz: Vec3::new(v.x, 0.0, v.z).length(),
+        speed: v.length(),
+        two: vs.map_or(false, |s| s.two != 0),
+        wheelie: c.model.bike && vs.map_or(false, |s| s.wheelie == 1 || s.wheelie == 99),
+        airborne: c.state.wheels.iter().take(if c.model.bike { 2 } else { 4 }).all(|w| !w.grounded),
+        pos: c.state.pos,
+    }
+}
+
+/// What the running game keeps for step 23b.
+#[derive(Clone, Debug, Default)]
+pub struct S23bLive {
+    /// the jump's air time (+584; negative for the frame after a landing) and take-off point (+640)
+    pub air: f32,
+    pub takeoff: Option<Vec3>,
+    /// the test drive seen last frame
+    pub td_was: Option<usize>,
+}
+
+/// mph per m/s (0x8201CD1C) and hours per second (0x8202F80C).
+pub const MPH: f32 = 2.237;
+pub const PER_HOUR: f32 = 0.000_277_778;
+
+/// The races of the city table that count for aAAR / aARC: sub types Ordered, Circuit,
+/// Unordered, Blitz (1, 2, 3, 5 of sub_8238E748's table 0x827E930C).
+pub const GOAL_SUB_TYPES: [&str; 4] = ["Ordered", "Circuit", "Unordered", "Blitz"];
+
+/// A race's content (+144): ContentID, else 4 for South Central, 1 otherwise (sub_82388E48
+/// 0x823895D0). No race file on the disc has a ContentID.
+pub fn race_content(district: &str) -> u32 {
+    if district.eq_ignore_ascii_case("SouthCentral") { 4 } else { 1 }
+}
+
+/// The vehicle table's +48 (ContentDownloadFlags, else ContentFlags) of the three lists.
+pub fn content_flags(data_dir: &str, car: &str) -> u32 {
+    static TABLE: std::sync::OnceLock<std::collections::HashMap<String, u32>> = std::sync::OnceLock::new();
+    let t = TABLE.get_or_init(|| {
+        let mut out = std::collections::HashMap::new();
+        for f in ["0xe94bde63", "0xccb5daee", "0x3cb91343"] {
+            let Ok(s) = std::fs::read(std::path::Path::new(data_dir).join("tune/vehicle").join(f)) else { continue };
+            let s = String::from_utf8_lossy(&s);
+            for block in s.split("Vehicle").skip(1) {
+                let field = |k: &str| block.lines().map(|l| l.trim()).find_map(|l| l.strip_prefix(k).filter(|r| r.starts_with(|c: char| c.is_whitespace())).map(|r| r.trim().to_string()));
+                let Some(name) = field("Name") else { continue };
+                let v = field("ContentDownloadFlags").or_else(|| field("ContentFlags")).and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+                out.insert(name.to_ascii_lowercase(), v);
+            }
+        }
+        out
+    });
+    t.get(&car.to_ascii_lowercase()).copied().unwrap_or(0)
+}
+
+/// The photo album's slot files (the port's PHOTO_ALBUM): `<data>/../photos/album/slot_NN.png`.
+pub fn album_dir(data_dir: &str) -> std::path::PathBuf {
+    std::path::Path::new(data_dir).join("../photos/album")
+}
+
+pub const ALBUM_SLOTS: usize = 16;
+
+impl Game {
+    /// Once a frame from the step 23 tick: the driving statistics, the test drive.
+    pub fn mc4b_tick(&mut self, dt: f32, d: S23Drive) {
+        // ---- the showroom's test drive (sub_826A6330) ----
+        let td = self.test_drive;
+        if td.is_some() && self.opt_x.s23b.td_was.is_none() {
+            self.mc4_stat_add("tTST", 0, 1.0);
+            let car = td.and_then(|i| self.car_dirs.get(i)).and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let flags = content_flags(&self.data_dir, &car);
+            log::info!("test drive: {} (vehicle table +48 = {})", car, flags);
+            if flags >= 4 {
+                self.mc4_award("aTDV");
+            }
+        }
+        self.opt_x.s23b.td_was = td;
+        // ---- the driving statistics: only while the world runs ----
+        let sim = dt * self.mc4_time_scale();
+        if !d.present || sim <= 0.0 || !matches!(self.mode, Mode::FreeRoam | Mode::Race) || self.fresh_game {
+            return;
+        }
+        let miles = |v: f32| (v * MPH * sim * PER_HOUR) as f64;
+        self.mc4_stat_add("gkDS", 0, miles(d.vel_xz));
+        if d.two {
+            self.mc4_stat_add("gk2W", 0, miles(d.speed));
+        }
+        if d.wheelie {
+            self.mc4_stat_add("gkWL", 0, miles(d.speed));
+        }
+        let x = &mut self.opt_x.s23b;
+        if d.airborne {
+            x.air += sim;
+        } else if x.air > 0.0 {
+            let air = x.air;
+            let dist = x.takeoff.map_or(0.0, |t| Vec3::new(d.pos.x - t.x, 0.0, d.pos.z - t.z).length());
+            x.air = -air;
+            self.mc4_stat_add("gsJT", 0, air as f64);
+            if dist as f64 > self.mc4_stat("gmJD", 0) {
+                self.mc4_stat_set("gmJD", 0, dist as f64);
+            }
+            if air > 0.5 {
+                log::info!("jump: {:.2} s in the air, {:.1} m (gsJT {:.1}, gmJD {:.1})", air, dist, self.mc4_stat("gsJT", 0), self.mc4_stat("gmJD", 0));
+            }
+        } else {
+            x.air = 0.0;
+            x.takeoff = Some(d.pos);
+        }
+    }
+
+    /// sub_822CD720 from the race-end statistics: the race's goals (won, under its goal time,
+    /// under a quarter of the damage), rCGL and aAOR when all three are met; aAAR / aARC once
+    /// every race of its content has them.
+    pub fn mc4_race_goals(&mut self, place: usize, time: Option<f32>, damage: f32) {
+        let Some(def) = self.current_race.and_then(|i| self.race_defs.get(i)).cloned() else {
+            log::info!("race goals: no race in hand");
+            return;
+        };
+        let Some(k) = self.mc4_race_index(&def.id) else {
+            log::info!("race goals: {} is not in the city's race table", def.id);
+            return;
+        };
+        let k = k as u32;
+        let win = place == 1;
+        let beat = time.map_or(false, |t| ((t * 1000.0).round() as i64) < ((def.goal_time * 1000.0).round() as i64));
+        let dmg = (1.0 - damage) > 0.75;
+        for (on, id) in [(beat, "rBTT"), (win, "rWIN"), (dmg, "rMDG")] {
+            if on {
+                self.mc4_stat_set(id, k, 1.0);
+            }
+        }
+        log::info!("race goals: {} - won {}, time {:?} under {} s {}, damage {:.2} {}", def.id, win, time, def.goal_time, beat, damage, dmg);
+        if !(win && beat && dmg) {
+            return;
+        }
+        self.mc4_stat_set("rCGL", k, 1.0);
+        self.mc4_award("aAOR");
+        let content = race_content(&def.district);
+        let (bit, id) = if content & 1 != 0 { (1, "aAAR") } else if content & 4 != 0 { (4, "aARC") } else { return };
+        if self.mc4_awarded(id) {
+            return;
+        }
+        let all = (0..self.race_table.len()).all(|j| {
+            let Some(d) = self.race_defs.iter().find(|d| d.id.eq_ignore_ascii_case(&self.race_table[j])) else { return true };
+            let counts = GOAL_SUB_TYPES.iter().any(|s| d.sub_type.eq_ignore_ascii_case(s)) && !d.dev_only && race_content(&d.district) & bit != 0;
+            !counts || self.mc4_stat("rCGL", j as u32) == 1.0
+        });
+        if all {
+            self.mc4_award(id);
+        }
+    }
+
+    /// A picture taken in photo mode (sub_8263DCF8): the album's slot it goes into - the first
+    /// free one (the port has no PA_ChooseSlot page; with all sixteen used, slot 0 is written
+    /// again) -, the count of used slots, aFAB as it reaches 16, tPTS + 1. The file to write.
+    pub fn mc4b_photo_path(&mut self) -> String {
+        let dir = album_dir(&self.data_dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let used: Vec<bool> = (0..ALBUM_SLOTS).map(|k| dir.join(format!("slot_{k:02}.png")).exists()).collect();
+        let slot = used.iter().position(|u| !u).unwrap_or(0);
+        if !used[slot] {
+            let count = used.iter().filter(|u| **u).count() + 1;
+            if count == ALBUM_SLOTS {
+                self.mc4_award("aFAB");
+            }
+        }
+        self.mc4_stat_add("tPTS", 0, 1.0);
+        self.dirty = true;
+        log::info!("photo: album slot {} (tPTS {})", slot, self.mc4_stat("tPTS", 0));
+        dir.join(format!("slot_{slot:02}.png")).to_string_lossy().to_string()
+    }
+
+    /// AudioManager_SetActiveTimeSlow's state: on from a tutorial's SetActiveTimeSlow(1) (before
+    /// its ease to pause) until its form is closed (SetActiveTimeSlow(0), before the ease back);
+    /// RACE_GH_02's lesson while box 76 is up (SetActiveTimeSlow(1) at 0x3e4, (0) after the box).
+    pub fn mc4b_time_slow(&self) -> bool {
+        let x = &self.opt_x.s23;
+        x.run.as_ref().map_or(false, |r| r.slow && r.phase >= 1) || x.lesson == 1
+    }
+}

@@ -1,0 +1,1482 @@
+== rage__rageShaderMaterial  (registered at 82197e40, 7 members)
+  +8     nImageWidth                      type 5
+  +12    nImageHeight                     type 5
+  +32    sTemplateFileName                type 11
+  +36    sShaderFullPathName              type 11
+  +40    avDefaultVertexColors            type 13
+  +52    apShaderParams                   type 13
+  +60    apUserDataParams                 type 13
+== rage__rageShaderMaterialTemplate  (registered at 8219a078, 3 members)
+  +4     sShaderFileName                  type 11
+  +8     sUserDataGroupFileName           type 11
+  +16    Material                         type 12
+== rage__rageShaderMaterialParam  (registered at 821a2320, 14 members)
+  +4     Name                             type 11
+  +8     UiName                           type 11
+  +12    UiWidget                         type 11
+  +16    UiHelp                           type 11
+  +20    UiHint                           type 11
+  +24    UiMin                            type 7
+  +28    UiMax                            type 7
+  +32    UiStep                           type 7
+  +36    UiHidden                         type 0
+  +40    UvSetIndex                       type 5
+  +44    UvSetName                        type 11
+  +48    TextureOutputFormats             type 11
+  +52    iNoOfMipLevels                   type 5
+  +56    MaterialDataUvSetIndex           type 5
+== rage__rageShaderMaterialParamMatrix44  (registered at 821a37c0, 4 members)
+  +64    mDataA                           type 10
+  +80    mDataB                           type 10
+  +96    mDataC                           type 10
+  +112   mDataD                           type 10
+== rage__rageShaderMaterialParamMatrix34  (registered at 821a45e8, 4 members)
+  +64    mDataA                           type 9
+  +80    mDataB                           type 9
+  +96    mDataC                           type 9
+  +112   mDataD                           type 9
+== rage__rageShaderMaterialGroup  (registered at 821ab548, 2 members)
+  +4     aMaterialFileNames               type 13
+  +12    aMaterials                       type 13
+== rage__rsmSourceVertexColourDescription  (registered at 821ab8d0, 2 members)
+  +16    strName                          type 11
+  +32    obDefaultColour                  type 10
+== rage__rsmRunTimeVertexColourDescription  (registered at 821ac230, 2 members)
+  +4     iIndex                           type 5
+  +8     astrChannelSources               type 13
+== rage__rageShaderMaterialUserData  (registered at 821acdc0, 6 members)
+  +4     sTemplateName                    type 11
+  +8     nBucketNumber                    type 5
+  +12    avDefaultVertexColors            type 13
+  +20    apParams                         type 13
+  +28    obSourceVertexColourDescriptions type 12
+  +44    obRunTimeVertexColourDescriptions type 12
+== rage__crJointData__crJointControlPoint  (registered at 821bb920, 2 members)
+  +4     MinTwist                         type 7
+  +8     MaxTwist                         type 7
+== rage__crJointData  (registered at 821bba68, 11 members)
+  +4     BoneID                           type 5
+  +8     JointDOFs                        type 5
+  +12    UseTwistLimits                   type 0
+  +13    UsePerControlTwistLimits         type 0
+  +16    NumControlPoints                 type 5
+  +32    TwistAxis                        type 9
+  +48    TwistLimitMin                    type 7
+  +52    TwistLimitMax                    type 7
+  +56    SoftLimitScale                   type 7
+  +80    ControlPoints                    type 13
+  +176   ZeroRotationEulers               type 9
+== mcRouteParams  (registered at 8224fd20, 9 members)
+  +8     fRandVal                         type 7
+  +16    iMinRandomSolutionNodes          type 5
+  +20    bGoalIsLine                      type 0
+  +21    bGoalIsRandom                    type 0
+  +22    bPreferNoTurns                   type 0
+  +23    bRespectDensity                  type 0
+  +24    bRespectBlockedRoads             type 0
+  +25    bConnectingRailsOnly             type 0
+  +26    bNetworkEnable                   type 0
+== mcFindRouteData  (registered at 8224ff10, 7 members)
+  +16    Params                           type 12
+  +44    RoadDensitySettings              type 12
+  +56    iStartRailIndex                  type 5
+  +60    iEndRailIndex                    type 5
+  +64    fStartRailT                      type 7
+  +68    fEndRailT                        type 7
+  +80    vApproxGoalPos                   type 9
+== mcExplosionType  (registered at 8225b500, 7 members)
+  +4     DeactivationRadiusSpeed          type 7
+  +8     InitialRadiusSpeed               type 7
+  +12    InitialRadius                    type 7
+  +16    DecayFactor                      type 7
+  +20    ForceFactor                      type 7
+  +32    Force                            type 9
+  +48    Torque                           type 9
+== mcCtfGlobals  (registered at 8225c418, 15 members)
+  +4     bAttachExplosionToCar            type 0
+  +8     fBombFuseTime                    type 7
+  +16    RelativeExplodePositionOffset    type 9
+  +32    fFlagPickupAndDropoffRadius      type 7
+  +36    fFlagPickupAndDropoffHeight      type 7
+  +40    fMinDropImpactForce              type 7
+  +44    fMinBikeDropImpactForce          type 7
+  +48    fFlagTransferImmuneTime          type 7
+  +52    fFlagPickupDisableTime           type 7
+  +56    fHeavyFlagMass                   type 7
+  +60    fHeavyFlagDrag                   type 7
+  +64    ColorNeutral                     type 6
+  +68    ColorRed                         type 6
+  +72    ColorBlue                        type 6
+  +76    ColorBomb                        type 6
+== mcNetManager  (registered at 8226f320, 7 members)
+  +12    Version                          type 5
+  +16    SyncPolicies                     type 12
+  +20    ConnectionPolicies               type 12
+  +24    ConnectionPoliciesDebugMode      type 12
+  +28    StreamChannelPolicies            type 12
+  +32    PeerComplainerPolicies           type 12
+  +36    GamePolicies                     type 12
+== mcNetConnectionPolicies  (registered at 82294368, 7 members)
+  +4     MaxSendCount                     type 6
+  +8     KeepaliveInterval                type 6
+  +12    TimeoutInterval                  type 6
+  +16    EnableDebugSpew                  type 0
+  +20    QosUpdateFrequencyMs             type 6
+  +24    BadLatencyMs                     type 6
+  +28    GoodLatencyMs                    type 6
+== mcNetPeerComplainerPolicies  (registered at 82294628, 2 members)
+  +4     ComplaintResendInterval          type 6
+  +8     ChannelId                        type 5
+== mcNetGamePolicies  (registered at 82294770, 10 members)
+  +4     LobbyRaceStartDelaySeconds       type 7
+  +8     RankedRaceStartDelaySeconds      type 7
+  +12    PreRaceVehicleLockdownSeconds    type 7
+  +16    PreRaceJoinLockdownSeconds       type 7
+  +20    RaceOverDelaySeconds             type 7
+  +24    TeamBalanceBeforeStartSeconds    type 7
+  +28    DefaultMaxPlayers                type 6
+  +32    RaceStartCineLengthSeconds       type 7
+  +36    HudMaxVisiblePlayers             type 6
+  +40    HudListOverflowSwapSeconds       type 7
+== mcNetSyncPolicies  (registered at 82294938, 16 members)
+  +4     VehicleStateSyncPeriod           type 5
+  +8     VehicleSyncIntervalMin           type 7
+  +12    VehicleSyncIntervalMax           type 7
+  +16    VehicleInputTimeout              type 7
+  +20    VehicleSyncDistAttenuator        type 7
+  +24    VehicleStateBlendDuration        type 5
+  +28    DisableSync                      type 0
+  +29    DisableDeltaCompression          type 0
+  +30    DisableDeltaCompressionDirtyCheck type 0
+  +31    DisableVehicleStateBlend         type 0
+  +32    BlendFromLastVisState            type 0
+  +33    IgnoreAngVelocitySync            type 0
+  +34    DisableTrafficSync               type 0
+  +36    TimeSyncStartPingIntervalMs      type 6
+  +40    TimeSyncFinalPingIntervalMs      type 6
+  +44    AmbientUpdateIntervalSeconds     type 7
+== mcPlayerInputTune  (registered at 822b7470, 24 members)
+  +24    SSSThreshold                     type 7
+  +28    SSSValue                         type 7
+  +32    AutoReverseSpeed                 type 7
+  +36    AutoReverseInput                 type 7
+  +40    ff_WheelRange                    type 7
+  +44    ff_FrntWhlFrcAmpDiv              type 7
+  +48    ff_FrntWhlFrcAmpExp              type 7
+  +52    ff_ConstantForceAmpMult          type 7
+  +56    ff_SpringMin                     type 7
+  +60    ff_SpringMax                     type 7
+  +64    ff_DamperMin                     type 7
+  +68    ff_DamperMax                     type 7
+  +72    CountersteerFactor               type 7
+  +76    SteerRate                        type 7
+  +80    ReturnRate                       type 7
+  +84    SteerInputExp                    type 7
+  +88    BrakeInputExp                    type 7
+  +92    ThrottleInputExp                 type 7
+  +96    ThrottleInputVelocityThreshold   type 7
+  +100   CruiseThrottleMin                type 7
+  +104   CruiseThrottleMax                type 7
+  +108   CruiseActivationSpeedRange       type 7
+  +112   SteerDamageBias                  type 7
+  +116   SteerDamageSpeedThreshold        type 7
+== mcLocator  (registered at 822e0f60, 5 members)
+  +16    Shape                            type 5
+  +32    Position                         type 9
+  +48    AreaPolygon                      type 12
+  +60    Radius                           type 7
+  +64    Falloff                          type 7
+== mcLocatorFogGround  (registered at 822e2ee0, 5 members)
+  +128   KeyMinFogColor                   type 13
+  +288   KeyMaxFogColor                   type 13
+  +448   KeyFogHeight                     type 13
+  +608   KeyFogNearZ                      type 13
+  +768   KeyFogFarZ                       type 13
+== mcLocatorFogCard  (registered at 822e4568, 5 members)
+  +120   KeyBaseVelocity                  type 13
+  +280   KeySize                          type 13
+  +440   KeyVariedVelocityFactor          type 13
+  +600   KeyGlobalOpacity                 type 13
+  +760   KeyParticleOpacity               type 13
+== mcLightingManagerTune  (registered at 822f4e60, 29 members)
+  +16    sm_PropGlowColors                type 13
+  +80    sm_fPropGlowIntensitys           type 13
+  +96    sm_fPropTrailIntensitys          type 13
+  +112   sm_PropGlowSeedSizes             type 13
+  +144   sm_fPropGlowDistanceFalloffs     type 13
+  +160   sm_fCarGlowIntensitys            type 13
+  +176   sm_fCarTrailIntensitys           type 13
+  +192   sm_fCarGlowDistanceFalloffs      type 13
+  +208   sm_fStreakSampless               type 13
+  +240   sm_iStreakIterationss            type 13
+  +272   sm_fStreakIntensitys             type 13
+  +304   sm_iBloomIterationss             type 13
+  +336   sm_fBloomIntensitys              type 13
+  +368   sm_fSignalGlowSizes              type 13
+  +384   sm_fSignalGlowReflectionSizes    type 13
+  +416   sm_fSignalGlowIntensitys         type 13
+  +432   sm_CarLightGlowSizess            type 13
+  +464   sm_CarLightGlowReflectionSizess  type 13
+  +496   sm_PropGlowReflectionSeedSize    type 8
+  +504   sm_fPropGlowReflectionIntensity  type 7
+  +508   sm_fCarGlowReflectionIntensity   type 7
+  +512   sm_fGlobalNightLightIntensity    type 7
+  +516   sm_GlobalParticleIntensity       type 7
+  +528   sm_vGarageLight0Color            type 9
+  +544   sm_fGarageLight0Intensity        type 7
+  +560   sm_vGarageLight1Color            type 9
+  +576   sm_fGarageLight1Intensity        type 7
+  +592   sm_vGarageAmbientLighting        type 9
+  +608   sm_fGarageTOD                    type 7
+== mcLightStreakTune  (registered at 822fc9a0, 13 members)
+  +4     StarSize                         type 13
+  +36    RainGlowIntensity                type 13
+  +52    TrailDistanceFalloff             type 7
+  +56    DistanceFalloff                  type 7
+  +60    MaxGlowDist                      type 7
+  +64    MaxGlowBias                      type 7
+  +68    MaxCarGlowBias                   type 7
+  +72    MinGlowBias                      type 7
+  +76    TrailScale                       type 7
+  +80    GlowScaleAmt                     type 7
+  +84    MaxDistGlowScale                 type 7
+  +88    MinDistGlowScale                 type 7
+  +92    StreakAngle                      type 13
+== ?  (registered at 822fe748, 6 members)
+  +16    Colour                           type 9
+  +32    Direction                        type 9
+  +64    Intensity                        type 7
+  +68    ConeAngle                        type 7
+  +72    Penumbra                         type 7
+  +88    Type                             type 2
+== mcTimeOfDayLight  (registered at 82301a80, 9 members)
+  +16    szName                           type 11
+  +272   szTextureName                    type 11
+  +528   bEnabled                         type 0
+  +532   fTimeOfDay                       type 7
+  +536   fDayOrbitSpeed                   type 7
+  +540   fDayOrbitSpeed2                  type 7
+  +544   fNightOrbitSpeed                 type 7
+  +548   fRateChangeTime                  type 7
+  +552   bDraw                            type 0
+== ?  (registered at 8230ecd8, 2 members)
+  +4     MaxRots                          type 5
+  +8     ScheduledFrame                   type 5
+== mcGyroTune  (registered at 8236b7c0, 53 members)
+  +24    Turn                             type 7
+  +28    Drift                            type 7
+  +32    Spin                             type 7
+  +36    RevSpin                          type 7
+  +40    Yaw                              type 7
+  +44    Pitch                            type 7
+  +48    Roll                             type 7
+  +52    Lean                             type 7
+  +56    LeanAngle                        type 7
+  +64    Wheelie                          type 7
+  +68    TurnFactor                       type 7
+  +76    TurnLimit                        type 7
+  +80    TurnDamp                         type 7
+  +84    TurnBias                         type 7
+  +88    TurnOversteer                    type 7
+  +92    LeanFactor                       type 7
+  +96    LeanAngleMax                     type 7
+  +100   LeanRateUp                       type 7
+  +104   LeanRateDn                       type 7
+  +108   LeanLimit                        type 7
+  +112   LeanDamp                         type 7
+  +116   LeanImpulseUp                    type 7
+  +120   LeanImpulseDn                    type 7
+  +124   LeanSpeedMin                     type 7
+  +128   LeanSteerLimit                   type 7
+  +132   LeanThrottleLimit                type 7
+  +136   LeanSteerBias                    type 7
+  +140   LeanOffsetCG                     type 7
+  +144   NosieAngle                       type 7
+  +148   WheelieAngle                     type 7
+  +152   WheelieRate                      type 7
+  +156   WheelieLimit                     type 7
+  +160   WheelieDamp                      type 7
+  +164   RollLimit                        type 7
+  +168   RollDamp                         type 7
+  +172   HillTorque                       type 7
+  +176   HillGrade                        type 7
+  +180   DriftTorque                      type 7
+  +184   DriftThrust                      type 7
+  +188   DriftDecay                       type 7
+  +192   WheelieBoostAcc                  type 7
+  +196   WheelieBoostDuration             type 7
+  +200   WobbleFrequency                  type 7
+  +204   WobbleAmplitude                  type 7
+  +208   BurnoutRate                      type 7
+  +212   BurnoutLimit                     type 7
+  +216   BurnoutTurn                      type 7
+  +220   BurnoutTurnRev                   type 7
+  +224   BurnoutLean                      type 7
+  +228   BurnoutGrip                      type 7
+  +232   ReverseAcc                       type 7
+  +236   ReverseLimit                     type 7
+  +240   GravityPitch                     type 7
+== mcCarSimTune  (registered at 8236c858, 57 members)
+  +32    ModelOffset                      type 9
+  +48    CenterOfMass                     type 9
+  +64    Size                             type 9
+  +80    InertiaBox                       type 9
+  +96    WheelPositionScale               type 9
+  +112   Mass                             type 7
+  +116   BoundFriction                    type 7
+  +120   BoundElasticity                  type 7
+  +124   BoundGravity                     type 7
+  +132   DrivetrainType                   type 5
+  +136   WheelFront                       type 12
+  +140   WheelBack                        type 12
+  +144   Engine                           type 12
+  +148   Trans                            type 12
+  +152   Powertrain                       type 12
+  +156   Freetrain                        type 12
+  +160   AxleFront                        type 12
+  +164   AxleBack                         type 12
+  +168   Aero                             type 12
+  +172   Fluid                            type 12
+  +192   TireFric                         type 12
+  +196   Nitro                            type 12
+  +200   SSTurbo                          type 12
+  +204   AirRide                          type 12
+  +208   Hydraulics                       type 12
+  +212   SSSValue                         type 7
+  +216   SSSThresholdMin                  type 7
+  +220   SSSThresholdMax                  type 7
+  +224   BurnThreshold                    type 7
+  +228   BurnRevThreshold                 type 7
+  +232   BurnBoost                        type 7
+  +236   BurnIncval                       type 7
+  +240   BurnDecval                       type 7
+  +244   BurnDamage                       type 7
+  +248   BurnWeightxfer                   type 7
+  +252   RevLimitMin                      type 7
+  +256   RevLimitMax                      type 7
+  +260   RevLimitDelay                    type 7
+  +264   RevLimitThrottleRate             type 7
+  +268   UpsetCG                          type 7
+  +272   SettleCG                         type 7
+  +276   DriftCG                          type 7
+  +280   HeadOnCGOffset                   type 7
+  +284   HeadOnSpinMult                   type 7
+  +288   BackfireFrequency                type 7
+  +292   CarFrictionHandlingWipeout       type 7
+  +296   CarFrictionHandlingStandard      type 7
+  +300   LandingDampFactor                type 7
+  +304   AeroDampFactor                   type 7
+  +308   TireMeltDampFactor               type 7
+  +312   AeroDampDelay                    type 7
+  +316   LandingElasticity                type 7
+  +320   BoundClearance                   type 7
+  +324   BoundAngle                       type 7
+  +328   BoundBumper                      type 7
+  +332   BoundWidebody                    type 7
+  +336   BoundBumperWidth                 type 7
+== mcCarZoneTune  (registered at 82381a50, 16 members)
+  +32    CenterOfMass                     type 9
+  +48    SSSValue                         type 7
+  +52    StaticFric                       type 7
+  +56    SlidingFric                      type 7
+  +60    OptSlipPercent                   type 7
+  +64    SteeringLimit                    type 7
+  +68    TurnBias                         type 7
+  +72    TurnFactor                       type 7
+  +76    TurnTorque                       type 7
+  +80    TurnLimit                        type 7
+  +84    TurnDamp                         type 7
+  +88    LeanFactor                       type 7
+  +92    LeanTorque                       type 7
+  +96    LeanLimit                        type 7
+  +100   LeanDamp                         type 7
+  +104   LeanRate                         type 7
+== mcCarStuckTune  (registered at 82383918, 2 members)
+  +48    TimeFlipThresh                   type 7
+  +52    MinDropRetriggerTime             type 7
+== mcCarDamageTune  (registered at 82383ce8, 20 members)
+  +24    MaxDamage                        type 7
+  +28    MedDamage                        type 7
+  +32    ImpactThreshold                  type 7
+  +36    WipeoutThreshold                 type 7
+  +40    WeightxferThreshold              type 7
+  +44    ExplodeThreshold                 type 7
+  +48    JoltThreshold                    type 7
+  +52    FatalBlow                        type 7
+  +56    WipeoutDelay                     type 7
+  +60    DamageOutDelay                   type 7
+  +64    ExplosionDelay                   type 7
+  +72    ExplodeImpulse                   type 7
+  +80    vLDoorDmgOffset                  type 9
+  +96    vLDoorDmgRot                     type 9
+  +112   vRDoorDmgOffset                  type 9
+  +128   vRDoorDmgRot                     type 9
+  +144   vHoodDmgOffset                   type 9
+  +160   vHoodDmgRot                      type 9
+  +176   vTrunkDmgOffset                  type 9
+  +192   vTrunkDmgRot                     type 9
+== mcCarModelTune  (registered at 82385948, 29 members)
+  +24    FenderClipFront                  type 13
+  +32    FenderClipRear                   type 13
+  +40    FenderCeilingFront               type 13
+  +48    FenderCeilingRear                type 13
+  +56    FenderHeightFront                type 13
+  +64    FenderHeightRear                 type 13
+  +72    FenderWidthFront                 type 13
+  +80    FenderWidthRear                  type 13
+  +88    FenderEdgeFront                  type 13
+  +96    FenderEdgeRear                   type 13
+  +104   FenderFloorFront                 type 13
+  +112   FenderFloorRear                  type 13
+  +120   fRotorSize                       type 13
+  +128   fRotorOffset                     type 13
+  +136   TireSteerLimit                   type 7
+  +140   TireSteerOffset                  type 7
+  +144   vDriverGaugeLightOffset          type 9
+  +160   vDriverNeonLightOffset           type 9
+  +176   GroundClearance                  type 7
+  +180   fWindowClipPlaneHeight           type 7
+  +184   cFrontBumperMovement             type 14
+  +188   cRearBumperMovement              type 14
+  +192   cHoodMovement                    type 14
+  +196   cTrunkMovement                   type 14
+  +200   bDoubleSidedTrunk                type 0
+  +201   bHasFrontLeftRotor               type 0
+  +202   bHasFrontRightRotor              type 0
+  +203   bHasRearLeftRotor                type 0
+  +204   bHasRearRightRotor               type 0
+== mcCarCamShakeTune  (registered at 82385ce0, 7 members)
+  +24    MagnitudeMultiplier              type 7
+  +28    DrivingRumbleThresholdSpeedPct   type 7
+  +32    DrivingRumbleMaxShakeSpeedPct    type 7
+  +36    ImpactShakeAmplitudeMin          type 7
+  +40    ImpactShakeDurationMin           type 7
+  +44    ImpactShakeAmplitudeMax          type 7
+  +48    ImpactShakeDurationMax           type 7
+== mcCarAeroTune  (registered at 82386000, 6 members)
+  +16    AngCDamp                         type 9
+  +32    AngVelDamp                       type 9
+  +48    AngVel2Damp                      type 9
+  +68    Down                             type 7
+  +88    DragMin                          type 7
+  +92    DragMax                          type 7
+== mcCarFluidTune  (registered at 823862f8, 5 members)
+  +4     Damp                             type 7
+  +12    CurrentScale                     type 7
+  +16    BuoyancyMax                      type 7
+  +20    BuoyancyMin                      type 7
+  +24    SinkRate                         type 7
+== mcCarNitroTune  (registered at 82386648, 8 members)
+  +4     NitroBoostExp                    type 7
+  +8     NitroBoostAmount                 type 7
+  +12    NitroBoostTime                   type 7
+  +16    NitroFOV                         type 7
+  +20    FovOutTime                       type 7
+  +24    FovInTime                        type 7
+  +28    FlameTime                        type 7
+  +32    FlameSize                        type 7
+== mcCarSSTurboTune  (registered at 82386bc0, 21 members)
+  +4     turboBoostAmount                 type 7
+  +8     turboUseTime                     type 7
+  +12    turboRegenTime                   type 7
+  +16    turboFalloffTime                 type 7
+  +20    chargedFalloffTime               type 7
+  +24    stayFullTime                     type 7
+  +28    loseChargeSpeed                  type 7
+  +40    fovOutTime                       type 7
+  +44    fovInTime                        type 7
+  +48    turboFOV                         type 7
+  +52    turboDist                        type 7
+  +56    blurOffTime                      type 7
+  +60    blurStartAmount                  type 7
+  +64    envelopeLength                   type 7
+  +68    envelopeWidth1                   type 7
+  +72    envelopeWidth2                   type 7
+  +76    flameTime                        type 7
+  +80    flameSize                        type 7
+  +84    smokeSize                        type 7
+  +96    smokeStartColor                  type 10
+  +112   smokeEndColor                    type 10
+== mcCarAirRideTune  (registered at 82386f48, 5 members)
+  +4     FrontDrop                        type 7
+  +8     BackRise                         type 7
+  +12    BackDrop                         type 7
+  +16    RateDeflate                      type 7
+  +20    RateInflate                      type 7
+== mcCarHydraulicsTune  (registered at 823872a8, 10 members)
+  +4     FrontRise                        type 7
+  +8     FrontDrop                        type 7
+  +12    BackRise                         type 7
+  +16    BackDrop                         type 7
+  +20    RateRise                         type 7
+  +24    RateDrop                         type 7
+  +28    SuspensionExtent                 type 7
+  +32    SuspensionDamp                   type 7
+  +36    SuspensionStiffness              type 7
+  +44    MassScaleUp                      type 7
+== mcCarTireFricTune  (registered at 82387648, 5 members)
+  +24    GearThreshold                    type 5
+  +28    SkiddingThreshold                type 7
+  +32    MeltRate                         type 7
+  +36    RecoverRate                      type 7
+  +40    SpinningFric                     type 7
+== mcCarConfigExt__mcCarLightTuneData  (registered at 82395ea0, 2 members)
+  +16    vLightCoverColor                 type 9
+  +32    iLightAttachment                 type 5
+== mcRubberBandTuning  (registered at 823990e0, 20 members)
+  +4     MinSpeed                         type 7
+  +8     MinDist                          type 7
+  +12    MaxDist                          type 7
+  +16    MinThrottle                      type 7
+  +20    BehindMinDist                    type 7
+  +24    BehindMaxDist                    type 7
+  +28    BehindMaxThrottle                type 7
+  +32    OutsideTrafficBubbleThresholdSpeed type 7
+  +36    OutsideTrafficBubbleThrottlePenalty type 7
+  +40    DistBehindBeforeTakingShortcuts  type 7
+  +44    UseNitroMinDistFromStart         type 7
+  +48    UseNitroMinDistFromFinish        type 7
+  +52    UseNitroMinDistBehindPlayer      type 7
+  +56    UnlimitedNitroMinDistBehindPlayer type 7
+  +60    HomeStretchBehindMaxThrottle     type 7
+  +64    HomeStretchDistance              type 7
+  +68    PlayerCloseMaxThrottle           type 7
+  +72    PlayerCloseDistance              type 7
+  +76    AheadDistOffsets                 type 13
+  +108   BehindDistOffsets                type 13
+== rage__rmPtfxShader  (registered at 82479620, 3 members)
+  +4     ShaderName                       type 11
+  +8     ShaderTechniqueName              type 11
+  +20    InstVars                         type 13
+== ?  (registered at 824906d8, 7 members)
+  +4     MinT                             type 7
+  +8     MaxT                             type 7
+  +12    EventType                        type 12
+  +16    EventTypeHash                    type 6
+  +20    Flags                            type 4
+  +22    TrackNumber                      type 2
+  +23    Priority                         type 2
+== rage__SkyDomeProceduralControl__TopStruct  (registered at 82493500, 4 members)
+  +4     TopCloudBias                     type 7
+  +8     TopCloudDetail                   type 7
+  +12    TopCloudThreshold                type 7
+  +16    TopCloudHeight                   type 7
+== rage__SkyDomeProceduralControl__NightStruct  (registered at 82493640, 8 members)
+  +16    StarBlinkFrequency               type 7
+  +20    StarBlinkIntensity               type 7
+  +24    StarIntensity                    type 7
+  +28    StarFieldThreshold               type 7
+  +36    MoonBrightness                   type 7
+  +64    MoonColor                        type 9
+  +80    MoonGlow                         type 7
+  +84    MoonVisiblity                    type 7
+== rage__SkyDomeProceduralControl__LightStruct  (registered at 824937d8, 2 members)
+  +4     LightningPulseFrequency          type 7
+  +8     LightningPulseIntensity          type 7
+== rage__SkyDomeProceduralControl__SkyStruct  (registered at 824949a8, 8 members)
+  +16    gNightSkyColor                   type 9
+  +32    gDaySkyColor                     type 9
+  +48    gSunsetColor                     type 9
+  +64    AzimuthHeight                    type 7
+  +68    SunCentreStart                   type 7
+  +72    SunCentreEnd                     type 7
+  +76    SunCentreIntensity               type 7
+  +80    SunOuterSize                     type 7
+== rage__SkyDomeProceduralControl__CloudStruct  (registered at 82494b40, 15 members)
+  +16    gCloudColor                      type 9
+  +32    NightBounceColor                 type 9
+  +48    gCloudShadowStrength             type 7
+  +52    CloudThreshold                   type 7
+  +56    CloudBias                        type 7
+  +60    CloudShadowOffset                type 7
+  +64    CloudInscatteringRange           type 7
+  +68    CloudEdgeSmooth                  type 7
+  +72    CloudThickness                   type 7
+  +76    CloudSpeed                       type 7
+  +80    DetailScale                      type 7
+  +84    DetailStrength                   type 7
+  +88    CloudWarp                        type 7
+  +92    CloudFadeOut                     type 7
+  +96    top                              type 12
+== rage__SkyDomeProceduralControl  (registered at 82494fa0, 4 members)
+  +16    sky                              type 12
+  +112   cloud                            type 12
+  +240   lightning                        type 12
+  +256   night                            type 12
+== rage__SkyhatMiniNoise  (registered at 82495428, 10 members)
+  +48    HDRExposure                      type 7
+  +52    HDRSunExposure                   type 7
+  +64    HDRExposureClamp                 type 9
+  +80    StarFieldRepeat                  type 7
+  +84    MoonSize                         type 7
+  +88    MoonPhase                        type 5
+  +96    MoonPosition                     type 9
+  +112   GalaxyOffset                     type 8
+  +144   detailSpeed                      type 7
+  +148   sunSetBump                       type 7
+== rage__SkyLightController  (registered at 82495600, 3 members)
+  +16    GroundColor                      type 9
+  +32    intensity                        type 7
+  +36    bounceIntensity                  type 7
+== rage__rmPtfxKeyframe__SaveData  (registered at 82496420, 2 members)
+  +4     Keys                             type 5
+  +8     KeyData                          type 13
+== rage__rmPtfxKeyframeWidgetData  (registered at 82496568, 6 members)
+  +4     ChannelLabels                    type 13
+  +20    ChannelColors                    type 13
+  +36    YRangeMinMax                     type 8
+  +44    XRangeMinMax                     type 8
+  +60    Type                             type 5
+  +64    ShowAsColorGradient              type 0
+== rage__rmPtfxNetKeyframeSet__KeyframeSpec  (registered at 82496d90, 2 members)
+  +4     NetId                            type 6
+  +8     Tag                              type 5
+== rage__ProceduralTextureVerletWater  (registered at 8249a9c8, 7 members)
+  +48    perturbShowSim                   type 0
+  +52    perturbQuadScale                 type 7
+  +56    perturbRotAngle                  type 7
+  +60    perturbTexScale                  type 7
+  +96    perturbQuadOffset                type 8
+  +112   mirrorPlane                      type 10
+  +128   farClip                          type 7
+== rage__CCollisionMap  (registered at 8249c258, 7 members)
+  +64    LightDepthScale                  type 7
+  +68    DepthBias                        type 7
+  +72    BiasSlope                        type 7
+  +76    NearSlice                        type 7
+  +80    FarSlice                         type 7
+  +84    FovYDiv                          type 7
+  +1260  ShowCollisionMap                 type 0
+== rage__ptxEffectRuleStd  (registered at 824b1e78, 33 members)
+  +8     KFColorTint                      type 12
+  +48    KFColorTintMax                   type 12
+  +88    KFZoom                           type 12
+  +128   KFRotation                       type 12
+  +168   KFDataSphere                     type 12
+  +208   KFDataCapsuleA                   type 12
+  +248   Name                             type 11
+  +256   PtxEvoGroup                      type 12
+  +268   ZoomCullDist                     type 0
+  +269   UseRandomColor                   type 0
+  +270   UseDefaultFunctors               type 0
+  +273   HasDataSphere                    type 0
+  +274   DataObjectType                   type 2
+  +275   GameFlags                        type 2
+  +288   TimeLine                         type 12
+  +324   FadeDistance                     type 7
+  +328   CullRadius                       type 7
+  +332   CullDistance                     type 7
+  +336   LodNearDistance                  type 7
+  +340   LodFarDistance                   type 7
+  +344   FileVersion                      type 7
+  +348   DurationMin                      type 7
+  +352   DurationMax                      type 7
+  +356   TimeScalarMin                    type 7
+  +360   TimeScalarMax                    type 7
+  +372   UseCullSphere                    type 0
+  +373   CullNoUpdate                     type 0
+  +374   CullNoEmit                       type 0
+  +375   CullNoDraw                       type 0
+  +376   SortEvents                       type 0
+  +377   Quality                          type 2
+  +384   CullSphere                       type 9
+  +400   RndOffsetPos                     type 9
+== rage__ptxEmitRuleStd__stdEmitterData  (registered at 824b4638, 13 members)
+  +4     EmitterDomain                    type 12
+  +12    VelocityDomain                   type 12
+  +20    SpawnRateKF                      type 12
+  +60    SpawnDistKF                      type 12
+  +100   TimeScaleKF                      type 12
+  +140   SpawnLifeKF                      type 12
+  +180   SpeedKF                          type 12
+  +220   SizeKFOT                         type 12
+  +260   AccelerationKFOT                 type 12
+  +300   DampeningKFOT                    type 12
+  +340   MatrixWeightKFOT                 type 12
+  +380   InheritVelKFOT                   type 12
+  +420   PtxRuleName                      type 11
+== rage__ptxEmitRuleStd  (registered at 824b4d48, 5 members)
+  +12    Duration                         type 7
+  +32    EmitInfo                         type 12
+  +496   Name                             type 11
+  +500   FileVersion                      type 7
+  +508   OneShot                          type 0
+== rage__ptxModel  (registered at 824b9eb0, 5 members)
+  +320   Rotation                         type 9
+  +336   RotationVar                      type 9
+  +352   RotationSpeedVar                 type 8
+  +360   Drawables                        type 13
+  +372   Props                            type 12
+== rage__ptxSprite  (registered at 824bfee8, 10 members)
+  +352   AxisAligned                      type 9
+  +368   StartTexFrameIndex               type 5
+  +372   EndTexFrameIndex                 type 5
+  +376   EndTexAnimFrame                  type 5
+  +380   NumTextureTilesX                 type 5
+  +384   NumTextureTilesY                 type 5
+  +392   Props                            type 12
+  +1656  ShaderData                       type 12
+  +1688  TrimCornersAmt                   type 7
+  +1692  TrimCorners                      type 0
+== rage__ptxRenderState  (registered at 824c2498, 6 members)
+  +4     BlendSet                         type 5
+  +8     DepthBias                        type 7
+  +12    LightingMode                     type 5
+  +16    DepthWrite                       type 0
+  +17    DepthTest                        type 0
+  +18    AlphaBlend                       type 0
+== rage__ptxTriggerEvent  (registered at 824c26c0, 4 members)
+  +48    OverrideMaxes                    type 12
+  +100   Type                             type 5
+  +104   Time                             type 7
+  +108   Toggle1                          type 0
+== rage__ptxRule  (registered at 824c28d0, 11 members)
+  +12    FileVersion                      type 7
+  +32    SpawnEffectA                     type 12
+  +144   SpawnEffectB                     type 12
+  +256   RenderState                      type 12
+  +276   PhysicalRange                    type 7
+  +280   StopVel                          type 7
+  +284   Flags                            type 6
+  +292   Name                             type 11
+  +296   ClassName                        type 11
+  +306   PercentPhysical                  type 2
+  +307   PercentKill                      type 2
+== rage__ptxDomain  (registered at 824c51a0, 4 members)
+  +12    DomainFunction                   type 5
+  +280   FileVersion                      type 7
+  +292   WorldSpace                       type 0
+  +293   PointRelative                    type 0
+== rage__ptxDomainBox  (registered at 824c5538, 4 members)
+  +16    PositionKF                       type 12
+  +56    DirectionKF                      type 12
+  +96    SizeKF                           type 12
+  +136   InnerSizeKF                      type 12
+== rage__ptxDomainVortex  (registered at 824c56f0, 3 members)
+  +16    PositionKF                       type 12
+  +56    DirectionKF                      type 12
+  +96    SizeKF                           type 12
+== rage__ptxDomainSphere  (registered at 824c5880, 2 members)
+  +16    PositionKF                       type 12
+  +96    SizeKF                           type 12
+== rage__ptxDomainCylinder  (registered at 824c59f0, 4 members)
+  +16    PositionKF                       type 12
+  +56    DirectionKF                      type 12
+  +96    SizeKF                           type 12
+  +136   InnerSizeKF                      type 12
+== rage__ProceduralTextureRenderTargetDef  (registered at 824d2d78, 6 members)
+  +4     name                             type 11
+  +68    parentIndex                      type 5
+  +72    type                             type 5
+  +76    width                            type 5
+  +80    height                           type 5
+  +84    bitsPerPixel                     type 5
+== rage__ProceduralTextureShaderDef  (registered at 824d31d0, 3 members)
+  +4     name                             type 11
+  +68    presetName                       type 11
+  +200   textures                         type 13
+== rage__ProceduralTexture  (registered at 824d3318, 2 members)
+  +4     renderTargetDefs                 type 13
+  +12    shaderDefs                       type 13
+== rage__IntervalShadows  (registered at 824d54a0, 4 members)
+  +112   softness                         type 7
+  +116   sunLightIntensity                type 7
+  +120   on                               type 0
+  +121   prtOn                            type 0
+== rage__FogControl  (registered at 824d5600, 11 members)
+  +24    density                          type 7
+  +28    color                            type 6
+  +32    speed                            type 7
+  +36    noiseTile                        type 7
+  +40    noiseTileY                       type 7
+  +44    noiseBias                        type 7
+  +48    noiseScale                       type 7
+  +52    maxHeight                        type 7
+  +56    minHeight                        type 7
+  +60    fuzzHeight                       type 7
+  +64    on                               type 0
+== rage__WaterFogControl  (registered at 824d57e8, 4 members)
+  +16    density                          type 7
+  +20    color                            type 6
+  +24    height                           type 7
+  +28    on                               type 0
+== rage__EnviromentDomeLighting  (registered at 824d5948, 5 members)
+  +16    sky                              type 9
+  +32    horizon                          type 9
+  +48    ground                           type 9
+  +64    intensity                        type 7
+  +68    on                               type 0
+== rage__VerletWaterSimulation  (registered at 824d5ab8, 3 members)
+  +16    simWidth                         type 5
+  +20    simHeight                        type 5
+  +36    on                               type 0
+== rage__VerletWaterSurface  (registered at 824d5d68, 2 members)
+  +20    phaseRate                        type 7
+  +32    on                               type 0
+== rage__SkyhatPerlinNoise  (registered at 824d5ec0, 2 members)
+  +24    phaseRate                        type 7
+  +44    on                               type 0
+== rage__AtmosphericScattering  (registered at 824d6198, 3 members)
+  +20    hazeDistance                     type 7
+  +24    hazeIntensity                    type 7
+  +108   on                               type 0
+== rage__ptxTimeLine  (registered at 824db980, 3 members)
+  +8     PreUpdate                        type 7
+  +12    NumLoops                         type 5
+  +16    Events                           type 13
+== rage__ptxEvent  (registered at 824dc5a0, 2 members)
+  +8     TriggerTime                      type 7
+  +24    TriggerCap                       type 5
+== rage__ptxEventEmitter  (registered at 824dcda8, 11 members)
+  +12    EvoData                          type 12
+  +32    DurationScalarMin                type 7
+  +36    DurationScalarMax                type 7
+  +40    TimeScalarMin                    type 7
+  +44    TimeScalarMax                    type 7
+  +48    ZoomMin                          type 7
+  +52    ZoomMax                          type 7
+  +56    ColorTintMin                     type 6
+  +60    ColorTintMax                     type 6
+  +64    EmitRuleName                     type 11
+  +68    PtxRuleName                      type 11
+== rage__ptxEventEffect  (registered at 824dd020, 5 members)
+  +32    RotationMin                      type 9
+  +48    OverrideMins                     type 12
+  +96    OverrideMaxes                    type 12
+  +144   EffectName                       type 11
+  +156   EmitterDomain                    type 12
+== rage__ptxRulePropList  (registered at 824de248, 16 members)
+  +4     BiasLinks                        type 13
+  +16    ColorKF                          type 12
+  +68    ColorMaxKF                       type 12
+  +120   AccelerationMinKF                type 12
+  +172   AccelerationMaxKF                type 12
+  +224   DampeningMinKF                   type 12
+  +276   DampeningMaxKF                   type 12
+  +328   MatrixWeightKF                   type 12
+  +380   PlaybackRateKF                   type 12
+  +432   AlphaKF                          type 12
+  +484   PositionNoiseKF                  type 12
+  +536   VelocityNoiseKF                  type 12
+  +588   CollisionVelDmpKF                type 12
+  +640   CollisionImpVarKF                type 12
+  +692   WindInfluenceKF                  type 12
+  +744   VortexPropsKF                    type 12
+== rage__ptxSpriteRulePropList  (registered at 824de5a0, 9 members)
+  +796   SizeKF                           type 12
+  +848   ThetaKF                          type 12
+  +900   InitThetaKFOT                    type 12
+  +952   InitRotateVelKFOT                type 12
+  +1004  RotateVelKF                      type 12
+  +1056  DirectionalKF                    type 12
+  +1108  DirectionalVelKF                 type 12
+  +1160  TextureAnimRateKF                type 12
+  +1212  TrailPropsKF                     type 12
+== rage__ptxModelRulePropList  (registered at 824de808, 10 members)
+  +796   SizeMin                          type 12
+  +848   SizeMax                          type 12
+  +900   InitialThetaMin                  type 12
+  +952   InitialThetaMax                  type 12
+  +1004  ThetaMin                         type 12
+  +1056  ThetaMax                         type 12
+  +1108  InitialRotationMin               type 12
+  +1160  InitialRotationMax               type 12
+  +1212  InitRotationSpeed                type 12
+  +1264  RotationSpeed                    type 12
+== rage__ptxEffectOverridables  (registered at 824def70, 5 members)
+  +16    Duration                         type 7
+  +20    PlaybackRate                     type 7
+  +24    ColorTint                        type 6
+  +28    Zoom                             type 7
+  +32    WhichFields                      type 6
+== ?  (registered at 8254a5f0, 26 members)
+  +4     RestartEveryUpdate               type 0
+  +8     MaxStepsToRecurse                type 5
+  +12    RecursiveFalloff                 type 7
+  +16    InitialSegmentLength             type 7
+  +20    SamplesPerSegment                type 5
+  +24    LengthVarianceWeight             type 7
+  +28    OffRoadWeight                    type 7
+  +32    MaxCurvaturePenalty              type 7
+  +36    LinearAdjustment                 type 7
+  +40    AngularAdjustment                type 7
+  +44    AngularAdjustmentThreshold       type 7
+  +48    AngularAdjustmentFalloff         type 7
+  +52    AdjustmentFalloff                type 7
+  +56    AdjustmentFalloffTrigger         type 7
+  +60    AdjustmentResetThreshold         type 7
+  +64    BufferZone                       type 7
+  +68    ObstacleLookaheadTime            type 7
+  +72    MaxSpeedScalar                   type 7
+  +76    MaxTotalAccelScalar              type 7
+  +80    MaxTotalDecelScalar              type 7
+  +84    MaxBrakeDecelScalar              type 7
+  +88    AverageSpeedWeight               type 7
+  +92    MaxObstacleHeightDelta           type 7
+  +96    MaxObstacleFlatDelta             type 7
+  +100   MaxObstaclePredictionDist        type 7
+  +104   CollisionSpeedPenalty            type 7
+== ?  (registered at 8254a8a0, 13 members)
+  +4     MinCurvature                     type 7
+  +8     MaxCurvature                     type 7
+  +12    MaxTotalAccel                    type 7
+  +16    MaxBrakeDecel                    type 7
+  +20    DragConstant1                    type 7
+  +24    DragConstant2                    type 7
+  +28    DragConstant3                    type 7
+  +48    IdleSpeed                        type 13
+  +588   MaxEngineAccelByGear             type 13
+  +4172  MaxEngineDecelByGear             type 13
+  +7756  MaxSpeedForHighCurvature         type 13
+  +8012  MaxSpeedForLowCurvature          type 13
+  +8268  SteerScalar                      type 13
+== vehAeroTune  (registered at 8255e7c8, 5 members)
+  +16    AngCDamp                         type 9
+  +32    AngVelDamp                       type 9
+  +48    AngVel2Damp                      type 9
+  +64    Drag                             type 7
+  +68    Down                             type 7
+== vehEngineTune  (registered at 8255ea50, 15 members)
+  +4     MaxHorsePower                    type 7
+  +8     IdleRPM                          type 7
+  +12    OptRPM                           type 7
+  +16    MaxRPM                           type 7
+  +20    EngageRPM                        type 7
+  +24    EngageCVT                        type 7
+  +28    GCL                              type 7
+  +32    UpshiftThrottle                  type 7
+  +36    DownshiftThrottle                type 7
+  +40    BoostDuration                    type 7
+  +44    BoostTorque                      type 7
+  +48    BoostThrottleThreshold           type 7
+  +52    TorqueControlNumValues           type 5
+  +56    TorqueControlValues              type 13
+  +100   IdleControlValues                type 13
+== vehDrivetrainTune  (registered at 8255ec68, 6 members)
+  +4     AngDrag                          type 7
+  +8     BrakeDynamicCoef                 type 7
+  +12    BrakeStaticCoef                  type 7
+  +16    DifferentialLowSpeedLimit        type 7
+  +20    DifferentialHighSpeedLimit       type 7
+  +24    DifferentialHighLimitSpeed       type 7
+== vehFluidTune  (registered at 8255edd8, 3 members)
+  +4     Damp                             type 7
+  +8     Buoyancy                         type 7
+  +12    CurrentScale                     type 7
+== vehTransTune  (registered at 8255ef20, 14 members)
+  +4     RevGearMPH                       type 7
+  +8     LowGearMPH                       type 7
+  +12    HighGearMPH                      type 7
+  +16    UpshiftBias                      type 7
+  +20    UpshiftBiasLow                   type 7
+  +24    DownshiftBiasMin                 type 7
+  +28    DownshiftBiasMax                 type 7
+  +32    MaxDownshifts                    type 5
+  +36    GearBias                         type 7
+  +40    GearChangeDelay                  type 7
+  +44    GearChangeInertia                type 7
+  +48    GearChangeMatchRPM               type 7
+  +52    ShiftModulatorAppoach            type 7
+  +56    ShiftModulatorDecay              type 7
+== vehWheelTune  (registered at 8255f128, 30 members)
+  +4     TireRadius                       type 7
+  +8     TireWidth                        type 7
+  +12    TireDispLimitLat                 type 7
+  +16    TireDispLimitLong                type 7
+  +20    TireDispLimitVert                type 7
+  +24    TireDampCoefLat                  type 7
+  +28    TireDampCoefLong                 type 7
+  +32    SurfaceDragCoefLat               type 7
+  +36    SurfaceDragCoefLong              type 7
+  +40    SteeringLimit                    type 7
+  +44    CamberLimit                      type 7
+  +48    WobbleLimit                      type 7
+  +52    AxleLimit                        type 7
+  +56    PivotOffset                      type 7
+  +60    BrakeCoef                        type 7
+  +64    HandbrakeCoef                    type 7
+  +68    SteeringOffset                   type 7
+  +72    TravelLimit                      type 7
+  +76    TravelExtent                     type 7
+  +80    SuspensionOffset                 type 7
+  +84    SuspensionLimit                  type 7
+  +88    SuspensionExtent                 type 7
+  +92    SuspensionClamp                  type 7
+  +96    SuspensionFactor                 type 7
+  +100   SuspensionDampCoef               type 7
+  +104   SuspensionDampFactor             type 7
+  +108   SuspensionBottomoutElasticity    type 7
+  +112   OptimumSlipPercent               type 7
+  +116   StaticFric                       type 7
+  +120   SlidingFric                      type 7
+== vehChassisTune  (registered at 8255f6f8, 20 members)
+  +32    ModelOffset                      type 9
+  +48    CenterOfMass                     type 9
+  +64    Size                             type 9
+  +80    InertiaBox                       type 9
+  +96    WheelPositionScale               type 9
+  +112   Mass                             type 7
+  +116   BoundFriction                    type 7
+  +120   BoundElasticity                  type 7
+  +124   BoundGravity                     type 7
+  +132   DrivetrainType                   type 5
+  +136   WheelFront                       type 12
+  +140   WheelBack                        type 12
+  +144   Engine                           type 12
+  +148   Trans                            type 12
+  +152   Powertrain                       type 12
+  +156   Freetrain                        type 12
+  +160   AxleFront                        type 12
+  +164   AxleBack                         type 12
+  +168   Aero                             type 12
+  +172   Fluid                            type 12
+== vehInputTune  (registered at 82560a40, 4 members)
+  +24    SSSThreshold                     type 7
+  +28    SSSValue                         type 7
+  +32    AutoReverseSpeed                 type 7
+  +36    AutoReverseInput                 type 7
+== vehGyroTune  (registered at 82563ea8, 11 members)
+  +24    Turn                             type 7
+  +28    Drift                            type 7
+  +32    Spin                             type 7
+  +36    RevSpin                          type 7
+  +40    Yaw                              type 7
+  +44    Pitch                            type 7
+  +48    Roll                             type 7
+  +52    Lean                             type 7
+  +56    LeanAngle                        type 7
+  +60    LeanApproachTime                 type 7
+  +64    Wheelie                          type 7
+== vehStuckTune  (registered at 8256a988, 6 members)
+  +24    TimeThresh                       type 7
+  +28    PosThresh                        type 7
+  +32    MoveThresh                       type 7
+  +36    TurnAmount                       type 7
+  +40    RotAmount                        type 7
+  +44    TransAmount                      type 7
+== rage__CShadowMapTile  (registered at 825f64d0, 10 members)
+  +80    NearSlice                        type 7
+  +84    FarSlice                         type 7
+  +88    LightDepthScale                  type 7
+  +92    DepthBias                        type 7
+  +96    CameraOffset                     type 7
+  +100   ViewportZShift                   type 7
+  +104   BiasSlope                        type 7
+  +108   Bounds                           type 7
+  +836   FadeInSMap                       type 7
+  +840   FovYDiv                          type 7
+== rage__CShadowMap  (registered at 825f66f0, 19 members)
+  +24    Tiles                            type 13
+  +84    FadeOutSMap                      type 7
+  +96    TopDownLightDepthScale           type 7
+  +100   Tile0LightDepthScale             type 7
+  +104   TopDownCameraOffset              type 7
+  +108   Tile0CameraOffset                type 7
+  +112   TopDownBiasSlope                 type 7
+  +116   Tile0BiasSlope                   type 7
+  +120   TopDownDepthBias                 type 7
+  +124   Tile0DepthBias                   type 7
+  +128   TopDownZOffset                   type 7
+  +132   Tile0ZOffset                     type 7
+  +136   TopDownNearSlice                 type 7
+  +140   Tile0NearSlice                   type 7
+  +144   TopDownFarSlice                  type 7
+  +148   Tile0FarSlice                    type 7
+  +152   TopDownFovYDiv                   type 7
+  +156   Tile0FovYDiv                     type 7
+  +628   ShowShadowMap                    type 0
+== mcTrigger  (registered at 82686788, 9 members)
+  +16    bTriggerMultipleTimes            type 0
+  +17    bPlayerCanTrigger                type 0
+  +18    bRemotePlayerCanTrigger          type 0
+  +20    nTriggerByOpponent               type 5
+  +24    eLapResetProperty                type 5
+  +28    fRandomness                      type 7
+  +32    nMinTriggered                    type 5
+  +36    nMaxTriggered                    type 5
+  +48    lapActive                        type 5
+== mcTriggerRadius  (registered at 82687280, 5 members)
+  +64    rRadius                          type 7
+  +68    rHeight                          type 7
+  +72    bTriggerOnEntryOnly              type 0
+  +73    bTriggerWhenMoving               type 0
+  +80    oCenter                          type 9
+== mcTriggerSpeed  (registered at 82687598, 6 members)
+  +64    rRadius                          type 7
+  +68    rRadiusInner                     type 7
+  +72    rHeight                          type 7
+  +76    rMinSpeed                        type 7
+  +80    rMaxSpeed                        type 7
+  +96    oCenter                          type 9
+== mcTriggerLine  (registered at 826883f8, 4 members)
+  +64    oPosStart                        type 9
+  +80    oPosEnd                          type 9
+  +96    rHeight                          type 7
+  +100   bDirected                        type 0
+== mcRoadDensityTriggerEvent  (registered at 82688a38, 2 members)
+  +16    RoadCenter                       type 9
+  +32    iDensity                         type 5
+== mcSoundTriggerEvent  (registered at 82689300, 2 members)
+  +16    Position                         type 9
+  +32    GameObject                       type 11
+== mcGasStationMenuTriggerEvent  (registered at 826895b0, 2 members)
+  +16    ReplenishDelay                   type 7
+  +24    nGasStationIdx                   type 5
+== mcInterSectionTriggerEvent  (registered at 826898a8, 3 members)
+  +16    bGreenElseAllRed                 type 0
+  +32    vIntersectionCenter              type 9
+  +48    vDirection                       type 9
+== mcReward  (registered at 826b7f00, 2 members)
+  +8     bHidden                          type 0
+  +9     bGiveImmediately                 type 0
+== mcRewardExperience  (registered at 826b8018, 2 members)
+  +60    szExperienceSystemName           type 11
+  +92    nExperienceAmount                type 5
+== mcRewardCar  (registered at 826b8548, 3 members)
+  +60    szCarName                        type 11
+  +92    szTextureName                    type 11
+  +156   bConfigUsable                    type 0
+== mcRewardMission  (registered at 826b8940, 3 members)
+  +60    szMissionId                      type 11
+  +92    szTransitionState                type 11
+  +124   bIgnoreEvents                    type 0
+== mcRewardAbilityLevel  (registered at 826b8bf0, 2 members)
+  +60    szAbilityId                      type 11
+  +92    nAbilityLevel                    type 5
+== mcRewardUserInterface  (registered at 826b8e90, 2 members)
+  +60    szStringId                       type 11
+  +92    szTextureName                    type 11
+== mcMission  (registered at 826c7fa8, 20 members)
+  +40    szDirectory                      type 11
+  +72    szId                             type 11
+  +200   szTitleId                        type 11
+  +328   szDescriptionId                  type 11
+  +456   szDistrictName                   type 11
+  +488   szActiveStateName                type 11
+  +520   szHookmanNameId                  type 11
+  +676   nDownloadableBitfield            type 5
+  +685   bAlwaysHidden                    type 0
+  +686   bAutoStart                       type 0
+  +687   bInteractionStart                type 0
+  +688   bAutoComplete                    type 0
+  +689   bInteractionComplete             type 0
+  +691   bShouldUpdate                    type 0
+  +693   bRepeatable                      type 0
+  +708   aPrerequisites                   type 13
+  +716   aObjectives                      type 13
+  +724   aRewards                         type 13
+  +732   aEvents                          type 13
+  +744   aReminders                       type 13
+== mcRequirement  (registered at 826ccec0, 7 members)
+  +40    szDescriptionId                  type 11
+  +104   nTargetId                        type 5
+  +117   bAlwaysHidden                    type 0
+  +119   bInitValidation                  type 0
+  +120   bAllowUpdate                     type 0
+  +124   aConditions                      type 13
+  +132   aRewards                         type 13
+== mcConditionExperience  (registered at 826d2b10, 2 members)
+  +88    szExperienceSystem               type 11
+  +120   nExperienceAmount                type 5
+== mcConditionRace  (registered at 826d2ef8, 4 members)
+  +88    szRaceName                       type 11
+  +120   szRaceType                       type 11
+  +152   szRaceSubType                    type 11
+  +184   nMinimumPlacement                type 5
+== mcConditionTallyRace  (registered at 826d31a0, 5 members)
+  +88    nTally                           type 5
+  +92    szRaceType                       type 11
+  +124   szRaceSubType                    type 11
+  +156   nMinimumPlacement                type 5
+  +160   szDistrict                       type 11
+== mcConditionTallyMission  (registered at 826d3310, 3 members)
+  +88    szHeuristic                      type 11
+  +120   nTally                           type 5
+  +124   szDistrict                       type 11
+== mcConditionStat  (registered at 826d3478, 4 members)
+  +88    szStatId                         type 11
+  +120   szStatType                       type 11
+  +152   nStatSubId                       type 5
+  +156   nStatValue                       type 5
+== mcMissionEvent  (registered at 826d3f08, 4 members)
+  +40    szEventDescription               type 11
+  +104   szActiveState                    type 11
+  +140   nPriority                        type 5
+  +144   bConsume                         type 0
+== mcMissionEventScript  (registered at 826d4090, 3 members)
+  +148   szHeuristic                      type 11
+  +184   aScriptNames                     type 13
+  +192   bCareerScript                    type 0
+== mcMissionEventTransition  (registered at 826d41f8, 3 members)
+  +148   szTransition                     type 11
+  +180   bIgnoreEvents                    type 0
+  +181   bResetMission                    type 0
+== mcAmbientTod  (registered at 826dbe78, 3 members)
+  +4     iStartTime                       type 4
+  +6     iEndTime                         type 4
+  +8     fWeight                          type 7
+== mcAmbientDistributionTreeData  (registered at 826dbfc0, 4 members)
+  +4     ChildNames                       type 13
+  +28    iMapColor                        type 5
+  +32    Name                             type 11
+  +36    AbbreviatedName                  type 11
+== mcAmbientTypeDistribution  (registered at 826dc1b0, 2 members)
+  +4     TypeName                         type 11
+  +8     TodArray                         type 13
+== mcAmbientDistribution  (registered at 826dc310, 2 members)
+  +4     TypeDistributionArray            type 13
+  +12    TodDensityArray                  type 13
+== mcAmbientType  (registered at 826e45b8, 21 members)
+  +12    iInstanceCount                   type 5
+  +108   bIsProxy                         type 0
+  +109   bSex                             type 0
+  +110   bFreewayOnly                     type 0
+  +111   bIsCab                           type 0
+  +112   bIsTrailer                       type 0
+  +113   bIsTaxi                          type 0
+  +116   iBoundGroup                      type 5
+  +120   iWheelCount                      type 5
+  +124   fMaxSpeed                        type 7
+  +128   fMinAccelBand                    type 7
+  +132   fMinAccel                        type 7
+  +136   fMaxAccel                        type 7
+  +140   fMinDecelBand                    type 7
+  +144   fMinDecel                        type 7
+  +148   fMaxDecel                        type 7
+  +152   fMaxSteer                        type 7
+  +156   fMaxSteerRate                    type 7
+  +160   fMinTurningRadius                type 7
+  +164   fPivotTurningRadius              type 7
+  +176   szAudioType                      type 11
+== mcAmbientTypePhysicsTuning  (registered at 826e48e8, 6 members)
+  +4     fMass                            type 7
+  +8     fMassScale                       type 7
+  +12    fInertialBoxScale                type 7
+  +16    fGravityFactor                   type 7
+  +32    vInertialBox                     type 9
+  +48    bCollideWithPlayer               type 0
+== mcAmbientWheelTuning  (registered at 826e6550, 9 members)
+  +4     fCogSim                          type 7
+  +8     fCogOffset                       type 7
+  +12    fTireGrip                        type 7
+  +16    fSuspensionTension               type 7
+  +20    fSuspensionDamping               type 7
+  +24    fSuspensionTravel                type 7
+  +28    fTireTension                     type 7
+  +32    fTireDamping                     type 7
+  +36    fTireStretch                     type 7
+== mcAmbientDensityTuning  (registered at 826f65b0, 37 members)
+  +4     fTrafficSpawnInnerRadius         type 7
+  +8     fTrafficSpawnOuterRadius         type 7
+  +12    fTrafficUnspawnInnerRadius       type 7
+  +16    fTrafficUnspawnOuterRadius       type 7
+  +20    fTrafficBoxLengthAtLowSpeed      type 7
+  +24    fTrafficBoxLengthAtHighSpeed     type 7
+  +28    fTrafficBoxOffsetAtLowSpeed      type 7
+  +32    fTrafficBoxOffsetAtHighSpeed     type 7
+  +36    fTrafficBoxWidthAtLowSpeed       type 7
+  +40    fTrafficBoxWidthAtHighSpeed      type 7
+  +44    fTrafficBoxLengthAtLowSpeedPerp  type 7
+  +48    fTrafficBoxLengthAtHighSpeedPerp type 7
+  +52    fTrafficBoxOffsetAtLowSpeedPerp  type 7
+  +56    fTrafficBoxOffsetAtHighSpeedPerp type 7
+  +60    fTrafficBoxWidthAtLowSpeedPerp   type 7
+  +64    fTrafficBoxWidthAtHighSpeedPerp  type 7
+  +68    fParkedCarRadius                 type 7
+  +72    fPedSpawnInnerRadius             type 7
+  +76    fPedSpawnOuterRadius             type 7
+  +80    fPedUnspawnInnerRadius           type 7
+  +84    fPedUnspawnOuterRadius           type 7
+  +88    fPedBoxWidth                     type 7
+  +92    fPedDensity                      type 7
+  +96    fMinSpawnTrafficSpacing          type 7
+  +100   fMinSpawnPedSpacing              type 7
+  +104   fMinSpawnPedTypeSpacing          type 7
+  +108   fFOVDegreesLowMPH                type 7
+  +112   fFOVDegreesHighMPH               type 7
+  +116   fFOVDegreesAtLowSpeed            type 7
+  +120   fFOVDegreesAtHighSpeed           type 7
+  +124   fDensityLowMPH                   type 7
+  +128   fDensityHighMPH                  type 7
+  +132   fDensityAtLowSpeed               type 7
+  +136   fDensityAtHighSpeed              type 7
+  +140   fTrafficBoxSizeInHangoutMode     type 7
+  +152   fParkedCarDensityFactor          type 7
+  +156   RoadDensitySettings              type 12
+== mcAvoidAnim  (registered at 826f8480, 3 members)
+  +4     AvoidType                        type 14
+  +8     ApproachDir                      type 14
+  +12    AudioType                        type 14
+== mcPoliceTuningGlobals  (registered at 8270b7c8, 95 members)
+  +4     iPullOverLawBreakScore           type 5
+  +8     iBullhornLawBreakScore           type 5
+  +12    iPursuitLawBreakScore            type 5
+  +16    iNoLawBrokenPerSecPoints         type 5
+  +20    iUndetectedPerSecPoints          type 5
+  +24    iPullOverPerSecPoints            type 5
+  +28    iHighSpeedStartPoints            type 5
+  +32    iHighSpeedPerSecPoints           type 5
+  +36    iMidSpeedStartPoints             type 5
+  +40    iMidSpeedPerSecPoints            type 5
+  +44    iLowSpeedStartPoints             type 5
+  +48    iLowSpeedPerSecPoints            type 5
+  +52    iOffRoadStartPoints              type 5
+  +56    iOffRoadPerSecPoints             type 5
+  +60    iDamagePropPoints                type 5
+  +64    iDamagePoliceVehPoints           type 5
+  +68    iDamageOtherVehPoints            type 5
+  +72    iStopSignPoints                  type 5
+  +76    iRedLightPoints                  type 5
+  +80    iTwoWheelStartPoints             type 5
+  +84    iTwoWheelPerSecPoints            type 5
+  +88    iBurnOutStartPoints              type 5
+  +92    iBurnOutPerSecPoints             type 5
+  +96    iJumpOffRoofTopPoints            type 5
+  +100   iWrongWayStartPoints             type 5
+  +104   iWrongWayPerSecPoints            type 5
+  +108   iBlockTrafficStartPoints         type 5
+  +112   iBlockTrafficPerSecPoints        type 5
+  +116   iMaxFine                         type 5
+  +120   iPerSecPursuitFine               type 5
+  +124   iPullOverFleeFine                type 5
+  +128   iLawFines                        type 13
+  +188   fDetectDist                      type 7
+  +192   fSafeDist                        type 7
+  +196   fPullOverDist                    type 7
+  +200   fBlockDist                       type 7
+  +204   fVisionDist                      type 7
+  +208   fMinSetGoalTime                  type 7
+  +212   fLostTgtThresholdTime            type 7
+  +216   fReacquireTgtThresholdTime       type 7
+  +220   fDetectHalfAngle                 type 7
+  +224   fSearchHalfAngle                 type 7
+  +228   fSearchMaxTime                   type 7
+  +232   fBullhornTime                    type 7
+  +236   fSpeedLimitLow                   type 7
+  +240   fSpeedLimitLowOffset             type 7
+  +244   iSpeedLimitLowPrcnt              type 5
+  +248   fSpeedLimitMidOffset             type 7
+  +252   iSpeedLimitMidPrcnt              type 5
+  +256   fSpeedLimitHiOffset              type 7
+  +260   iSpeedLimitHiPrcnt               type 5
+  +264   fBurnOutThresholdTime            type 7
+  +268   fAirJumpThresholdTime            type 7
+  +272   fWrongWayThresholdTime           type 7
+  +276   fBlockTrafficThresholdTime       type 7
+  +280   iBlockTrafficSpeedPrcnt          type 5
+  +284   fGoalFollowDist                  type 7
+  +288   fStopFollowDist                  type 7
+  +292   iRndFollowOnProbPrcnt            type 5
+  +296   iRndFollowOffProbPrcnt           type 5
+  +300   fFollowDownTime                  type 7
+  +304   fAlongSideDist                   type 7
+  +308   fLeadDist                        type 7
+  +312   fMovingSpeed                     type 7
+  +316   fPatrolTime                      type 7
+  +320   iChangePathProbPrcnt             type 5
+  +324   fTeleportDist                    type 7
+  +328   fTeleportDownTime                type 7
+  +332   iTeleportProbPrcnt               type 5
+  +336   fNoTeleportTime                  type 7
+  +340   fMaxSirenDelayTime               type 7
+  +344   fChirpSirenTime                  type 7
+  +348   fWarnSirenDownTime               type 7
+  +352   iWarnSirenIsectProbPrcnt         type 5
+  +356   fWarnSirenIsectDist              type 7
+  +360   fArrestTime                      type 7
+  +364   fArrestStateTime                 type 7
+  +368   fArrestTgtThresholdSpd           type 7
+  +372   fBikerWipeoutArrestDist          type 7
+  +376   fMinPerRdoTime                   type 7
+  +380   fMaxPerRdoTime                   type 7
+  +384   fRdoVicinityDist                 type 7
+  +388   iPerRdoTgtLocProbPrcnt           type 5
+  +392   fCopZoneRdoDelayTime             type 7
+  +396   fCopHudIconVisibleDist           type 7
+  +400   fHeadOnAngle                     type 7
+  +404   fHeadOnBlockDist                 type 7
+  +408   fRightAngle                      type 7
+  +412   fDispatchRdoDelayTime            type 7
+  +416   fDispatchLocWaitTime             type 7
+  +420   iRaceTgtAiProbPrcnt              type 5
+  +424   fRaceTgtAiDist                   type 7
+  +428   fAllowNitroDist                  type 7
+  +432   fTrackTgtTime                    type 7
+  +436   fPullOverFleeDelayScale          type 7
+== mcAmbientPath  (registered at 82739570, 17 members)
+  +16    vVerts                           type 13
+  +24    bSnapToRails                     type 13
+  +80    SpawnMtx                         type 15
+  +148   TypeName                         type 11
+  +152   fPathStartSpeed                  type 7
+  +156   fPathMaxSpeed                    type 7
+  +160   fPathEndSpeed                    type 7
+  +164   bParked                          type 0
+  +165   bParkedInCruiseOnly              type 0
+  +166   bHazard                          type 0
+  +167   bFire                            type 0
+  +168   bSmoke                           type 0
+  +169   bDamage                          type 0
+  +170   bPhysical                        type 0
+  +171   bSpawnWhenTriggered              type 0
+  +172   bRandomLargeAmbient              type 0
+  +173   bRandomSmallAmbient              type 0
+== ?  (registered at 8275d588, 3 members)
+  +32    Offset                           type 9
+  +48    Color                            type 6
+  +52    Bone                             type 2
+== rage__fragTuneBreakPreset  (registered at 8275e178, 4 members)
+  +4     Name                             type 11
+  +8     Strength                         type 7
+  +12    ForceTransmissionUp              type 7
+  +16    ForceTransmissionDown            type 7
+== rage__fragTuneStruct  (registered at 8275e308, 15 members)
+  +8     GlobalMaxDrawingDistance         type 7
+  +12    GlobalForceTransmissionScaleDown type 7
+  +16    GlobalForceTransmissionScaleUp   type 7
+  +20    GlobalRootBreakHealthScale       type 7
+  +24    GlobalBreakHealthScale           type 7
+  +28    GlobalDamageHealthScale          type 7
+  +32    BreakingFrameRateLimit           type 7
+  +36    AggressiveAssetTouching          type 0
+  +37    FragDebug1                       type 0
+  +38    FragDebug2                       type 0
+  +40    CollisionDamageScale             type 7
+  +44    CollisionDamageMinThreshold      type 7
+  +48    CollisionDamageMaxThreshold      type 7
+  +52    ReferenceMassForDefaultTuning    type 7
+  +56    BreakPresets                     type 13
+== ?  (registered at 8275ebd0, 3 members)
+  +32    Offset                           type 9
+  +48    EmitterName                      type 11
+  +172   MinRelativeSpeed                 type 7
+== ?  (registered at 8275f440, 4 members)
+  +32    CrossedHealth                    type 7
+  +36    ChanceOfDamage                   type 7
+  +40    DamageComponent                  type 5
+  +44    DamageHealth                     type 7
+== ?  (registered at 8275f5a0, 5 members)
+  +32    AnimName                         type 11
+  +96    Speed                            type 7
+  +100   Start                            type 7
+  +104   End                              type 7
+  +108   Looping                          type 0
+== ?  (registered at 8275fee0, 3 members)
+  +32    CrossedHealth                    type 7
+  +36    ChanceOfSnuff                    type 7
+  +40    SnuffComponent                   type 5
+== mcAmbientRenderType  (registered at 82790530, 3 members)
+  +40    fLodSwitchScale                  type 7
+  +44    fHighToMedSwitch                 type 7
+  +48    fMedToLowSwitch                  type 7
+== mcAmbientRenderCarType  (registered at 82792518, 6 members)
+  +68    fMaxPitchDot                     type 7
+  +72    fMaxRollDot                      type 7
+  +76    fMaxPitchAngle                   type 7
+  +80    fMaxRollAngle                    type 7
+  +84    fGlowIntensityScale              type 7
+  +264   LightTune                        type 13
+== mcAmbientCarTypeColor  (registered at 827947c0, 3 members)
+  +4     fScale                           type 7
+  +8     vColors                          type 13
+  +16    iPaintType                       type 5

@@ -1,0 +1,727 @@
+//! The AI navigation mesh of the city, `resources/city/sc/0x69d17d57.r26` (`city.xsm`,
+//! `rage::ai::navLevelSimpleMesh`): 35 chunks of triangles and quads that cover roads,
+//! sidewalks, alleys, plazas and parks. Layout (work/map/unknown_files.md, "Puzzle 1"):
+//!
+//! ```text
+//! root        +08 -> material manager {+04 -> material pointers, +08 u16 count}; material +08 u32 flags
+//!             +0c -> level
+//! level       +28 -> chunk-data table {+04 -> pointers}     +2c -> span-data table {+04 -> pointers, +14 u32 count}
+//!             +30 -> chunk pointers, +34 u16 count           +38 -> spans (12 bytes), +3c u16 count
+//! chunk       +10 matrix (four vec4 rows; row 3 = origin)    +50 u16 chunk-data index   +56 u16 polygons
+//! chunk data  +08 -> local links (12 bytes) n u16 +20        +0c -> normals (vec4, a coarse table) n u16 +22
+//!             +10 -> polygons (28 bytes) n u16 +24           +14 -> vertices (3 x i16 / 20 m) n u16 +26
+//! polygon     +00 3 x i16 centre   +06 u8 material   +07 u8 has external connections   +08 f32 area
+//!             +10 -> u16 link indices   +14 -> u16 vertex indices   +18 u8 normal   +19 u8 links   +1a u8 vertices
+//! local link  +04 u16 polygon 1, +06 u16 polygon 2, +08 u16 vertex 1, +0a u16 vertex 2 (the shared edge)
+//! span        +00 u16 chunk A, +02 u16 chunk B, +04 u16 span-data index, +06 3 x i16 centre (local to A)
+//! span data   +04 -> records (14 bytes: a local link, polygon in A at +04, polygon in B at +06,
+//!             the edge's two vertices - of chunk A - at +08 / +0a), +08 u16 count
+//! ```
+//!
+//! Adjacency is the file's own: every polygon lists its local links (to polygons of the same
+//! chunk) and the spans join polygons of two chunks. Nothing is rebuilt from positions.
+
+use super::Rd;
+use crate::rsc::Resource;
+use glam::Vec3;
+use hashbrown::HashMap;
+
+/// i16 units per metre (the game sets its quantisation scale to 20 before loading the mesh).
+pub const SCALE: f32 = 20.0;
+/// Material flag bits, named as the game registers them.
+pub const AI_SIDEWALK: u32 = 1;
+pub const AI_ROAD: u32 = 2;
+pub const AI_GRASS: u32 = 4;
+pub const AI_SHORTCUT: u32 = 8;
+
+const GRID: f32 = 32.0;
+
+/// A way from one polygon into a neighbour: the shared edge, in world space.
+#[derive(Debug, Clone, Copy)]
+pub struct NavLink {
+    pub poly: u32,
+    pub a: Vec3,
+    pub b: Vec3,
+}
+
+#[derive(Debug, Clone)]
+pub struct NavPoly {
+    pub chunk: u16,
+    pub material: u8,
+    /// flags of its material (bit 0 sidewalk, bit 1 road, ...)
+    pub flags: u32,
+    /// stored area, m2
+    pub area: f32,
+    /// stored centre, world space
+    pub center: Vec3,
+    /// from the chunk's normal table: approximate (see [`NavPoly::height`])
+    pub normal: Vec3,
+    /// 3 or 4
+    pub nv: u8,
+    pub verts: [Vec3; 4],
+    /// its links: `NavMesh::links[first_link .. first_link + n_links]`
+    pub first_link: u32,
+    pub n_links: u8,
+}
+
+impl NavPoly {
+    pub fn sidewalk(&self) -> bool {
+        self.flags & AI_SIDEWALK != 0
+    }
+
+    pub fn points(&self) -> &[Vec3] {
+        &self.verts[..self.nv as usize]
+    }
+
+    /// Height of the surface at a place in plan view, from the vertices (the quads are not
+    /// flat and the stored normals come from a small table, 25 or so per chunk): the triangle
+    /// of the fan about vertex 0 the place lies in, or the nearest of them outside.
+    pub fn height(&self, x: f32, z: f32) -> f32 {
+        let p = self.points();
+        let mut best = (f32::MAX, self.center.y);
+        for i in 1..p.len().saturating_sub(1) {
+            let (a, b, c) = (p[0], p[i], p[i + 1]);
+            let det = (b.z - c.z) * (a.x - c.x) + (c.x - b.x) * (a.z - c.z);
+            if det.abs() < 1e-6 {
+                continue;
+            }
+            let u = ((b.z - c.z) * (x - c.x) + (c.x - b.x) * (z - c.z)) / det;
+            let v = ((c.z - a.z) * (x - c.x) + (a.x - c.x) * (z - c.z)) / det;
+            let w = 1.0 - u - v;
+            // how far outside (0 inside)
+            let out = (-u).max(-v).max(-w).max(0.0);
+            if out < best.0 {
+                let (u, v, w) = (u.clamp(-0.5, 1.5), v.clamp(-0.5, 1.5), w.clamp(-0.5, 1.5));
+                best = (out, a.y * u + b.y * v + c.y * w);
+            }
+        }
+        best.1
+    }
+
+    /// Plan-view test, either winding.
+    pub fn contains(&self, x: f32, z: f32) -> bool {
+        let p = self.points();
+        let mut s = 0;
+        for i in 0..p.len() {
+            let (a, b) = (p[i], p[(i + 1) % p.len()]);
+            let c = (b.x - a.x) * (z - a.z) - (b.z - a.z) * (x - a.x);
+            if c > 1e-5 {
+                s |= 1;
+            } else if c < -1e-5 {
+                s |= 2;
+            }
+        }
+        s != 3
+    }
+
+    /// A point inside: bilinear on a quad, folded barycentric on a triangle (u, v in 0..1).
+    pub fn point(&self, u: f32, v: f32) -> Vec3 {
+        let p = &self.verts;
+        if self.nv >= 4 {
+            p[0].lerp(p[1], u).lerp(p[3].lerp(p[2], u), v)
+        } else {
+            let (u, v) = if u + v > 1.0 { (1.0 - u, 1.0 - v) } else { (u, v) };
+            p[0] + (p[1] - p[0]) * u + (p[2] - p[0]) * v
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct NavMesh {
+    pub polys: Vec<NavPoly>,
+    pub links: Vec<NavLink>,
+    /// flags of the materials (8 in the shipped file)
+    pub materials: Vec<u32>,
+    /// index of each chunk's first polygon
+    pub chunk_first: Vec<u32>,
+    /// links between polygons of one chunk, as listed by the polygons
+    pub local_links: usize,
+    /// links between chunks (each is entered on both of its polygons)
+    pub spans: usize,
+    grid: HashMap<(i32, i32), Vec<u32>>,
+}
+
+fn cell(x: f32, z: f32) -> (i32, i32) {
+    ((x / GRID).floor() as i32, (z / GRID).floor() as i32)
+}
+
+impl NavMesh {
+    pub fn parse(res: &Resource) -> Option<NavMesh> {
+        let rd = Rd::new(res);
+        let i16at = |o: usize| rd.u16(o) as i16 as f32 / SCALE;
+        let v3 = |o: usize| Vec3::new(rd.f32(o), rd.f32(o + 4), rd.f32(o + 8));
+        let mut mesh = NavMesh::default();
+        if let Some(mm) = rd.ptr(0x08) {
+            if let Some(arr) = rd.ptr(mm + 4) {
+                for k in 0..(rd.u16(mm + 8) as usize).min(256) {
+                    mesh.materials.push(rd.ptr(arr + 4 * k).map_or(0, |m| rd.u32(m + 8)));
+                }
+            }
+        }
+        let lvl = rd.ptr(0x0c)?;
+        let cds = rd.ptr(rd.ptr(lvl + 0x28)? + 4)?;
+        let (chunks, n_chunks) = (rd.ptr(lvl + 0x30)?, rd.u16(lvl + 0x34) as usize);
+        // per chunk: world vertices (kept for the spans)
+        let mut chunk_verts: Vec<Vec<Vec3>> = Vec::with_capacity(n_chunks);
+        for ci in 0..n_chunks {
+            mesh.chunk_first.push(mesh.polys.len() as u32);
+            chunk_verts.push(Vec::new());
+            let Some(c) = rd.ptr(chunks + 4 * ci) else { continue };
+            let Some(d) = rd.ptr(cds + 4 * rd.u16(c + 0x50) as usize) else { continue };
+            let rows = [v3(c + 0x10), v3(c + 0x20), v3(c + 0x30), v3(c + 0x40)];
+            if !rows.iter().all(|r| r.is_finite()) {
+                continue;
+            }
+            let world = |v: Vec3| rows[0] * v.x + rows[1] * v.y + rows[2] * v.z + rows[3];
+            let (n_links, n_normals, n_polys, n_verts) = (rd.u16(d + 0x20) as usize, rd.u16(d + 0x22) as usize, rd.u16(d + 0x24) as usize, rd.u16(d + 0x26) as usize);
+            let (Some(lk), Some(po), Some(ve)) = (rd.ptr(d + 0x08).or((n_links == 0).then_some(0)), rd.ptr(d + 0x10), rd.ptr(d + 0x14)) else { continue };
+            let no = rd.ptr(d + 0x0c);
+            if !rd.has(po, n_polys * 28) || !rd.has(ve, n_verts * 6) || !rd.has(lk, n_links * 12) {
+                continue;
+            }
+            let verts: Vec<Vec3> = (0..n_verts).map(|k| world(Vec3::new(i16at(ve + 6 * k), i16at(ve + 6 * k + 2), i16at(ve + 6 * k + 4)))).collect();
+            let base = mesh.polys.len() as u32;
+            for k in 0..n_polys {
+                let o = po + 28 * k;
+                let material = rd.u8(o + 6);
+                let (nl, nv) = (rd.u8(o + 0x19) as usize, (rd.u8(o + 0x1a) as usize).min(4));
+                let mut pv = [Vec3::ZERO; 4];
+                if let Some(vp) = rd.ptr(o + 0x14) {
+                    for a in 0..nv {
+                        pv[a] = verts.get(rd.u16(vp + 2 * a) as usize).copied().unwrap_or(Vec3::ZERO);
+                    }
+                }
+                let ni = rd.u8(o + 0x18) as usize;
+                let mut normal = no.filter(|_| ni < n_normals).map_or(Vec3::Y, |n| v3(n + 16 * ni));
+                normal = (rows[0] * normal.x + rows[1] * normal.y + rows[2] * normal.z).normalize_or(Vec3::Y);
+                let first_link = mesh.links.len() as u32;
+                if let Some(lp) = rd.ptr(o + 0x10) {
+                    for a in 0..nl {
+                        let l = lk + 12 * rd.u16(lp + 2 * a) as usize;
+                        if !rd.has(l, 12) {
+                            continue;
+                        }
+                        let (p1, p2) = (rd.u16(l + 4) as usize, rd.u16(l + 6) as usize);
+                        let other = if p1 == k { p2 } else if p2 == k { p1 } else { continue };
+                        let (Some(&a), Some(&b)) = (verts.get(rd.u16(l + 8) as usize), verts.get(rd.u16(l + 10) as usize)) else { continue };
+                        if other < n_polys {
+                            mesh.links.push(NavLink { poly: base + other as u32, a, b });
+                        }
+                    }
+                }
+                mesh.local_links += mesh.links.len() - first_link as usize;
+                mesh.polys.push(NavPoly {
+                    chunk: ci as u16,
+                    material,
+                    flags: mesh.materials.get(material as usize).copied().unwrap_or(0),
+                    area: rd.f32(o + 8),
+                    center: world(Vec3::new(i16at(o), i16at(o + 2), i16at(o + 4))),
+                    normal,
+                    nv: nv as u8,
+                    verts: pv,
+                    first_link,
+                    n_links: (mesh.links.len() - first_link as usize) as u8,
+                });
+            }
+            chunk_verts[ci] = verts;
+        }
+        // links between chunks: appended behind the local ones, so the polygons' link ranges
+        // are rebuilt at the end
+        let mut extra: Vec<(u32, NavLink)> = Vec::new();
+        if let (Some(sp), Some(sds)) = (rd.ptr(lvl + 0x38), rd.ptr(lvl + 0x2c).and_then(|t| rd.ptr(t + 4))) {
+            let count = |ci: usize| -> u32 { mesh.chunk_first.get(ci + 1).copied().unwrap_or(mesh.polys.len() as u32) - mesh.chunk_first[ci] };
+            for k in 0..rd.u16(lvl + 0x3c) as usize {
+                let o = sp + 12 * k;
+                let (ca, cb) = (rd.u16(o) as usize, rd.u16(o + 2) as usize);
+                let Some(sd) = rd.ptr(sds + 4 * rd.u16(o + 4) as usize) else { continue };
+                let Some(recs) = rd.ptr(sd + 4) else { continue };
+                if ca >= n_chunks || cb >= n_chunks {
+                    continue;
+                }
+                for j in 0..rd.u16(sd + 8) as usize {
+                    let r = recs + 14 * j;
+                    let (pa, pb) = (rd.u16(r + 4) as u32, rd.u16(r + 6) as u32);
+                    if pa >= count(ca) || pb >= count(cb) {
+                        continue;
+                    }
+                    let (pa, pb) = (mesh.chunk_first[ca] + pa, mesh.chunk_first[cb] + pb);
+                    let (Some(&a), Some(&b)) = (chunk_verts[ca].get(rd.u16(r + 8) as usize), chunk_verts[ca].get(rd.u16(r + 10) as usize)) else { continue };
+                    extra.push((pa, NavLink { poly: pb, a, b }));
+                    extra.push((pb, NavLink { poly: pa, a, b }));
+                    mesh.spans += 1;
+                }
+            }
+        }
+        if !extra.is_empty() {
+            let mut add: HashMap<u32, Vec<NavLink>> = HashMap::new();
+            for (p, l) in extra {
+                add.entry(p).or_default().push(l);
+            }
+            let old = std::mem::take(&mut mesh.links);
+            for (i, p) in mesh.polys.iter_mut().enumerate() {
+                let first = mesh.links.len() as u32;
+                mesh.links.extend_from_slice(&old[p.first_link as usize..p.first_link as usize + p.n_links as usize]);
+                if let Some(v) = add.get(&(i as u32)) {
+                    mesh.links.extend_from_slice(v);
+                }
+                p.first_link = first;
+                p.n_links = (mesh.links.len() as u32 - first).min(255) as u8;
+            }
+        }
+        for (i, p) in mesh.polys.iter().enumerate() {
+            let (mut lo, mut hi) = (p.verts[0], p.verts[0]);
+            for v in p.points() {
+                lo = lo.min(*v);
+                hi = hi.max(*v);
+            }
+            let ((x0, z0), (x1, z1)) = (cell(lo.x, lo.z), cell(hi.x, hi.z));
+            if x1 - x0 > 64 || z1 - z0 > 64 {
+                continue;
+            }
+            for x in x0..=x1 {
+                for z in z0..=z1 {
+                    mesh.grid.entry((x, z)).or_default().push(i as u32);
+                }
+            }
+        }
+        (!mesh.polys.is_empty()).then_some(mesh)
+    }
+
+    pub fn links_of(&self, poly: u32) -> &[NavLink] {
+        let p = &self.polys[poly as usize];
+        &self.links[p.first_link as usize..p.first_link as usize + p.n_links as usize]
+    }
+
+    /// Polygons whose bounding box reaches into the square around a place.
+    pub fn near(&self, pos: Vec3, radius: f32, mut f: impl FnMut(u32, &NavPoly)) {
+        let ((x0, z0), (x1, z1)) = (cell(pos.x - radius, pos.z - radius), cell(pos.x + radius, pos.z + radius));
+        for x in x0..=x1 {
+            for z in z0..=z1 {
+                let Some(list) = self.grid.get(&(x, z)) else { continue };
+                for &i in list {
+                    let p = &self.polys[i as usize];
+                    // listed in several cells: report it from the first of them only
+                    let lo = p.points().iter().fold(p.verts[0], |a, v| a.min(*v));
+                    let (cx, cz) = cell(lo.x, lo.z);
+                    if (cx.max(x0), cz.max(z0)) == (x, z) {
+                        f(i, p);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The polygon under a point: of those with one of the `flags` that contain it in plan
+    /// view, the one whose plane is nearest in height (within `dy`).
+    pub fn find(&self, pos: Vec3, flags: u32, dy: f32) -> Option<u32> {
+        let list = self.grid.get(&cell(pos.x, pos.z))?;
+        let mut best: Option<(f32, u32)> = None;
+        for &i in list {
+            let p = &self.polys[i as usize];
+            if p.flags & flags == 0 || !p.contains(pos.x, pos.z) {
+                continue;
+            }
+            let d = (p.height(pos.x, pos.z) - pos.y).abs();
+            if d <= dy && best.map_or(true, |b| d < b.0) {
+                best = Some((d, i));
+            }
+        }
+        best.map(|b| b.1)
+    }
+
+    /// Connected pieces of the sidewalk (polygons with flag bit 0, joined by the file's
+    /// links): the piece number of every polygon (`u32::MAX` on the others) and their count.
+    pub fn sidewalk_islands(&self) -> (Vec<u32>, usize) {
+        let mut id = vec![u32::MAX; self.polys.len()];
+        let mut n = 0;
+        let mut stack = Vec::new();
+        for s in 0..self.polys.len() {
+            if id[s] != u32::MAX || !self.polys[s].sidewalk() {
+                continue;
+            }
+            id[s] = n;
+            stack.push(s as u32);
+            while let Some(x) = stack.pop() {
+                for l in self.links_of(x) {
+                    if id[l.poly as usize] == u32::MAX && self.polys[l.poly as usize].sidewalk() {
+                        id[l.poly as usize] = n;
+                        stack.push(l.poly);
+                    }
+                }
+            }
+            n += 1;
+        }
+        (id, n as usize)
+    }
+}
+
+// ---------------------------------------------------------------------------------
+// Ways for cars over the mesh (the port's own query: the original's `navLevelSimple`
+// path handlers are not decoded - work/map/unknown_files.md, "AI shortcuts on the
+// navigation mesh").
+
+pub const AI_JUMP: u32 = 0x10;
+pub const AI_JUMP_UP: u32 = 0x20;
+/// What a car may drive on: roads and everything marked as a shortcut (alleys, car parks,
+/// plazas; the pavement and grass shortcuts too).
+pub const AI_DRIVE: u32 = AI_ROAD | AI_SHORTCUT;
+
+/// A way over the mesh.
+#[derive(Debug, Clone)]
+pub struct NavPath {
+    /// the polygons crossed, first to last
+    pub polys: Vec<u32>,
+    /// the pulled-tight line: start, the corners, goal (both ends moved onto the mesh)
+    pub points: Vec<Vec3>,
+    /// the plain line: start, the middle of every edge crossed, goal
+    pub mids: Vec<Vec3>,
+    /// length of `points`, m
+    pub length: f32,
+    /// true: over drivable polygons only; false: nothing else connected, so it crosses
+    /// plain pavement, grass or a jump somewhere
+    pub strict: bool,
+}
+
+#[derive(PartialEq)]
+struct Open(f32, u32);
+impl Eq for Open {}
+impl Ord for Open {
+    fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+        o.0.total_cmp(&self.0)
+    }
+}
+impl PartialOrd for Open {
+    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+
+/// Twice the area of o, p, q in plan view.
+fn turn(o: Vec3, p: Vec3, q: Vec3) -> f32 {
+    (p.x - o.x) * (q.z - o.z) - (p.z - o.z) * (q.x - o.x)
+}
+
+impl NavPoly {
+    /// A car may drive here.
+    pub fn drivable(&self) -> bool {
+        self.flags & AI_DRIVE != 0 && self.nv >= 3
+    }
+
+    /// How dear a metre is for a car: 1 on roads and road shortcuts, 1.5 on the other
+    /// shortcut materials (pavement, grass); `None` on what is not for cars. (The port's weights.)
+    pub fn drive_cost(&self) -> Option<f32> {
+        if !self.drivable() {
+            None
+        } else if self.flags & AI_ROAD != 0 {
+            Some(1.0)
+        } else {
+            Some(1.5)
+        }
+    }
+
+    /// The point of the polygon nearest to a place in plan view (the place itself when it
+    /// lies inside), at the surface's height.
+    pub fn closest(&self, x: f32, z: f32) -> Vec3 {
+        let p = self.points();
+        if p.len() < 3 {
+            return self.center;
+        }
+        if self.contains(x, z) {
+            return Vec3::new(x, self.height(x, z), z);
+        }
+        let mut best = (f32::MAX, self.center);
+        for i in 0..p.len() {
+            let (a, b) = (p[i], p[(i + 1) % p.len()]);
+            let (dx, dz) = (b.x - a.x, b.z - a.z);
+            let t = (((x - a.x) * dx + (z - a.z) * dz) / (dx * dx + dz * dz).max(1e-9)).clamp(0.0, 1.0);
+            let q = a.lerp(b, t);
+            let d = (q.x - x) * (q.x - x) + (q.z - z) * (q.z - z);
+            if d < best.0 {
+                best = (d, q);
+            }
+        }
+        best.1
+    }
+}
+
+impl NavMesh {
+    /// The polygon nearest to a place among those `accept` takes: at most `radius` away in
+    /// plan view and `dy` in height. Returns it and the place moved onto it.
+    pub fn nearest(&self, pos: Vec3, radius: f32, dy: f32, accept: &dyn Fn(&NavPoly) -> bool) -> Option<(u32, Vec3)> {
+        let mut best: Option<(f32, u32, Vec3)> = None;
+        self.near(pos, radius, |i, p| {
+            if p.nv < 3 || !accept(p) {
+                return;
+            }
+            let q = p.closest(pos.x, pos.z);
+            let (flat, up) = (((q.x - pos.x) * (q.x - pos.x) + (q.z - pos.z) * (q.z - pos.z)).sqrt(), (q.y - pos.y).abs());
+            if flat > radius || up > dy {
+                return;
+            }
+            // (of two floors one above the other: the one at the place's height)
+            let d = flat + up * 0.5;
+            if best.as_ref().map_or(true, |b| d < b.0) {
+                best = Some((d, i, q));
+            }
+        });
+        best.map(|b| (b.1, b.2))
+    }
+
+    /// Height of the mesh under a place (the polygon nearest in height, within `dy`).
+    pub fn height_at(&self, pos: Vec3, flags: u32, dy: f32) -> Option<f32> {
+        self.find(pos, flags, dy).map(|i| self.polys[i as usize].height(pos.x, pos.z))
+    }
+
+    /// A way for a car from one place to another: over road and shortcut polygons; only if
+    /// those do not connect the two, over anything (plain pavement, grass and jumps at eight
+    /// times the length). `snap`: how far the two places may lie from the mesh; `margin`:
+    /// how far the line keeps from the ends of the edges it crosses (half a car's width).
+    ///
+    /// A* over the file's adjacency, a polygon entered at the middle of the shared edge;
+    /// then the line is pulled tight through the edges (each shortened by the margin).
+    pub fn drive_path(&self, from: Vec3, to: Vec3, snap: f32, margin: f32) -> Option<NavPath> {
+        self.path_over(from, to, snap, margin, true).or_else(|| self.path_over(from, to, snap, margin, false))
+    }
+
+    fn path_over(&self, from: Vec3, to: Vec3, snap: f32, margin: f32, strict: bool) -> Option<NavPath> {
+        const DY: f32 = 4.0;
+        const LOOSE: f32 = 8.0;
+        let cost = |p: &NavPoly| if strict { p.drive_cost() } else { Some(p.drive_cost().unwrap_or(LOOSE)).filter(|_| p.nv >= 3) };
+        let end = |p: Vec3| self.nearest(p, snap, DY, &|q| q.drivable()).or_else(|| if strict { None } else { self.nearest(p, snap, DY, &|_| true) });
+        let ((s, sp), (t, tp)) = (end(from)?, end(to)?);
+        // per polygon: cost so far, where it was entered, from which polygon over which edge
+        struct Node {
+            g: f32,
+            at: Vec3,
+            prev: u32,
+            edge: (Vec3, Vec3),
+        }
+        let mut seen: HashMap<u32, Node> = HashMap::new();
+        let mut open = std::collections::BinaryHeap::new();
+        seen.insert(s, Node { g: 0.0, at: sp, prev: u32::MAX, edge: (sp, sp) });
+        open.push(Open(sp.distance(tp), s));
+        let mut found = false;
+        while let Some(Open(f, p)) = open.pop() {
+            let (g0, at) = {
+                let n = &seen[&p];
+                (n.g, n.at)
+            };
+            if f > g0 + at.distance(tp) + 1e-3 {
+                continue;
+            }
+            if p == t {
+                found = true;
+                break;
+            }
+            if seen.len() > 40_000 {
+                break;
+            }
+            let k = cost(&self.polys[p as usize]).unwrap_or(1.0);
+            for l in self.links_of(p) {
+                if cost(&self.polys[l.poly as usize]).is_none() {
+                    continue;
+                }
+                let mid = (l.a + l.b) * 0.5;
+                let g = g0 + at.distance(mid) * k;
+                if seen.get(&l.poly).map_or(true, |o| g < o.g - 1e-4) {
+                    seen.insert(l.poly, Node { g, at: mid, prev: p, edge: (l.a, l.b) });
+                    open.push(Open(g + mid.distance(tp), l.poly));
+                }
+            }
+        }
+        if !found {
+            return None;
+        }
+        let mut polys = vec![t];
+        let mut edges: Vec<(Vec3, Vec3)> = Vec::new();
+        let mut c = t;
+        while c != s {
+            let n = &seen[&c];
+            edges.push(n.edge);
+            c = n.prev;
+            polys.push(c);
+            if polys.len() > seen.len() + 1 {
+                return None;
+            }
+        }
+        polys.reverse();
+        edges.reverse();
+        // the gates: each edge with its ends told apart (left / right as seen from the polygon
+        // being left) and shortened by the margin
+        let mut gates: Vec<(Vec3, Vec3)> = Vec::with_capacity(edges.len() + 2);
+        gates.push((sp, sp));
+        for (k, (a, b)) in edges.iter().enumerate() {
+            let c = self.polys[polys[k] as usize].center;
+            let (l, r) = if turn(c, *b, *a) >= 0.0 { (*a, *b) } else { (*b, *a) };
+            let d = r - l;
+            let len = Vec3::new(d.x, 0.0, d.z).length();
+            let m = if len <= margin * 2.0 + 0.2 { 0.5 } else { margin / len };
+            gates.push((l + d * m, r - d * m));
+        }
+        gates.push((tp, tp));
+        // the funnel
+        let mut points = vec![sp];
+        let (mut apex, mut left, mut right) = (sp, sp, sp);
+        let (mut li, mut ri) = (0usize, 0usize);
+        let same = |a: Vec3, b: Vec3| (a.x - b.x).abs() < 1e-4 && (a.z - b.z).abs() < 1e-4;
+        let mut i = 1;
+        let mut guard = 0;
+        while i < gates.len() {
+            guard += 1;
+            if guard > gates.len() * gates.len() + 64 {
+                break;
+            }
+            let (l, r) = gates[i];
+            // the right side
+            if turn(apex, right, r) >= 0.0 {
+                if same(apex, right) || turn(apex, left, r) < 0.0 {
+                    right = r;
+                    ri = i;
+                } else {
+                    // over the left side: the left point is a corner
+                    points.push(left);
+                    apex = left;
+                    right = apex;
+                    ri = li;
+                    i = li + 1;
+                    continue;
+                }
+            }
+            // the left side
+            if turn(apex, left, l) <= 0.0 {
+                if same(apex, left) || turn(apex, right, l) > 0.0 {
+                    left = l;
+                    li = i;
+                } else {
+                    points.push(right);
+                    apex = right;
+                    left = apex;
+                    li = ri;
+                    i = ri + 1;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        if !same(*points.last().unwrap(), tp) {
+            points.push(tp);
+        }
+        points.dedup_by(|a, b| a.distance(*b) < 1e-3);
+        let length = points.windows(2).map(|w| w[0].distance(w[1])).sum();
+        let mut mids = vec![sp];
+        mids.extend(edges.iter().map(|e| (e.0 + e.1) * 0.5));
+        mids.push(tp);
+        mids.dedup_by(|a, b| a.distance(*b) < 1e-3);
+        Some(NavPath { polys, points, mids, length, strict })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file() -> Option<Resource> {
+        let root = std::env::var("MCLA_DATA_DIR").unwrap_or_else(|_| "D:/MCLA/extracted/cache".into());
+        let d = std::fs::read(std::path::Path::new(&root).join("resources/city/sc/0x69d17d57.r26")).ok()?;
+        if d.len() < 16 || &d[0..4] != b"MCLR" {
+            return None;
+        }
+        let u = |o: usize| u32::from_le_bytes(d[o..o + 4].try_into().unwrap());
+        let data = d[16..].to_vec();
+        let vs = (u(12) as usize).min(data.len());
+        Some(Resource { rtype: u(4), flags: u(8), virtual_size: vs, physical_size: data.len() - vs, data })
+    }
+
+    /// Counts of work/map/unknown_files.md (Puzzle 1) and the sanity of the adjacency.
+    #[test]
+    fn navmesh_counts_and_adjacency() {
+        let Some(res) = file() else { return };
+        let m = NavMesh::parse(&res).unwrap();
+        assert_eq!(m.chunk_first.len(), 35);
+        assert_eq!(m.polys.len(), 52_987);
+        assert_eq!(m.materials, [0x81, 0x82, 0x09, 0x0a, 0x110, 0x84, 0xa0, 0x0c]);
+        // sidewalk 13,762 + sidewalk-and-shortcut 1,350
+        assert_eq!(m.polys.iter().filter(|p| p.sidewalk()).count(), 15_112);
+        assert_eq!(m.polys.iter().filter(|p| p.material == 0).count(), 13_762);
+        assert_eq!(m.polys.iter().filter(|p| p.material == 1).count(), 21_586);
+        assert_eq!(m.polys.iter().filter(|p| p.nv == 3).count(), 9_229);
+        assert_eq!(m.spans, 1_372);
+        // every local link is listed by both of its polygons, give or take the few odd ones
+        assert!((m.local_links as i64 - 2 * 84_354).abs() < 1_200, "{}", m.local_links);
+        // stored centre = mean of the vertices; a link's edge lies on the polygon's outline
+        let (mut on, mut all, mut flat) = (0, 0, 0);
+        for (i, p) in m.polys.iter().enumerate() {
+            let mean = p.points().iter().copied().sum::<Vec3>() / p.nv as f32;
+            assert!(mean.distance(p.center) < 0.12, "{i}: {:?} {:?}", mean, p.center);
+            flat += p.points().iter().all(|v| (p.height(v.x, v.z) - v.y).abs() < 0.05) as usize;
+            for l in m.links_of(i as u32) {
+                assert!((l.poly as usize) < m.polys.len() && l.poly as usize != i);
+                all += 1;
+                let hit = |q: Vec3| p.points().iter().any(|v| v.distance(q) < 0.12);
+                on += (hit(l.a) && hit(l.b)) as usize;
+            }
+        }
+        assert!(on as f32 > all as f32 * 0.985, "{on} of {all}");
+        // the height query gives back the vertices (not on the few folded or upright polygons)
+        assert!(flat as f32 > m.polys.len() as f32 * 0.99, "{flat}");
+        println!("links {all}, edge on the outline {on}, height exact at the vertices {flat}");
+        // world extent of the notes
+        let lo = m.polys.iter().fold(Vec3::splat(1e9), |a, p| a.min(p.center));
+        let hi = m.polys.iter().fold(Vec3::splat(-1e9), |a, p| a.max(p.center));
+        assert!(lo.x > -3470.0 && hi.x < 2830.0 && lo.z > -2335.0 && hi.z < 1970.0, "{lo:?} {hi:?}");
+        // the pavements are islands (city blocks) between the roads
+        let (id, n) = m.sidewalk_islands();
+        assert_eq!(n, 351);
+        assert_eq!(id.iter().filter(|&&x| x != u32::MAX).count(), 15_112);
+        // point query: a sidewalk polygon is found at its own centre
+        let k = m.polys.iter().position(|p| p.sidewalk()).unwrap();
+        let c = m.polys[k].center;
+        let f = m.find(c, AI_SIDEWALK, 1.0).unwrap();
+        assert!(m.polys[f as usize].contains(c.x, c.z));
+        let mut seen = 0;
+        m.near(c, 10.0, |i, _| seen += (i as usize == k) as usize);
+        assert_eq!(seen, 1);
+    }
+
+    /// Ways for cars between route nodes of real races that lie away from the lane network
+    /// (car parks and alleys; from the sweep in game/src/offroad.rs): a way exists, its
+    /// polygons are neighbours, and the pulled-tight line stays on polygons a car may use.
+    #[test]
+    fn drive_paths_between_real_route_nodes() {
+        let Some(res) = file() else { return };
+        let m = NavMesh::parse(&res).unwrap();
+        let on = |pts: &[Vec3], accept: &dyn Fn(&NavPoly) -> bool| {
+            pts.windows(2).all(|w| {
+                let n = (w[0].distance(w[1]) / 0.5).ceil().max(1.0) as usize;
+                (0..=n).all(|k| m.nearest(w[0].lerp(w[1], k as f32 / n as f32), 0.3, 4.0, accept).is_some())
+            })
+        };
+        // hw_ordered_jp_11 (a car park off Sunset), be_blitz_mb_01, be_blitz_mb_02
+        let strict = [
+            ([1339.6, 16.2, -776.5], [1321.7, 16.8, -824.7]),
+            ([1224.06, 14.9653, -758.784], [1312.49, 16.1386, -796.416]),
+            ([-684.117, 19.3751, -662.881], [-639.055, 20.1, -698.121]),
+        ];
+        for (a, b) in strict {
+            let (a, b) = (Vec3::from(a), Vec3::from(b));
+            let p = m.drive_path(a, b, 12.0, 1.3).unwrap_or_else(|| panic!("no way {a:?} -> {b:?}"));
+            assert!(p.strict && p.polys.iter().all(|i| m.polys[*i as usize].drivable()), "{a:?} -> {b:?}");
+            assert!(p.polys.windows(2).all(|w| m.links_of(w[0]).iter().any(|l| l.poly == w[1])));
+            assert!(p.points[0].distance(a) < 12.5 && p.points.last().unwrap().distance(b) < 12.5);
+            assert!(p.length > a.distance(b) - 25.0 && p.length < a.distance(b) * 1.5, "{}", p.length);
+            assert!(on(&p.points, &|q| q.drivable()) && on(&p.mids, &|q| q.drivable()), "{a:?} -> {b:?} leaves the drivable polygons");
+            println!("path {a:?} -> {b:?}: {:.0} m ({:.0} m straight) over {} polygons, {} corners", p.length, a.distance(b), p.polys.len(), p.points.len());
+        }
+        // from the street into that car park: road, one polygon of plain pavement, car park -
+        // nothing but pavement joins the two, so the way is not a strict one
+        let (a, b) = (Vec3::new(1358.5, 16.8, -806.4), Vec3::new(1321.7, 16.8, -824.7));
+        let p = m.drive_path(a, b, 12.0, 1.3).unwrap();
+        assert!(!p.strict);
+        assert_eq!(p.polys.iter().filter(|i| !m.polys[**i as usize].drivable()).count(), 1);
+        assert!(p.polys.iter().all(|i| m.polys[*i as usize].drivable() || m.polys[*i as usize].material == 0));
+        assert!(on(&p.points, &|_| true) && p.length < a.distance(b) * 1.5);
+        // the same place twice: one polygon, a line of two points or one
+        let p = m.drive_path(b, b, 12.0, 1.3).unwrap();
+        assert!(p.polys.len() == 1 && p.length < 0.01);
+    }
+}

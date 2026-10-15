@@ -1,0 +1,1122 @@
+//! Road network ("navsys", resource type 66, e.g. `resources/city/sc/0x9960fcd8.r66`).
+//!
+//! The network is a set of directed **lanes** (class 0x00479f0c, stride 0x70):
+//! ```text
+//! +04 flags (1 normal, 0x2001 special)   +08 owner (road section) ptr   +0c length
+//! +10 vec3 bbox min   +20 vec3 bbox max
+//! +4c u16 point count   +4e u16 curve order   +50 -> u16 vertex indices
+//! ```
+//! The vertex indices refer to the shared vec4 array at root+0x2c. A lane lists its
+//! points in travel direction **without its final point**: it ends where its successor
+//! starts, which is the bounding-box corner opposite its first point (91 % of all lane
+//! ends match another lane's first vertex within 1 m). Lanes are owned by road
+//! sections (0x0047a13c, stride 0xb0: +14 lane array, +18 count, +1c total length,
+//! +24 centre/radius, +90 street name, +94 speed limit in m/s) or junction objects.
+//!
+//! For driving, every lane is split into its straight segments: a [`Link`] is one
+//! segment, chained to the next segment of the lane or to the first segments of the
+//! successor lanes.
+
+use super::Rd;
+use crate::rsc::Resource;
+use crate::Result;
+use glam::Vec3;
+use hashbrown::HashMap;
+
+#[derive(Debug, Clone)]
+pub struct Link {
+    pub a: Vec3,
+    pub b: Vec3,
+    pub len: f32,
+    pub flags: u32,
+    pub zone: Option<usize>,
+    /// index of the lane this segment belongs to
+    pub lane: usize,
+    /// links that start where this one ends
+    pub next: Vec<usize>,
+    /// links that end where this one starts
+    pub prev: Vec<usize>,
+    /// lane changes: links of adjacent lanes (same direction) reachable from this link's end
+    pub side: Vec<usize>,
+    /// oncoming lanes next to this link's end (entered against traffic)
+    pub opp: Vec<usize>,
+    /// lanes next to this link's start that run opposite to it (used to get back on the
+    /// correct side when this link is driven against traffic)
+    pub back: Vec<usize>,
+    /// junction hops: lane starts within reach of this link's end (lane ends only) that
+    /// are not connected by a lane, e.g. turns the junction has no connector for
+    pub hop: Vec<usize>,
+    /// same, from this link's start when it is driven against traffic (lane starts only)
+    pub hop_a: Vec<usize>,
+    /// endpoint node ids (links sharing an endpoint share the node)
+    pub node_a: usize,
+    pub node_b: usize,
+}
+
+impl Link {
+    pub fn dir(&self) -> Vec3 {
+        (self.b - self.a).normalize_or(-Vec3::Z)
+    }
+    pub fn point_at(&self, t: f32) -> Vec3 {
+        self.a.lerp(self.b, t.clamp(0.0, 1.0))
+    }
+    /// parameter of the closest point on the link to `p`
+    pub fn project(&self, p: Vec3) -> f32 {
+        let d = self.b - self.a;
+        let l2 = d.length_squared().max(1e-6);
+        ((p - self.a).dot(d) / l2).clamp(0.0, 1.0)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Zone {
+    pub links: Vec<usize>,
+    pub length: f32,
+    pub center: Vec3,
+    pub radius: f32,
+    pub name: String,
+    /// Authored road speed in m/s; zero selects the engine's default (40 mph).
+    pub speed_limit: f32,
+}
+
+pub const DEFAULT_ROAD_SPEED: f32 = 40.0 * 0.44704;
+
+impl Zone {
+    pub fn speed_limit_mps(&self) -> f32 {
+        // sub_822447B8 uses 40 mph when +148 is zero. Reject corrupt values too.
+        if self.speed_limit.is_finite() && self.speed_limit > 0.0 {
+            self.speed_limit
+        } else {
+            DEFAULT_ROAD_SPEED
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Street {
+    pub name: String,
+}
+
+#[derive(Debug, Default)]
+pub struct NavSys {
+    pub links: Vec<Link>,
+    pub zones: Vec<Zone>,
+    pub streets: Vec<Street>,
+    /// number of lanes in the file
+    pub lanes: usize,
+    grid: HashMap<(i32, i32), Vec<usize>>,
+    /// per endpoint node: links starting / ending there
+    starts_at: Vec<Vec<usize>>,
+    ends_at: Vec<Vec<usize>>,
+}
+
+const LINK_VT: u32 = 0x00479f0c;
+const ZONE_VT: u32 = 0x0047a13c;
+const STREET_VT: u32 = 0x0047a0c4;
+const GRID: f32 = 50.0;
+
+fn cell(p: Vec3) -> (i32, i32) {
+    ((p.x / GRID).floor() as i32, (p.z / GRID).floor() as i32)
+}
+
+fn xz(a: Vec3, b: Vec3) -> f32 {
+    ((a.x - b.x).powi(2) + (a.z - b.z).powi(2)).sqrt()
+}
+
+struct RawLane {
+    pts: Vec<Vec3>,
+    min: Vec3,
+    max: Vec3,
+    len: f32,
+    flags: u32,
+    zone: Option<usize>,
+}
+
+impl NavSys {
+    pub fn parse(res: &Resource) -> Result<NavSys> {
+        let rd = Rd::new(res);
+        let vs = res.virtual_size;
+        let mut nav = NavSys::default();
+        let mut link_offs = Vec::new();
+        let mut zone_offs = Vec::new();
+        let mut street_offs = Vec::new();
+        let mut o = 0usize;
+        while o + 0x30 <= vs {
+            match rd.vtable(o) {
+                LINK_VT => {
+                    link_offs.push(o);
+                    o += 0x70;
+                    continue;
+                }
+                ZONE_VT => {
+                    zone_offs.push(o);
+                    o += 0xb0;
+                    continue;
+                }
+                STREET_VT => {
+                    street_offs.push(o);
+                    o += 0xc0;
+                    continue;
+                }
+                _ => {}
+            }
+            o += 4;
+        }
+        let verts = rd.ptr(0x2c);
+        let vert = |i: usize| -> Option<Vec3> {
+            let v = verts? + i * 16;
+            if !rd.has(v, 16) {
+                return None;
+            }
+            Some(Vec3::new(rd.f32(v), rd.f32(v + 4), rd.f32(v + 8)))
+        };
+        let zone_index = |off: usize| zone_offs.binary_search(&off).ok();
+        let mut raw: Vec<RawLane> = Vec::with_capacity(link_offs.len());
+        for &lo in &link_offs {
+            let min = Vec3::new(rd.f32(lo + 0x10), rd.f32(lo + 0x14), rd.f32(lo + 0x18));
+            let max = Vec3::new(rd.f32(lo + 0x20), rd.f32(lo + 0x24), rd.f32(lo + 0x28));
+            let cnt = rd.u16(lo + 0x4c) as usize;
+            let mut pts = Vec::with_capacity(cnt + 1);
+            if let Some(arr) = rd.ptr(lo + 0x50) {
+                for k in 0..cnt.min(64) {
+                    if let Some(p) = vert(rd.u16(arr + k * 2) as usize) {
+                        pts.push(p);
+                    }
+                }
+            }
+            if pts.is_empty() {
+                pts.push(min);
+            }
+            raw.push(RawLane { pts, min, max, len: rd.f32(lo + 0xc), flags: rd.u32(lo + 4), zone: rd.ptr(lo + 8).and_then(zone_index) });
+        }
+        let link_index = |off: usize| link_offs.binary_search(&off).ok();
+        let mut zone_lanes: Vec<Vec<usize>> = Vec::new();
+        for &zo in &zone_offs {
+            let mut z = Zone { length: rd.f32(zo + 0x1c), center: Vec3::new(rd.f32(zo + 0x24), rd.f32(zo + 0x28), rd.f32(zo + 0x2c)), radius: rd.f32(zo + 0x30), ..Default::default() };
+            z.speed_limit = rd.f32(zo + 0x94);
+            if let Some(np) = rd.ptr(zo + 0x90) {
+                let s = rd.cstr(np);
+                if s.len() < 64 && s.bytes().all(|b| (0x20..0x7f).contains(&b)) {
+                    z.name = s;
+                }
+            }
+            let count = rd.u16(zo + 0x18) as usize;
+            let mut lanes = Vec::new();
+            if let Some(arr) = rd.ptr(zo + 0x14) {
+                for i in 0..count.min(4096) {
+                    if let Some(li) = rd.ptr(arr + i * 4).and_then(link_index) {
+                        lanes.push(li);
+                    }
+                }
+            }
+            zone_lanes.push(lanes);
+            nav.zones.push(z);
+        }
+        for &so in &street_offs {
+            let mut name = String::new();
+            for f in (4..0xc0).step_by(4) {
+                if let Some(p) = rd.ptr(so + f) {
+                    let s = rd.cstr(p);
+                    if s.len() >= 3 && s.len() < 64 && s.bytes().all(|b| (0x20..0x7f).contains(&b)) && s.chars().any(|c| c.is_ascii_alphabetic()) {
+                        name = s;
+                        break;
+                    }
+                }
+            }
+            nav.streets.push(Street { name });
+        }
+        nav.build_graph(raw, zone_lanes);
+        Ok(nav)
+    }
+
+    fn build_graph(&mut self, mut raw: Vec<RawLane>, zone_lanes: Vec<Vec<usize>>) {
+        let n = raw.len();
+        self.lanes = n;
+        // lane starts, for end matching
+        let scell = |p: Vec3| ((p.x / 8.0).floor() as i32, (p.z / 8.0).floor() as i32);
+        let mut sgrid: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+        for (i, l) in raw.iter().enumerate() {
+            sgrid.entry(scell(l.pts[0])).or_default().push(i);
+        }
+        let starts_near = |raw: &Vec<RawLane>, p: Vec3, r: f32, me: usize| -> Vec<(f32, usize)> {
+            let (cx, cz) = scell(p);
+            let k = (r / 8.0).ceil() as i32;
+            let mut v = Vec::new();
+            for dx in -k..=k {
+                for dz in -k..=k {
+                    if let Some(list) = sgrid.get(&(cx + dx, cz + dz)) {
+                        for &j in list {
+                            if j == me {
+                                continue;
+                            }
+                            let q = raw[j].pts[0];
+                            let d = xz(q, p);
+                            if d < r && (q.y - p.y).abs() < 4.0 {
+                                v.push((d, j));
+                            }
+                        }
+                    }
+                }
+            }
+            v.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            v
+        };
+        // 1. end point of every lane + its successors
+        let mut ends: Vec<Vec3> = Vec::with_capacity(n);
+        let mut succ: Vec<Vec<usize>> = Vec::with_capacity(n);
+        for i in 0..n {
+            let l = &raw[i];
+            let s = l.pts[0];
+            let last = *l.pts.last().unwrap();
+            // corner of the bounding box opposite the start
+            let ex = if (s.x - l.min.x).abs() <= (s.x - l.max.x).abs() { l.max.x } else { l.min.x };
+            let ez = if (s.z - l.min.z).abs() <= (s.z - l.max.z).abs() { l.max.z } else { l.min.z };
+            let mut end = Vec3::new(ex, last.y, ez);
+            let mut found: Vec<usize> = starts_near(&raw, end, 1.0, i).into_iter().map(|x| x.1).collect();
+            if found.is_empty() {
+                // curved lane (the box corner is not on it): look for a lane start ahead of
+                // the last listed point at the distance the remaining length predicts
+                let listed: f32 = l.pts.windows(2).map(|w| w[0].distance(w[1])).sum();
+                let remaining = (l.len - listed).max(0.0);
+                let fwd = if l.pts.len() >= 2 { (last - l.pts[l.pts.len() - 2]).normalize_or(Vec3::Z) } else { (end - s).normalize_or(Vec3::Z) };
+                let mut best: Option<(f32, usize)> = None;
+                for (_, j) in starts_near(&raw, last, remaining + 12.0, i) {
+                    let q = raw[j].pts[0];
+                    if q.x < l.min.x - 1.5 || q.x > l.max.x + 1.5 || q.z < l.min.z - 1.5 || q.z > l.max.z + 1.5 {
+                        continue;
+                    }
+                    let v = q - last;
+                    let d = v.length();
+                    if d < 0.5 || v.dot(fwd) / d.max(0.01) < 0.3 {
+                        continue;
+                    }
+                    let err = (d - remaining).abs();
+                    if err < 6.0 + remaining * 0.12 && best.map_or(true, |b| err < b.0) {
+                        best = Some((err, j));
+                    }
+                }
+                if let Some((_, j)) = best {
+                    end = raw[j].pts[0];
+                    found = starts_near(&raw, end, 1.0, i).into_iter().map(|x| x.1).collect();
+                    if !found.contains(&j) {
+                        found.push(j);
+                    }
+                }
+            }
+            if found.is_empty() {
+                // no exact continuation: take compatible lane starts close to the end
+                let d0 = (end - last).normalize_or(Vec3::Z);
+                found = starts_near(&raw, end, 7.0, i)
+                    .into_iter()
+                    .filter(|&(_, j)| {
+                        let l2 = &raw[j];
+                        let nd = if l2.pts.len() >= 2 { (l2.pts[1] - l2.pts[0]).normalize_or(d0) } else { d0 };
+                        nd.dot(d0) > 0.2
+                    })
+                    .take(3)
+                    .map(|x| x.1)
+                    .collect();
+            }
+            ends.push(end);
+            succ.push(found);
+        }
+        // 2. split lanes into straight links
+        let mut first = vec![0usize; n];
+        let mut lastl = vec![0usize; n];
+        let mut links: Vec<Link> = Vec::with_capacity(n * 4);
+        for i in 0..n {
+            let l = &mut raw[i];
+            if l.pts.last().map_or(true, |p| p.distance(ends[i]) > 0.05) {
+                l.pts.push(ends[i]);
+            }
+            if l.pts.len() < 2 {
+                l.pts.push(ends[i] + Vec3::new(0.01, 0.0, 0.0));
+            }
+            first[i] = links.len();
+            for w in l.pts.windows(2) {
+                let k = links.len();
+                links.push(Link { a: w[0], b: w[1], len: w[0].distance(w[1]).max(0.01), flags: l.flags, zone: l.zone, lane: i, next: vec![k + 1], prev: Vec::new(), side: Vec::new(), opp: Vec::new(), back: Vec::new(), hop: Vec::new(), hop_a: Vec::new(), node_a: 0, node_b: 0 });
+            }
+            lastl[i] = links.len() - 1;
+        }
+        for i in 0..n {
+            let mut nx: Vec<usize> = succ[i].iter().map(|&j| first[j]).collect();
+            nx.sort_unstable();
+            nx.dedup();
+            links[lastl[i]].next = nx;
+        }
+        for k in 0..links.len() {
+            let nexts = links[k].next.clone();
+            for j in nexts {
+                links[j].prev.push(k);
+            }
+        }
+        for (zi, lanes) in zone_lanes.into_iter().enumerate() {
+            for li in lanes {
+                if li < n {
+                    self.zones[zi].links.extend(first[li]..=lastl[li]);
+                }
+            }
+        }
+        self.grid.clear();
+        for (i, l) in links.iter().enumerate() {
+            let c = cell(l.a);
+            self.grid.entry(c).or_default().push(i);
+            let c2 = cell(l.b);
+            if c2 != c {
+                self.grid.entry(c2).or_default().push(i);
+            }
+        }
+        self.links = links;
+        // lane changes: from the end of a link onto a parallel link of a neighbouring lane
+        let nl = self.links.len();
+        let mut side: Vec<Vec<usize>> = vec![Vec::new(); nl];
+        let mut opp: Vec<Vec<usize>> = vec![Vec::new(); nl];
+        let mut back: Vec<Vec<usize>> = vec![Vec::new(); nl];
+        for (i, l) in self.links.iter().enumerate() {
+            let d = l.dir();
+            for j in self.links_near(l.b, 10.0) {
+                let m = &self.links[j];
+                if j == i || m.lane == l.lane {
+                    continue;
+                }
+                let dot = m.dir().dot(d);
+                if dot.abs() < 0.92 {
+                    continue;
+                }
+                // neighbours of the end point
+                let t = m.project(l.b);
+                let q = m.point_at(t);
+                let lat = xz(q, l.b);
+                if (2.0..6.5).contains(&lat) && (q.y - l.b.y).abs() < 2.0 {
+                    if dot > 0.0 && t < 0.9 {
+                        side[i].push(j);
+                    } else if dot < 0.0 && t > 0.1 {
+                        opp[i].push(j);
+                    }
+                }
+                // neighbours of the start point that run the other way
+                if dot < 0.0 {
+                    let t = m.project(l.a);
+                    let q = m.point_at(t);
+                    let lat = xz(q, l.a);
+                    if (2.0..6.5).contains(&lat) && (q.y - l.a.y).abs() < 2.0 && t < 0.9 {
+                        back[i].push(j);
+                    }
+                }
+            }
+        }
+        for i in 0..nl {
+            self.links[i].side = std::mem::take(&mut side[i]);
+            self.links[i].opp = std::mem::take(&mut opp[i]);
+            self.links[i].back = std::mem::take(&mut back[i]);
+        }
+        // junction hops between lane ends and lane starts (open junction area)
+        {
+            const HOP: f32 = 32.0;
+            let hcell = |p: Vec3| ((p.x / 16.0).floor() as i32, (p.z / 16.0).floor() as i32);
+            let is_start: Vec<bool> = (0..nl).map(|i| i == 0 || self.links[i - 1].lane != self.links[i].lane).collect();
+            let is_end: Vec<bool> = (0..nl).map(|i| i + 1 == nl || self.links[i + 1].lane != self.links[i].lane).collect();
+            let mut sg: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+            for i in 0..nl {
+                if is_start[i] {
+                    sg.entry(hcell(self.links[i].a)).or_default().push(i);
+                }
+            }
+            let near = |p: Vec3, travel: Vec3, me: usize, links: &Vec<Link>| -> Vec<usize> {
+                let (cx, cz) = hcell(p);
+                let mut v: Vec<(f32, usize)> = Vec::new();
+                for dx in -2..=2 {
+                    for dz in -2..=2 {
+                        if let Some(list) = sg.get(&(cx + dx, cz + dz)) {
+                            for &k in list {
+                                let q = links[k].a;
+                                let d = xz(q, p);
+                                if k == me || links[k].lane == links[me].lane || d < 1.2 || d > HOP || (q.y - p.y).abs() > 2.5 {
+                                    continue;
+                                }
+                                // not behind us, and not a lane that heads straight back
+                                if (q - p).dot(travel) < -0.2 * d || links[k].dir().dot(travel) < -0.8 {
+                                    continue;
+                                }
+                                v.push((d, k));
+                            }
+                        }
+                    }
+                }
+                v.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                v.into_iter().take(64).map(|x| x.1).collect()
+            };
+            let mut hop: Vec<Vec<usize>> = vec![Vec::new(); nl];
+            let mut hop_a: Vec<Vec<usize>> = vec![Vec::new(); nl];
+            for i in 0..nl {
+                if is_end[i] {
+                    let l = &self.links[i];
+                    hop[i] = near(l.b, l.dir(), i, &self.links).into_iter().filter(|k| !l.next.contains(k)).collect();
+                }
+                if is_start[i] {
+                    let l = &self.links[i];
+                    hop_a[i] = near(l.a, -l.dir(), i, &self.links);
+                }
+            }
+            for i in 0..nl {
+                self.links[i].hop = std::mem::take(&mut hop[i]);
+                self.links[i].hop_a = std::mem::take(&mut hop_a[i]);
+            }
+        }
+        // endpoint nodes (endpoints within 1.2 m)
+        let pts: Vec<Vec3> = (0..nl * 2).map(|e| if e % 2 == 0 { self.links[e / 2].a } else { self.links[e / 2].b }).collect();
+        let mut parent: Vec<usize> = (0..nl * 2).collect();
+        fn find(p: &mut Vec<usize>, mut x: usize) -> usize {
+            while p[x] != x {
+                p[x] = p[p[x]];
+                x = p[x];
+            }
+            x
+        }
+        let ncell = |p: Vec3| ((p.x / 4.0).floor() as i32, (p.z / 4.0).floor() as i32);
+        let mut ng: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+        for e in 0..nl * 2 {
+            ng.entry(ncell(pts[e])).or_default().push(e);
+        }
+        for e in 0..nl * 2 {
+            let p = pts[e];
+            let (cx, cz) = ncell(p);
+            for dx in -1..=1 {
+                for dz in -1..=1 {
+                    if let Some(list) = ng.get(&(cx + dx, cz + dz)) {
+                        for &f in list {
+                            if f > e && xz(pts[f], p) < 1.2 && (pts[f].y - p.y).abs() < 3.0 {
+                                let (ra, rb) = (find(&mut parent, e), find(&mut parent, f));
+                                if ra != rb {
+                                    parent[ra] = rb;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut ids: HashMap<usize, usize> = HashMap::new();
+        self.starts_at.clear();
+        self.ends_at.clear();
+        for e in 0..nl * 2 {
+            let r = find(&mut parent, e);
+            let next_id = ids.len();
+            let id = *ids.entry(r).or_insert(next_id);
+            if id == self.starts_at.len() {
+                self.starts_at.push(Vec::new());
+                self.ends_at.push(Vec::new());
+            }
+            if e % 2 == 0 {
+                self.links[e / 2].node_a = id;
+                self.starts_at[id].push(e / 2);
+            } else {
+                self.links[e / 2].node_b = id;
+                self.ends_at[id].push(e / 2);
+            }
+        }
+    }
+
+    /// (lanes, links, links with a successor)
+    pub fn stats(&self) -> (usize, usize, usize) {
+        (self.lanes, self.links.len(), self.links.iter().filter(|l| !l.next.is_empty()).count())
+    }
+
+    /// Number of links reachable (forward) from `from`.
+    pub fn reachable(&self, from: usize) -> usize {
+        let mut seen = vec![false; self.links.len()];
+        let mut st = vec![from];
+        seen[from] = true;
+        let mut c = 0;
+        while let Some(u) = st.pop() {
+            c += 1;
+            for &v in &self.links[u].next {
+                if !seen[v] {
+                    seen[v] = true;
+                    st.push(v);
+                }
+            }
+        }
+        c
+    }
+
+    /// Links near a point (grid cells around it).
+    pub fn links_near(&self, p: Vec3, radius: f32) -> impl Iterator<Item = usize> + '_ {
+        let (cx, cz) = cell(p);
+        let r = (radius / GRID).ceil() as i32 + 1;
+        let mut v = Vec::new();
+        for dx in -r..=r {
+            for dz in -r..=r {
+                if let Some(list) = self.grid.get(&(cx + dx, cz + dz)) {
+                    v.extend_from_slice(list);
+                }
+            }
+        }
+        v.sort_unstable();
+        v.dedup();
+        v.into_iter()
+    }
+
+    /// Effective speed limit of a road-owned link, in metres per second.
+    pub fn speed_limit_mps(&self, link: usize) -> Option<f32> {
+        self.links.get(link)?.zone.and_then(|z| self.zones.get(z)).map(Zone::speed_limit_mps)
+    }
+
+    /// Speed of the road under the car. Junctions/off-road return None so cruise
+    /// can retain its previous limit, as sub_822A25E0 does without a road object.
+    /// This proximity lookup substitutes for the original road occupancy system.
+    pub fn speed_limit_at(&self, pos: Vec3) -> Option<f32> {
+        let mut nearest = None;
+        let mut distance = 20.0f32.powi(2);
+        for i in self.links_near(pos, 20.0) {
+            let link = &self.links[i];
+            let q = link.point_at(link.project(pos));
+            // Do not borrow the speed of a freeway above/below a surface road.
+            if (q.y - pos.y).abs() > 4.0 {
+                continue;
+            }
+            let d = q.distance_squared(pos);
+            if d < distance {
+                distance = d;
+                nearest = Some(i);
+            }
+        }
+        nearest.and_then(|i| self.speed_limit_mps(i))
+    }
+
+    /// Nearest link (by distance to the segment) and the parameter along it.
+    pub fn nearest_link(&self, p: Vec3) -> Option<(usize, f32, f32)> {
+        let mut best: Option<(usize, f32, f32)> = None;
+        for i in self.links_near(p, 80.0) {
+            let l = &self.links[i];
+            let t = l.project(p);
+            let q = l.point_at(t);
+            let d = Vec3::new(q.x - p.x, (q.y - p.y) * 0.3, q.z - p.z).length();
+            if best.map_or(true, |b| d < b.2) {
+                best = Some((i, t, d));
+            }
+        }
+        if best.is_none() {
+            // fall back to brute force
+            for (i, l) in self.links.iter().enumerate() {
+                let t = l.project(p);
+                let d = l.point_at(t).distance(p);
+                if best.map_or(true, |b| d < b.2) {
+                    best = Some((i, t, d));
+                }
+            }
+        }
+        best
+    }
+
+    /// Nearest link preferring ones aligned with `heading`.
+    pub fn nearest_link_aligned(&self, p: Vec3, heading: Vec3) -> Option<(usize, f32)> {
+        let mut best: Option<(usize, f32, f32)> = None;
+        for i in self.links_near(p, 80.0) {
+            let l = &self.links[i];
+            let t = l.project(p);
+            let q = l.point_at(t);
+            let d = Vec3::new(q.x - p.x, (q.y - p.y) * 0.3, q.z - p.z).length();
+            let align = l.dir().dot(heading); // -1..1
+            let score = d + (1.0 - align) * 9.0;
+            if best.map_or(true, |b| score < b.2) {
+                best = Some((i, t, score));
+            }
+        }
+        best.map(|(i, t, _)| (i, t))
+    }
+
+    /// Shortest path (by length) from link `from` to any link passing within `radius`
+    /// of `goal` (A* over the directed lane graph). Returns the links, both ends inclusive.
+    pub fn path_to_point(&self, from: usize, goal: Vec3, radius: f32) -> Option<Vec<usize>> {
+        use std::cmp::Ordering;
+        use std::collections::BinaryHeap;
+        #[derive(PartialEq)]
+        struct N(f32, usize);
+        impl Eq for N {}
+        impl Ord for N {
+            fn cmp(&self, o: &Self) -> Ordering {
+                o.0.partial_cmp(&self.0).unwrap_or(Ordering::Equal)
+            }
+        }
+        impl PartialOrd for N {
+            fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+                Some(self.cmp(o))
+            }
+        }
+        let n = self.links.len();
+        let is_goal = |i: usize| {
+            let l = &self.links[i];
+            let q = l.point_at(l.project(goal));
+            xz(q, goal) < radius && (q.y - goal.y).abs() < 8.0
+        };
+        let mut dist = vec![f32::INFINITY; n];
+        let mut prev = vec![usize::MAX; n];
+        let mut heap = BinaryHeap::new();
+        dist[from] = 0.0;
+        heap.push(N(self.links[from].b.distance(goal), from));
+        while let Some(N(_, u)) = heap.pop() {
+            if is_goal(u) {
+                let mut out = vec![u];
+                let mut c = u;
+                while prev[c] != usize::MAX {
+                    c = prev[c];
+                    out.push(c);
+                }
+                out.reverse();
+                return Some(out);
+            }
+            let du = dist[u];
+            for &v in &self.links[u].next {
+                let nd = du + self.links[v].len;
+                if nd < dist[v] {
+                    dist[v] = nd;
+                    prev[v] = u;
+                    heap.push(N(nd + self.links[v].b.distance(goal), v));
+                }
+            }
+            for &v in &self.links[u].side {
+                // a lane change costs the rest of the neighbouring link plus a small penalty
+                let t = self.links[v].project(self.links[u].b);
+                let nd = du + self.links[v].len * (1.0 - t) + 6.0;
+                if nd < dist[v] {
+                    dist[v] = nd;
+                    prev[v] = u;
+                    heap.push(N(nd + self.links[v].b.distance(goal), v));
+                }
+            }
+        }
+        None
+    }
+
+    /// Shortest path between two links.
+    pub fn path(&self, from: usize, to: usize) -> Option<Vec<usize>> {
+        let l = &self.links[to];
+        let mid = (l.a + l.b) * 0.5;
+        let p = self.path_to_point(from, mid, 0.6)?;
+        if p.last() == Some(&to) {
+            Some(p)
+        } else {
+            None
+        }
+    }
+
+    /// Driving route between two world positions as a polyline along the lanes.
+    /// `heading` selects the lane to start on. The polyline ends near `to`.
+    pub fn route_points(&self, from: Vec3, heading: Option<Vec3>, to: Vec3) -> Option<Vec<Vec3>> {
+        // candidate start links: the best aligned one first, then other close lanes
+        let mut starts: Vec<usize> = Vec::new();
+        if let Some(h) = heading {
+            if let Some((l, _)) = self.nearest_link_aligned(from, h) {
+                starts.push(l);
+            }
+        }
+        let mut near: Vec<(f32, usize)> = self
+            .links_near(from, 30.0)
+            .filter_map(|i| {
+                let l = &self.links[i];
+                let q = l.point_at(l.project(from));
+                let d = xz(q, from);
+                if d < 30.0 && (q.y - from.y).abs() < 8.0 {
+                    let pen = heading.map_or(0.0, |h| (1.0 - l.dir().dot(h)) * 12.0);
+                    Some((d + pen, i))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        near.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        for (_, i) in near.into_iter().take(8) {
+            if !starts.contains(&i) {
+                starts.push(i);
+            }
+        }
+        for radius in [9.0f32, 18.0, 32.0] {
+            for &s in &starts {
+                if let Some(p) = self.path_to_point(s, to, radius) {
+                    let mut pts: Vec<Vec3> = Vec::with_capacity(p.len() + 2);
+                    let t0 = self.links[s].project(from);
+                    pts.push(self.links[s].point_at(t0));
+                    for (k, &li) in p.iter().enumerate() {
+                        let l = &self.links[li];
+                        if k + 1 == p.len() {
+                            // stop at the point of the last link closest to the goal
+                            let t = l.project(to);
+                            let t = if p.len() == 1 { t.max(t0) } else { t };
+                            pts.push(l.point_at(t));
+                        } else {
+                            pts.push(l.b);
+                        }
+                    }
+                    return Some(pts);
+                }
+            }
+        }
+        None
+    }
+    /// Race line: the shortest route from `start` (facing `heading`) through all `cps`
+    /// in order, passing within `radius` of each.
+    ///
+    /// Racers are not bound by traffic rules, so the search runs over (link, direction)
+    /// states: lanes may be driven against traffic and oncoming lanes may be crossed, at
+    /// a cost, which keeps the line on the correct side wherever that is not much
+    /// longer. All legs are solved jointly (multi-source Dijkstra per leg over the
+    /// candidate states at each checkpoint). Returns the polyline and the number of legs
+    /// that had no road route (bridged with a straight line).
+    pub fn route_through(&self, start: Vec3, heading: Vec3, cps: &[Vec3], radius: f32) -> (Vec<Vec3>, usize) {
+        use std::cmp::Ordering;
+        use std::collections::BinaryHeap;
+        #[derive(PartialEq)]
+        struct N(f32, usize);
+        impl Eq for N {}
+        impl Ord for N {
+            fn cmp(&self, o: &Self) -> Ordering {
+                o.0.partial_cmp(&self.0).unwrap_or(Ordering::Equal)
+            }
+        }
+        impl PartialOrd for N {
+            fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+                Some(self.cmp(o))
+            }
+        }
+        const TELEPORT: u32 = u32::MAX - 1;
+        const WRONG: f32 = 1.5; // cost factor for driving against traffic
+        let n = self.links.len();
+        let ns = n * 2; // state = link * 2 + (1 if reversed)
+        let mut pts = vec![start];
+        if n == 0 || cps.is_empty() {
+            pts.extend_from_slice(cps);
+            return (pts, cps.len());
+        }
+        let cands_at = |p: Vec3| -> Vec<usize> {
+            let mut v: Vec<usize> = Vec::new();
+            for i in self.links_near(p, radius + 10.0) {
+                let l = &self.links[i];
+                let q = l.point_at(l.project(p));
+                if xz(q, p) < radius && (q.y - p.y).abs() < 8.0 {
+                    v.push(i * 2);
+                    v.push(i * 2 + 1);
+                }
+            }
+            if v.is_empty() {
+                if let Some((i, _, _)) = self.nearest_link(p) {
+                    v.push(i * 2);
+                    v.push(i * 2 + 1);
+                }
+            }
+            v
+        };
+        // start states: lanes around the start, entered in the direction we are facing
+        let mut sources: Vec<(usize, f32)> = Vec::new();
+        {
+            // lanes around the start; when the start is off the lanes (car park, plaza)
+            // widen the search to the closest ones
+            let mut near: Vec<(f32, usize, f32)> = Vec::new();
+            for i in self.links_near(start, 60.0) {
+                let l = &self.links[i];
+                let t = l.project(start);
+                let q = l.point_at(t);
+                let d = xz(q, start);
+                if d < 60.0 && (q.y - start.y).abs() < 6.0 {
+                    near.push((d, i, t));
+                }
+            }
+            let dmin = near.iter().map(|x| x.0).fold(f32::INFINITY, f32::min);
+            let reach = (dmin + 8.0).max(14.0);
+            for (d, i, t) in near {
+                if d > reach {
+                    continue;
+                }
+                let l = &self.links[i];
+                let dot = l.dir().dot(heading);
+                // with traffic
+                sources.push((i * 2, d * 2.0 + (1.0 - dot) * 12.0 + l.len * (1.0 - t)));
+                // against traffic
+                sources.push((i * 2 + 1, d * 2.0 + (1.0 + dot) * 12.0 + 10.0 + l.len * t * WRONG));
+            }
+        }
+        if sources.is_empty() {
+            let s0 = self.nearest_link_aligned(start, heading).map(|x| x.0).or_else(|| self.nearest_link(start).map(|x| x.0)).unwrap_or(0);
+            sources.push((s0 * 2, 0.0));
+        }
+        let first_sources: Vec<usize> = sources.iter().map(|x| x.0).collect();
+        let mut leg_prev: Vec<Vec<u32>> = Vec::with_capacity(cps.len());
+        let mut leg_cands: Vec<Vec<(usize, f32)>> = Vec::with_capacity(cps.len());
+        let mut missing = 0usize;
+        let mut dist = vec![f32::INFINITY; ns];
+        for cp in cps {
+            let cands = cands_at(*cp);
+            let mut is_cand = vec![false; ns];
+            for &c in &cands {
+                is_cand[c] = true;
+            }
+            for d in dist.iter_mut() {
+                *d = f32::INFINITY;
+            }
+            let mut prev = vec![u32::MAX; ns];
+            let mut heap = BinaryHeap::new();
+            for &(st, c) in &sources {
+                if c < dist[st] {
+                    dist[st] = c;
+                    heap.push(N(c, st));
+                }
+            }
+            let mut settled = 0usize;
+            let mut best_c = f32::INFINITY;
+            while let Some(N(d, u)) = heap.pop() {
+                if d > dist[u] {
+                    continue;
+                }
+                if is_cand[u] {
+                    settled += 1;
+                    best_c = best_c.min(d);
+                    if settled >= cands.len() {
+                        break;
+                    }
+                }
+                if d > best_c + 300.0 {
+                    break;
+                }
+                let li = u / 2;
+                let lu = &self.links[li];
+                let mut relax = |v: usize, nd: f32, dist: &mut Vec<f32>, prev: &mut Vec<u32>, heap: &mut BinaryHeap<N>| {
+                    if nd < dist[v] {
+                        dist[v] = nd;
+                        prev[v] = u as u32;
+                        heap.push(N(nd, v));
+                    }
+                };
+                if u % 2 == 0 {
+                    // travelling with traffic, now at lu.b
+                    for &k in &lu.next {
+                        relax(k * 2, d + self.links[k].len, &mut dist, &mut prev, &mut heap);
+                    }
+                    for &k in &self.ends_at[lu.node_b] {
+                        if k != li {
+                            relax(k * 2 + 1, d + self.links[k].len * WRONG + 8.0, &mut dist, &mut prev, &mut heap);
+                        }
+                    }
+                    for &k in &lu.side {
+                        let t = self.links[k].project(lu.b);
+                        relax(k * 2, d + self.links[k].len * (1.0 - t) + 6.0, &mut dist, &mut prev, &mut heap);
+                    }
+                    for &k in &lu.opp {
+                        let t = self.links[k].project(lu.b);
+                        relax(k * 2 + 1, d + self.links[k].len * t * WRONG + 12.0, &mut dist, &mut prev, &mut heap);
+                    }
+                    for &k in &lu.hop {
+                        let gap = self.links[k].a.distance(lu.b);
+                        relax(k * 2, d + gap * 1.7 + 15.0 + self.links[k].len, &mut dist, &mut prev, &mut heap);
+                    }
+                } else {
+                    // travelling against traffic, now at lu.a
+                    for &k in &self.starts_at[lu.node_a] {
+                        if k != li {
+                            relax(k * 2, d + self.links[k].len, &mut dist, &mut prev, &mut heap);
+                        }
+                    }
+                    for &k in &lu.prev {
+                        relax(k * 2 + 1, d + self.links[k].len * WRONG, &mut dist, &mut prev, &mut heap);
+                    }
+                    for &k in &lu.back {
+                        let t = self.links[k].project(lu.a);
+                        relax(k * 2, d + self.links[k].len * (1.0 - t) + 6.0, &mut dist, &mut prev, &mut heap);
+                    }
+                    for &k in &lu.hop_a {
+                        let gap = self.links[k].a.distance(lu.a);
+                        relax(k * 2, d + gap * 1.7 + 15.0 + self.links[k].len, &mut dist, &mut prev, &mut heap);
+                    }
+                }
+            }
+            let mut reached: Vec<(usize, f32)> = cands.iter().filter(|&&c| dist[c].is_finite()).map(|&c| (c, dist[c])).collect();
+            if reached.is_empty() {
+                // unreachable by road: jump to the checkpoint and continue from there
+                missing += 1;
+                let base = sources.iter().map(|x| x.1).fold(f32::INFINITY, f32::min);
+                reached = cands.iter().map(|&c| (c, base + 5000.0)).collect();
+                for &c in &cands {
+                    prev[c] = TELEPORT;
+                }
+            }
+            leg_prev.push(prev);
+            leg_cands.push(reached.clone());
+            sources = reached;
+        }
+        // backtrack from the cheapest final candidate
+        let mut chain: Vec<usize> = Vec::new();
+        let mut cur = sources.iter().min_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).map(|x| x.0).unwrap_or(first_sources[0]);
+        for k in (0..cps.len()).rev() {
+            let prev = &leg_prev[k];
+            let mut seg = vec![cur];
+            let mut guard = 0;
+            while prev[cur] != u32::MAX && prev[cur] != TELEPORT && guard < ns {
+                cur = prev[cur] as usize;
+                seg.push(cur);
+                guard += 1;
+            }
+            if prev[cur] == TELEPORT && k > 0 {
+                cur = leg_cands[k - 1].iter().min_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).map(|x| x.0).unwrap_or(cur);
+                seg.push(cur);
+            }
+            // cur is now the source state of this leg, i.e. a candidate of the previous
+            // leg; that leg emits it, so drop the duplicate here
+            if k > 0 {
+                seg.pop();
+            }
+            chain.extend(seg);
+        }
+        chain.reverse();
+        for (k, &st) in chain.iter().enumerate() {
+            let l = &self.links[st / 2];
+            let (entry, exit) = if st % 2 == 0 { (l.a, l.b) } else { (l.b, l.a) };
+            if k == 0 {
+                let t0 = l.project(start);
+                let q = l.point_at(t0);
+                if q.distance(start) > 1.0 {
+                    pts.push(q);
+                }
+            } else if pts.last().map_or(false, |q| q.distance(entry) > 9.0) {
+                // junction hop: drive to the start of the lane we hop onto
+                pts.push(entry);
+            }
+            if pts.last().map_or(true, |q| q.distance(exit) > 0.5) {
+                pts.push(exit);
+            }
+        }
+        (pts, missing)
+    }
+}
+
+#[cfg(test)]
+mod speed_tests {
+    use super::*;
+
+    fn fixture() -> Resource {
+        let mut data = vec![0u8; 0x700];
+        let put = |d: &mut [u8], o: usize, v: u32| d[o..o + 4].copy_from_slice(&v.to_be_bytes());
+        put(&mut data, 0x2c, 0x50000500);
+        for (i, mph) in [30.0f32, 65.0].into_iter().enumerate() {
+            let road = 0x100 + i * 0xb0;
+            let lane = 0x300 + i * 0x70;
+            let y = i as f32 * 10.0;
+            data[road..road + 4].copy_from_slice(&ZONE_VT.to_le_bytes());
+            put(&mut data, road + 0x94, (mph * 0.44704).to_bits());
+            data[lane..lane + 4].copy_from_slice(&LINK_VT.to_le_bytes());
+            put(&mut data, lane + 8, 0x50000000 + road as u32);
+            put(&mut data, lane + 0xc, 40.0f32.to_bits());
+            put(&mut data, lane + 0x14, y.to_bits());
+            put(&mut data, lane + 0x20, 40.0f32.to_bits());
+            put(&mut data, lane + 0x24, y.to_bits());
+            data[lane + 0x4c..lane + 0x4e].copy_from_slice(&2u16.to_be_bytes());
+            put(&mut data, lane + 0x50, 0x50000600 + (i * 4) as u32);
+            for j in 0..2 {
+                let v = i * 2 + j;
+                data[0x600 + v * 2..0x602 + v * 2].copy_from_slice(&(v as u16).to_be_bytes());
+                put(&mut data, 0x500 + v * 16, (j as f32 * 40.0).to_bits());
+                put(&mut data, 0x504 + v * 16, y.to_bits());
+            }
+        }
+        Resource { rtype: 66, flags: 0, virtual_size: data.len(), physical_size: 0, data }
+    }
+
+    #[test]
+    fn parses_big_endian_road_speeds_and_selects_correct_overpass_level() {
+        let nav = NavSys::parse(&fixture()).unwrap();
+        assert_eq!(nav.zones.len(), 2);
+        for (y, mph) in [(0.5, 30.0), (10.5, 65.0)] {
+            let speed = nav.speed_limit_at(Vec3::new(20.0, y, 0.0)).unwrap();
+            assert!((speed / 0.44704 - mph).abs() < 0.0001);
+        }
+        assert_eq!(nav.speed_limit_at(Vec3::new(20.0, 30.0, 0.0)), None);
+        assert_eq!(nav.speed_limit_at(Vec3::new(20.0, 0.0, 100.0)), None);
+    }
+
+    #[test]
+    fn missing_or_zero_speed_uses_default_but_junction_retains_previous_limit() {
+        let mut res = fixture();
+        res.data[0x194..0x198].fill(0);
+        let mut nav = NavSys::parse(&res).unwrap();
+        let p = Vec3::new(20.0, 0.5, 0.0);
+        assert_eq!(nav.speed_limit_at(p), Some(DEFAULT_ROAD_SPEED));
+        for link in &mut nav.links {
+            link.zone = None;
+        }
+        assert_eq!(nav.speed_limit_at(p), None);
+        assert_eq!(nav.speed_limit_mps(usize::MAX), None);
+        for value in [f32::NAN, f32::INFINITY, -1.0] {
+            assert_eq!(Zone { speed_limit: value, ..Default::default() }.speed_limit_mps(), DEFAULT_ROAD_SPEED);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires CSV from tools/road_speed_reference.py; set MCLA_SPEED_REFERENCE"]
+    fn matches_original_recompiled_accessor_bit_for_bit() {
+        let path = std::env::var("MCLA_SPEED_REFERENCE").expect("set MCLA_SPEED_REFERENCE to the reference CSV");
+        let csv = std::fs::read_to_string(path).unwrap();
+        let mut count = 0;
+        for line in csv.lines().skip(1) {
+            let fields: Vec<_> = line.split(',').collect();
+            let input = f32::from_bits(fields[1].parse().unwrap());
+            let expected: u32 = fields[2].parse().unwrap();
+            let actual = Zone { speed_limit: input, ..Default::default() }.speed_limit_mps();
+            assert_eq!(actual.to_bits(), expected, "road {} input {input}", fields[0]);
+            count += 1;
+        }
+        assert_eq!(count, 1664, "Complete Edition roads plus the default case");
+    }
+
+    #[test]
+    #[ignore = "requires user's extracted Complete Edition data; set MCLA_DATA_DIR"]
+    fn complete_edition_road_speed_census() {
+        let root = std::env::var("MCLA_DATA_DIR").expect("set MCLA_DATA_DIR to extracted/cache");
+        let bytes = std::fs::read(std::path::Path::new(&root).join("resources/city/sc/0x9960fcd8.r66")).unwrap();
+        assert_eq!(&bytes[..4], b"MCLR");
+        let data = bytes[16..].to_vec();
+        let virtual_size = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        let res = Resource { rtype: 66, flags: 0, virtual_size, physical_size: data.len() - virtual_size, data };
+        let nav = NavSys::parse(&res).unwrap();
+        let mut census = std::collections::BTreeMap::new();
+        for zone in &nav.zones {
+            *census.entry((zone.speed_limit_mps() / 0.44704).round() as u32).or_insert(0usize) += 1;
+        }
+        assert_eq!(census.into_iter().collect::<Vec<_>>(), vec![(10, 1), (15, 3), (25, 1), (30, 133), (40, 646), (45, 356), (55, 37), (60, 2), (65, 484)]);
+        assert!(nav.links.iter().enumerate().any(|(i, _)| nav.speed_limit_mps(i).is_some_and(|s| s > 29.0)));
+    }
+}
+
+/// A signalled junction of the road network (file class 0x47a0c4, the game's
+/// `mcRnIntersectionAmbient`): root +58 -> array of 0xc0-byte objects, count at root +c8.
+/// +2c -> the arms' outward unit directions (vec4 each), +30 u16 their number; +3c / +40 the
+/// box's half extents; +80 the centre (y = street level). Layout and use read from the
+/// executable: work/map/signal_rule.md.
+#[derive(Debug, Clone)]
+pub struct NavJunction {
+    pub center: glam::Vec3,
+    pub arms: Vec<glam::Vec3>,
+    pub half: [f32; 2],
+}
+
+/// The junctions that have arms (339 of the 351 in the file).
+pub fn parse_junctions(res: &crate::rsc::Resource) -> Vec<NavJunction> {
+    let rd = super::Rd::new(res);
+    let mut out = Vec::new();
+    let Some(arr) = rd.ptr(0x58) else { return out };
+    let n = (rd.u32(0xc8) as usize).min(4096);
+    for i in 0..n {
+        let o = arr + i * 0xc0;
+        if !rd.has(o, 0xc0) || rd.vtable(o) != 0x0047_a0c4 {
+            continue;
+        }
+        let v = |p: usize| glam::Vec3::new(rd.f32(p), rd.f32(p + 4), rd.f32(p + 8));
+        let count = rd.u16(o + 0x30) as usize;
+        let Some(dirs) = rd.ptr(o + 0x2c) else { continue };
+        let arms: Vec<glam::Vec3> = (0..count.min(16)).map(|k| v(dirs + k * 16)).filter(|d| d.is_finite() && d.length_squared() > 0.25).collect();
+        let center = v(o + 0x80);
+        if arms.is_empty() || !center.is_finite() {
+            continue;
+        }
+        out.push(NavJunction { center, arms, half: [rd.f32(o + 0x3c), rd.f32(o + 0x40)] });
+    }
+    out
+}

@@ -1,0 +1,792 @@
+//! Port-only hooks for the launcher (docs/LAUNCHER.md, "Changes needed in the game"). Nothing here touches gameplay:
+//! the data folder, `settings.toml` (display, intro), the rolling log and the crash report, the screenshot key.
+//!
+//! - Settings: `mcla_config::Settings`, read once by [`init`] from `--settings <file>`, `MCLA_SETTINGS` or
+//!   `%LOCALAPPDATA%\RustyMCLA\settings.toml`. Command-line flags win over the file. A headless `--screenshot` run
+//!   ignores the user's file (so captures stay repeatable) unless a settings file is named explicitly.
+//! - Log: every record goes to stderr as before and, for a normal run, also to `logs/game-<yyyymmdd-hhmmss>.log` (the
+//!   newest 10 are kept). Headless `--screenshot` runs and the developer self-tests write no log file (stderr only).
+//! - Crash: a panic writes `logs/crash-<time>.txt` (message, place, backtrace, adapter, settings, the last 50 log lines);
+//!   a panic on the main thread then ends the process with exit code 101. A worker thread's panic is reported the same
+//!   way but the game goes on as it always did. A clean exit is 0.
+//! - F12: `App::screenshot_key` saves the next frame as a PNG in the screenshots folder.
+
+use crate::App;
+use mcla_config::paths::{self, DataDir, DataInputs, DataSource};
+use mcla_config::{Intro, Settings, Status, WindowMode};
+use std::collections::VecDeque;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+/// How many game logs and crash reports are kept.
+const KEEP: usize = 10;
+/// How many log lines a crash report carries.
+const TAIL_LINES: usize = 50;
+/// The developer's old extraction folder, used only when nothing next to the exe exists.
+/// TODO-remove-before-release (docs/LAUNCHER.md, open list): a player's machine has no such folder; delete this and its test.
+const DEV_DATA_FALLBACK: &str = "D:/MCLA/extracted/cache";
+
+pub struct Runtime {
+    pub settings: Settings,
+    pub settings_path: PathBuf,
+    pub settings_status: Status,
+    /// the file is not in effect: a headless run without `--settings` uses the defaults
+    pub settings_ignored: bool,
+    pub data: DataDir,
+    pub screenshots: PathBuf,
+    pub shot_run: bool,
+}
+
+static RT: OnceLock<Runtime> = OnceLock::new();
+
+pub fn get() -> Option<&'static Runtime> {
+    RT.get()
+}
+
+/// The data folder, the settings and the screenshots folder for this run. The first call wins (later calls, as in the
+/// option unit tests, get the same answer). `data_flag` is `--data <dir>` or a bare folder argument.
+pub fn init(data_flag: Option<&str>, settings_flag: Option<&str>, shot_run: bool) -> &'static Runtime {
+    RT.get_or_init(|| {
+        let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_else(|| PathBuf::from("."));
+        let explicit = settings_flag.is_some_and(|f| !f.is_empty()) || std::env::var_os("MCLA_SETTINGS").is_some_and(|v| !v.is_empty());
+        let settings_path = paths::settings_path(settings_flag);
+        let (settings, settings_status, settings_ignored) = if shot_run && !explicit {
+            // (what captures always did: no vertical sync, the old window)
+            let mut s = Settings::default();
+            s.display.vsync = false;
+            (s, Status::Missing, true)
+        } else {
+            let l = Settings::load(&settings_path);
+            (l.settings, l.status, false)
+        };
+        let env_data = std::env::var("MCLA_DATA").ok();
+        let data = paths::resolve_data_dir(&DataInputs {
+            flag: data_flag,
+            env: env_data.as_deref(),
+            settings: &settings.paths.data_dir,
+            exe_dir: &exe_dir,
+            dev_fallback: Some(Path::new(DEV_DATA_FALLBACK)),
+        });
+        match data.source {
+            DataSource::NotFound => log::error!("data folder not found (looked at {}); run the launcher to build it, or pass --data <folder>", data.path.display()),
+            DataSource::DevFallback => log::warn!("data folder: using the developer fallback {} (TODO-remove-before-release)", data.path.display()),
+            s => log::info!("data folder: {} ({:?})", data.path.display(), s),
+        }
+        let screenshots = paths::screenshots_dir(&settings.paths.screenshots, &exe_dir);
+        Runtime { settings, settings_path, settings_status, settings_ignored, data, screenshots, shot_run }
+    })
+}
+
+/// The intro setting (`game.intro`); `normal` when settings were never loaded.
+pub fn intro_mode() -> Intro {
+    get().map_or(Intro::Normal, |r| r.settings.game.intro)
+}
+
+/// The new-career arrival: the opening film plays (`normal` only), and the arrival scene (`normal`, `fast`).
+/// `skip` is the same as pressing ENTER through both, before they start.
+pub fn intro_film() -> bool {
+    intro_mode() == Intro::Normal
+}
+
+pub fn intro_scene() -> bool {
+    intro_mode() != Intro::Skip
+}
+
+// ---------------------------------------------------------------- logging
+
+#[derive(Default)]
+struct LogState {
+    file: Option<std::fs::File>,
+    /// everything logged before the file was opened, written to it when it is
+    pre: Vec<u8>,
+    tail: VecDeque<String>,
+    partial: String,
+    path: Option<PathBuf>,
+}
+
+static LOG: Mutex<LogState> = Mutex::new(LogState { file: None, pre: Vec::new(), tail: VecDeque::new(), partial: String::new(), path: None });
+
+/// The writer env_logger is given: stderr as before, plus the file once [`start_file_log`] has opened it.
+struct Tee;
+
+impl Write for Tee {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let _ = std::io::stderr().write_all(buf);
+        if let Ok(mut st) = LOG.lock() {
+            let text = String::from_utf8_lossy(buf);
+            st.partial.push_str(&text);
+            while let Some(i) = st.partial.find('\n') {
+                let line: String = st.partial.drain(..=i).collect();
+                st.tail.push_back(line.trim_end().to_string());
+                if st.tail.len() > TAIL_LINES {
+                    st.tail.pop_front();
+                }
+            }
+            if st.file.is_some() {
+                if let Some(f) = st.file.as_mut() {
+                    let _ = f.write_all(buf);
+                }
+            } else if st.pre.len() < 1 << 20 {
+                st.pre.extend_from_slice(buf);
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn init_logging() {
+    let env = env_logger::Env::default().default_filter_or("info,wgpu_core=warn,wgpu_hal=warn,naga=warn");
+    let _ = env_logger::Builder::from_env(env).target(env_logger::Target::Pipe(Box::new(Tee))).try_init();
+}
+
+pub fn timestamp() -> String {
+    chrono::Local::now().format("%Y%m%d-%H%M%S").to_string()
+}
+
+/// Delete the oldest `<prefix>*<ext>` files of a folder until `keep` are left (names carry a sortable time).
+pub fn prune(dir: &Path, prefix: &str, ext: &str, keep: usize) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut names: Vec<String> = rd.flatten().filter_map(|e| e.file_name().into_string().ok()).filter(|n| n.starts_with(prefix) && n.ends_with(ext)).collect();
+    names.sort();
+    let extra = names.len().saturating_sub(keep);
+    for n in names.into_iter().take(extra) {
+        let _ = std::fs::remove_file(dir.join(n));
+    }
+}
+
+fn windows_version() -> String {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        if let Ok(o) = std::process::Command::new("cmd").args(["/C", "ver"]).creation_flags(0x0800_0000).output() {
+            let t = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if !t.is_empty() {
+                return t;
+            }
+        }
+    }
+    String::new()
+}
+
+/// Open `logs/game-<time>.log`, write the header, then everything logged so far. Called once, for a normal run only.
+pub fn start_file_log() {
+    let Some(rt) = get() else { return };
+    if rt.shot_run {
+        return;
+    }
+    let dir = paths::logs_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        log::warn!("log: cannot create {}", dir.display());
+        return;
+    }
+    prune(&dir, "game-", ".log", KEEP - 1);
+    let mut path = dir.join(format!("game-{}.log", timestamp()));
+    let mut n = 1;
+    while path.exists() {
+        n += 1;
+        path = dir.join(format!("game-{}-{n}.log", timestamp()));
+    }
+    let Ok(mut f) = std::fs::File::create(&path) else {
+        log::warn!("log: cannot create {}", path.display());
+        return;
+    };
+    let _ = f.write_all(header(rt, &path).as_bytes());
+    if let Ok(mut st) = LOG.lock() {
+        let pre = std::mem::take(&mut st.pre);
+        let _ = f.write_all(&pre);
+        st.file = Some(f);
+        st.path = Some(path.clone());
+    }
+    log::info!("log file: {}", path.display());
+}
+
+fn header(rt: &Runtime, log_path: &Path) -> String {
+    let save = crate::game::savedir::get().map_or_else(|| "(beside the data)".to_string(), |p| p.display().to_string());
+    let settings = if rt.settings_ignored {
+        "defaults (headless run, no --settings)".to_string()
+    } else {
+        format!("{} ({:?})", rt.settings_path.display(), rt.settings_status)
+    };
+    format!(
+        "Rusty MCLA game log\nversion:     {}\nstarted:     {}\nos:          {} {} {}\nexe:         {}\nargs:        {}\nlog:         {}\nsettings:    {}\nin effect:   {}\ndata:        {} ({:?})\nsave:        {}\nscreenshots: {}\ngpu:         (logged as \"adapter:\" once the window exists)\n----\n",
+        env!("CARGO_PKG_VERSION"),
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S %z"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        windows_version(),
+        std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default(),
+        std::env::args().skip(1).collect::<Vec<_>>().join(" "),
+        log_path.display(),
+        settings,
+        rt.settings.summary(),
+        rt.data.path.display(),
+        rt.data.source,
+        save,
+        rt.screenshots.display(),
+    )
+}
+
+static ADAPTER: Mutex<String> = Mutex::new(String::new());
+
+/// Called by `Gpu::new` with the adapter wgpu chose.
+pub fn set_adapter(info: &wgpu::AdapterInfo) {
+    let line = format!("{} (backend {:?}, {:?}, driver {} {}, vendor 0x{:04x} device 0x{:04x})", info.name, info.backend, info.device_type, info.driver, info.driver_info, info.vendor, info.device);
+    log::info!("adapter: {line}");
+    if let Ok(mut a) = ADAPTER.lock() {
+        *a = line;
+    }
+}
+
+// ---------------------------------------------------------------- entry, panic hook
+
+static MAIN_THREAD: OnceLock<std::thread::ThreadId> = OnceLock::new();
+
+/// Runs the game: logging, the panic hook, the exit code (0 normal, 1 an error was returned, 101 a panic).
+pub fn run(game: fn() -> anyhow::Result<()>) -> std::process::ExitCode {
+    let _ = MAIN_THREAD.set(std::thread::current().id());
+    init_logging();
+    std::panic::set_hook(Box::new(panic_hook));
+    match game() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            log::error!("fatal: {e:#}");
+            std::process::ExitCode::from(1)
+        }
+    }
+}
+
+fn panic_hook(info: &std::panic::PanicHookInfo<'_>) {
+    let thread = std::thread::current();
+    let name = thread.name().unwrap_or("unnamed").to_string();
+    let on_main = MAIN_THREAD.get() == Some(&thread.id());
+    let msg = info.payload().downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| info.payload().downcast_ref::<String>().cloned()).unwrap_or_else(|| "(no message)".into());
+    let place = info.location().map_or_else(|| "(unknown place)".to_string(), |l| format!("{}:{}:{}", l.file(), l.line(), l.column()));
+    let bt = std::backtrace::Backtrace::force_capture().to_string();
+    let report = crash_report(&name, &msg, &place, &trim_backtrace(&bt));
+    eprintln!("panic in thread '{name}': {msg}\n  at {place}");
+    let rt = get();
+    match rt.filter(|r| !r.shot_run) {
+        Some(_) => {
+            let dir = paths::logs_dir();
+            let _ = std::fs::create_dir_all(&dir);
+            prune(&dir, "crash-", ".txt", KEEP - 1);
+            let mut path = dir.join(format!("crash-{}.txt", timestamp()));
+            let mut n = 1;
+            while path.exists() {
+                n += 1;
+                path = dir.join(format!("crash-{}-{n}.txt", timestamp()));
+            }
+            match std::fs::write(&path, &report) {
+                Ok(()) => eprintln!("crash report: {}", path.display()),
+                Err(e) => eprintln!("crash report not written ({}): {e}", path.display()),
+            }
+        }
+        None => eprintln!("{report}"),
+    }
+    if on_main {
+        std::process::exit(101);
+    }
+}
+
+/// Drop the frames of the panic machinery (the hook, std's panic code) from the top of a backtrace.
+fn trim_backtrace(bt: &str) -> String {
+    let lines: Vec<&str> = bt.lines().collect();
+    match lines.iter().position(|l| l.contains("rust_begin_unwind")) {
+        Some(i) => lines[(i + 2).min(lines.len())..].join("
+"),
+        None => bt.to_string(),
+    }
+}
+
+fn crash_report(thread: &str, msg: &str, place: &str, backtrace: &str) -> String {
+    let rt = get();
+    let tail: Vec<String> = LOG.try_lock().map(|st| st.tail.iter().cloned().collect()).unwrap_or_default();
+    let adapter = ADAPTER.try_lock().map(|a| a.clone()).unwrap_or_default();
+    format!(
+        "Rusty MCLA crash report\nversion:   {}\ntime:      {}\nos:        {} {} {}\nthread:    {}\nmessage:   {}\nplace:     {}\nadapter:   {}\nsettings:  {}\ndata:      {}\nargs:      {}\n\n---- backtrace ----\n{}\n\n---- last {} log lines ----\n{}\n",
+        env!("CARGO_PKG_VERSION"),
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S %z"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        windows_version(),
+        thread,
+        msg,
+        place,
+        if adapter.is_empty() { "(not created yet)" } else { &adapter },
+        rt.map_or_else(|| "(not loaded)".to_string(), |r| format!("{} [{}]", r.settings_path.display(), r.settings.summary())),
+        rt.map_or_else(String::new, |r| r.data.path.display().to_string()),
+        std::env::args().skip(1).collect::<Vec<_>>().join(" "),
+        backtrace,
+        TAIL_LINES,
+        tail.join("\n"),
+    )
+}
+
+// ---------------------------------------------------------------- display
+
+/// Vertical sync: `display.vsync` (the auto modes pick what the surface supports).
+pub fn present_mode() -> wgpu::PresentMode {
+    let vsync = get().map_or(false, |r| r.settings.display.vsync);
+    let m = if vsync { wgpu::PresentMode::AutoVsync } else { wgpu::PresentMode::AutoNoVsync };
+    log::info!("present mode: {m:?} (vsync {vsync})");
+    m
+}
+
+/// The launcher's monitor numbering (`display.monitor`): 0 = the primary monitor, then the others in the order the system
+/// lists them (winit and the launcher's Tauri both ask Windows' `EnumDisplayMonitors`). `primary` = its place in `all`;
+/// none = the first one counts as primary.
+pub fn monitor_order(count: usize, primary: Option<usize>) -> Vec<usize> {
+    let p = primary.filter(|p| *p < count).unwrap_or(0);
+    if count == 0 {
+        return Vec::new();
+    }
+    std::iter::once(p).chain((0..count).filter(|i| *i != p)).collect()
+}
+
+/// The monitor of `display.monitor`; an index that is not there (a monitor unplugged) falls back to the primary one with a
+/// warning. None only when the system lists no monitor at all.
+pub fn chosen_monitor(event_loop: &winit::event_loop::ActiveEventLoop, index: u32) -> Option<winit::monitor::MonitorHandle> {
+    let all: Vec<_> = event_loop.available_monitors().collect();
+    let primary = event_loop.primary_monitor();
+    let order = monitor_order(all.len(), primary.as_ref().and_then(|p| all.iter().position(|m| m == p)));
+    let name = |m: &winit::monitor::MonitorHandle| format!("{} ({}x{} at {},{})", m.name().unwrap_or_default(), m.size().width, m.size().height, m.position().x, m.position().y);
+    match order.get(index as usize) {
+        Some(&i) => {
+            log::info!("monitor: display.monitor = {index} -> {} of {} ({})", name(&all[i]), all.len(), if index == 0 { "primary" } else { "listed" });
+            Some(all[i].clone())
+        }
+        None => {
+            let m = primary.or_else(|| all.first().cloned());
+            log::warn!("monitor: display.monitor = {index} but only {} monitor(s) are connected; the primary one is used: {}", all.len(), m.as_ref().map_or_else(|| "none".to_string(), name));
+            m
+        }
+    }
+}
+
+/// Fullscreen on a monitor: the exclusive video mode of `res` (highest refresh, then bit depth), else borderless with a
+/// warning.
+fn fullscreen_on(monitor: Option<winit::monitor::MonitorHandle>, res: mcla_config::Resolution) -> winit::window::Fullscreen {
+    use winit::window::Fullscreen;
+    let want = winit::dpi::PhysicalSize::new(res.w, res.h);
+    let mode = monitor.as_ref().and_then(|m| m.video_modes().filter(|v| v.size() == want).max_by_key(|v| (v.refresh_rate_millihertz(), v.bit_depth())));
+    match mode {
+        Some(v) => {
+            log::info!("fullscreen: video mode {}x{} @ {} mHz, {} bit", v.size().width, v.size().height, v.refresh_rate_millihertz(), v.bit_depth());
+            Fullscreen::Exclusive(v)
+        }
+        None => {
+            log::warn!("fullscreen: the monitor has no {} video mode; borderless fullscreen instead", res.text());
+            Fullscreen::Borderless(monitor)
+        }
+    }
+}
+
+/// The window's size, mode and monitor from `display.window_mode` / `display.resolution` / `display.monitor`. A headless
+/// run without `--settings` keeps the old 1600 x 900 logical window. In borderless and fullscreen the monitor decides the
+/// size; fullscreen ("exclusive") asks for a video mode of the resolution on the chosen monitor and falls back to
+/// borderless. Windowed on monitor 0 is placed by the system, as before; on another monitor it is centred on it.
+pub fn window_attributes(event_loop: &winit::event_loop::ActiveEventLoop, attrs: winit::window::WindowAttributes) -> winit::window::WindowAttributes {
+    use winit::window::Fullscreen;
+    let Some(rt) = get().filter(|r| !r.settings_ignored) else {
+        set_mode(WindowMode::Windowed);
+        return attrs;
+    };
+    let d = &rt.settings.display;
+    set_mode(d.window_mode);
+    let attrs = attrs.with_inner_size(winit::dpi::PhysicalSize::new(d.resolution.w, d.resolution.h));
+    let monitor = chosen_monitor(event_loop, d.monitor);
+    match d.window_mode {
+        WindowMode::Windowed => match monitor.filter(|_| d.monitor != 0) {
+            Some(m) => {
+                let (mp, ms) = (m.position(), m.size());
+                let x = mp.x + (ms.width as i32 - d.resolution.w as i32).max(0) / 2;
+                let y = mp.y + (ms.height as i32 - d.resolution.h as i32).max(0) / 2;
+                attrs.with_position(winit::dpi::PhysicalPosition::new(x, y))
+            }
+            None => attrs,
+        },
+        WindowMode::Borderless => attrs.with_fullscreen(Some(Fullscreen::Borderless(monitor))),
+        WindowMode::Fullscreen => attrs.with_fullscreen(Some(fullscreen_on(monitor, d.resolution))),
+    }
+}
+
+// ---------------------------------------------------------------- Alt+Enter: window mode
+
+/// The window mode in effect (what was asked for; a fullscreen that fell back to borderless still counts as fullscreen,
+/// so the next Alt+Enter goes on to windowed).
+static MODE: Mutex<Option<WindowMode>> = Mutex::new(None);
+/// The windowed size before leaving windowed, given back on the way back.
+static WINDOWED_SIZE: Mutex<Option<winit::dpi::PhysicalSize<u32>>> = Mutex::new(None);
+/// Alt is held (winit's `ModifiersChanged`).
+static ALT: AtomicBool = AtomicBool::new(false);
+
+fn set_mode(m: WindowMode) {
+    if let Ok(mut g) = MODE.lock() {
+        *g = Some(m);
+    }
+}
+
+pub fn window_mode() -> WindowMode {
+    MODE.lock().ok().and_then(|g| *g).unwrap_or(WindowMode::Windowed)
+}
+
+/// The window's `ModifiersChanged`.
+pub fn set_alt(down: bool) {
+    ALT.store(down, Ordering::Relaxed);
+}
+
+/// What a key event means for Alt+Enter (`mcla_config::keybinds::alt_enter`, either Enter, either Alt): `Some(true)` =
+/// cycle the window mode, `Some(false)` = Alt+Enter again (key repeat, a synthetic press, the release): swallowed, nothing
+/// else hears it; `None` = not Alt+Enter.
+pub fn alt_enter_event(alt: bool, code: winit::keyboard::KeyCode, pressed: bool, repeat: bool, synthetic: bool) -> Option<bool> {
+    let key = crate::keybinds::to_key(code)?;
+    if !mcla_config::keybinds::alt_enter(alt, key) {
+        return None;
+    }
+    Some(pressed && !repeat && !synthetic)
+}
+
+/// Put a window into a mode at once (Alt+Enter). Fullscreen uses the window's current monitor and `display.resolution`.
+pub fn apply_window_mode(window: &winit::window::Window, from: WindowMode, to: WindowMode) {
+    use winit::window::Fullscreen;
+    if from == WindowMode::Windowed {
+        if let Ok(mut s) = WINDOWED_SIZE.lock() {
+            *s = Some(window.inner_size());
+        }
+    }
+    let res = get().filter(|r| !r.settings_ignored).map_or(mcla_config::Settings::default().display.resolution, |r| r.settings.display.resolution);
+    match to {
+        WindowMode::Windowed => {
+            window.set_fullscreen(None);
+            if let Some(s) = WINDOWED_SIZE.lock().ok().and_then(|g| *g) {
+                let _ = window.request_inner_size(s);
+            }
+        }
+        WindowMode::Borderless => window.set_fullscreen(Some(Fullscreen::Borderless(window.current_monitor()))),
+        WindowMode::Fullscreen => window.set_fullscreen(Some(fullscreen_on(window.current_monitor().or_else(|| window.primary_monitor()), res))),
+    }
+}
+
+/// Write the new window mode into `settings.toml`: only that key (`mcla_config::set_key`, atomic). Not in a headless run
+/// that ignores the user's file, and never over a file that is not valid TOML.
+pub fn write_window_mode(m: WindowMode) -> Result<PathBuf, String> {
+    let rt = get().ok_or("no settings")?;
+    if rt.settings_ignored {
+        return Err("headless run without --settings: the user's settings file is not touched".into());
+    }
+    mcla_config::set_key(&rt.settings_path, "display", "window_mode", mcla_config::toml::Value::String(m.word().into())).map_err(|e| e.to_string())?;
+    Ok(rt.settings_path.clone())
+}
+
+impl App {
+    /// A key event of the window, before anything else hears it: true = Alt+Enter took it.
+    pub(crate) fn alt_enter_key(&mut self, code: winit::keyboard::KeyCode, pressed: bool, repeat: bool, synthetic: bool) -> bool {
+        match alt_enter_event(ALT.load(Ordering::Relaxed), code, pressed, repeat, synthetic) {
+            None => false,
+            Some(false) => true,
+            Some(true) => {
+                self.cycle_window_mode();
+                true
+            }
+        }
+    }
+
+    /// Alt+Enter: windowed -> borderless -> fullscreen -> windowed, at once, and written back to `settings.toml`.
+    pub(crate) fn cycle_window_mode(&mut self) {
+        let from = window_mode();
+        let to = from.next();
+        if let Some(w) = self.window.as_ref() {
+            apply_window_mode(w, from, to);
+        }
+        set_mode(to);
+        match write_window_mode(to) {
+            Ok(p) => log::info!("Alt+Enter: window mode {} -> {} (written to {})", from.word(), to.word(), p.display()),
+            Err(e) => log::warn!("Alt+Enter: window mode {} -> {}; not written: {e}", from.word(), to.word()),
+        }
+        if let Some(w) = self.window.as_ref() {
+            log_window(w);
+        }
+    }
+}
+
+/// One log line about the window that was made.
+pub fn log_window(window: &winit::window::Window) {
+    let s = window.inner_size();
+    log::info!(
+        "window: inner {}x{} px, scale {:.2}, fullscreen {}, monitor {:?}",
+        s.width,
+        s.height,
+        window.scale_factor(),
+        match window.fullscreen() {
+            None => "no".to_string(),
+            Some(winit::window::Fullscreen::Borderless(_)) => "borderless".to_string(),
+            Some(winit::window::Fullscreen::Exclusive(v)) => format!("exclusive {}x{}", v.size().width, v.size().height),
+        },
+        window.current_monitor().and_then(|m| m.name())
+    );
+}
+
+// ---------------------------------------------------------------- frame limiter
+
+static LAST_FRAME: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// How long to wait so frames start at least `period` apart.
+pub fn frame_wait(last: Instant, now: Instant, period: Duration) -> Duration {
+    (last + period).saturating_duration_since(now)
+}
+
+/// Called after every rendered frame: sleeps (the last millisecond spins) to hold `display.fps_cap`.
+pub fn limit_frame() {
+    let cap = get().map_or(0, |r| r.settings.display.fps_cap);
+    if cap == 0 {
+        return;
+    }
+    let period = Duration::from_secs_f64(1.0 / cap as f64);
+    let Ok(mut last) = LAST_FRAME.lock() else { return };
+    let now = Instant::now();
+    let Some(prev) = *last else {
+        *last = Some(now);
+        return;
+    };
+    let wait = frame_wait(prev, now, period);
+    if wait.is_zero() {
+        // (late: no catching up with a burst)
+        *last = Some(now);
+        return;
+    }
+    let target = now + wait;
+    if wait > Duration::from_millis(2) {
+        std::thread::sleep(wait - Duration::from_millis(2));
+    }
+    while Instant::now() < target {
+        std::hint::spin_loop();
+    }
+    *last = Some(target);
+}
+
+// ---------------------------------------------------------------- screenshot key, test hooks
+
+/// The file F12 asked for, until it has been written.
+static SHOT_PENDING: Mutex<Option<(PathBuf, u32)>> = Mutex::new(None);
+static TEST_PANIC_DONE: AtomicBool = AtomicBool::new(false);
+
+/// `game-<time>.png`, with `-2`, `-3` ... when that name is taken (two presses in one second).
+pub fn screenshot_name(dir: &Path, stamp: &str) -> PathBuf {
+    let mut p = dir.join(format!("game-{stamp}.png"));
+    let mut n = 1;
+    while p.exists() {
+        n += 1;
+        p = dir.join(format!("game-{stamp}-{n}.png"));
+    }
+    p
+}
+
+impl App {
+    /// F12: the next frame goes to a PNG in the screenshots folder (the photo mode's capture path).
+    pub(crate) fn screenshot_key(&mut self) {
+        if self.photo_request.is_some() {
+            return;
+        }
+        let dir = get().map_or_else(|| PathBuf::from("screenshots"), |r| r.screenshots.clone());
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            log::warn!("screenshot: cannot create {}: {e}", dir.display());
+            self.game.show_message("SCREENSHOT FAILED");
+            return;
+        }
+        let path = screenshot_name(&dir, &timestamp());
+        self.photo_request = Some(path.to_string_lossy().into_owned());
+        if let Ok(mut p) = SHOT_PENDING.lock() {
+            *p = Some((path, 0));
+        }
+    }
+
+    /// After every rendered frame: the screenshot key's confirmation, the frame limiter, the test hooks.
+    pub(crate) fn after_frame(&mut self) {
+        let pending = SHOT_PENDING.lock().ok().and_then(|mut p| match p.take() {
+            Some((path, n)) if path.exists() => Some((path, n, true)),
+            Some((path, n)) if n < 120 => {
+                *p = Some((path, n + 1));
+                None
+            }
+            Some((path, _)) => Some((path, 0, false)),
+            None => None,
+        });
+        if let Some((path, _, done)) = pending {
+            if done {
+                let (w, h) = std::fs::File::open(&path).ok().and_then(|f| png::Decoder::new(std::io::BufReader::new(f)).read_info().ok()).map_or((0, 0), |r| (r.info().width, r.info().height));
+                log::info!("screenshot key: saved {} ({}x{})", path.display(), w, h);
+                if self.photo.is_none() {
+                    self.game.show_message("SCREENSHOT SAVED");
+                }
+            } else {
+                log::warn!("screenshot key: {} was not written", path.display());
+            }
+        }
+        limit_frame();
+        // (test hooks: MCLA_SHOT_KEY_TEST=<frame> presses F12 at that frame; MCLA_TEST_PANIC=main|thread panics
+        // at frame 30, in the main thread or in a worker; =quit leaves normally (exit code 0) - they exist only to check
+        // the screenshot key, the crash report and the exit codes)
+        if let Some(n) = std::env::var("MCLA_SHOT_KEY_TEST").ok().and_then(|v| v.parse::<u64>().ok()) {
+            if self.frame_no as u64 == n {
+                self.screenshot_key();
+            }
+        }
+        // (MCLA_ALT_ENTER_TEST=<frame>[,<frame>...]: at each frame the key sequence Alt down, Enter, Enter (repeat), Enter up,
+        // Alt up, Enter (no Alt) goes through the window handler's own decision (`alt_enter_key`); 30 frames later the window
+        // is logged - it exists only to check Alt+Enter headlessly)
+        if let Ok(v) = std::env::var("MCLA_ALT_ENTER_TEST") {
+            let frames: Vec<u64> = v.split(',').filter_map(|f| f.trim().parse().ok()).collect();
+            let n = self.frame_no as u64;
+            if frames.contains(&n) {
+                use winit::keyboard::KeyCode;
+                set_alt(true);
+                let a = self.alt_enter_key(KeyCode::Enter, true, false, false);
+                let b = self.alt_enter_key(KeyCode::Enter, true, true, false);
+                let c = self.alt_enter_key(KeyCode::Enter, false, false, false);
+                set_alt(false);
+                let d = self.alt_enter_key(KeyCode::Enter, true, false, false);
+                log::info!("alt-enter test at frame {n}: press {a}, repeat {b}, release {c} (taken = true); plain Enter {d} (false = passed on); mode now {}", window_mode().word());
+            }
+            if frames.iter().any(|f| f + 30 == n) {
+                if let Some(w) = self.window.as_ref() {
+                    log::info!("alt-enter test: 30 frames later, mode {}", window_mode().word());
+                    log_window(w);
+                }
+            }
+        }
+        if self.frame_no == 30 && !TEST_PANIC_DONE.swap(true, Ordering::Relaxed) {
+            match std::env::var("MCLA_TEST_PANIC").as_deref() {
+                Ok("thread") => {
+                    let _ = std::thread::Builder::new().name("test-worker".into()).spawn(|| panic!("MCLA_TEST_PANIC in a worker thread")).map(|h| h.join());
+                }
+                Ok("quit") => self.quit = true,
+                Ok(_) => panic!("MCLA_TEST_PANIC"),
+                Err(_) => {}
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("mcla-hooks-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn frame_wait_holds_the_period() {
+        let t0 = Instant::now();
+        let p = Duration::from_secs_f64(1.0 / 60.0);
+        // 60 fps = 16.667 ms; a frame that took 5 ms waits 11.667 ms
+        let w = frame_wait(t0, t0 + Duration::from_millis(5), p);
+        assert_eq!(w.as_micros(), 11_666);
+        assert_eq!(frame_wait(t0, t0 + Duration::from_millis(17), p), Duration::ZERO);
+        // 144 fps = 6.944 ms
+        let p = Duration::from_secs_f64(1.0 / 144.0);
+        assert_eq!(frame_wait(t0, t0, p).as_micros(), 6_944);
+    }
+
+    #[test]
+    fn old_logs_are_pruned_oldest_first() {
+        let d = tmp("prune");
+        for i in 0..14 {
+            std::fs::write(d.join(format!("game-20260101-0000{:02}.log", i)), "x").unwrap();
+        }
+        std::fs::write(d.join("crash-20260101-000000.txt"), "x").unwrap();
+        std::fs::write(d.join("launcher-20260101-000000.log"), "x").unwrap();
+        prune(&d, "game-", ".log", 9);
+        let mut left: Vec<String> = std::fs::read_dir(&d).unwrap().flatten().map(|e| e.file_name().into_string().unwrap()).filter(|n| n.starts_with("game-")).collect();
+        left.sort();
+        assert_eq!(left.len(), 9);
+        assert_eq!(left[0], "game-20260101-000005.log", "the five oldest went");
+        assert!(d.join("crash-20260101-000000.txt").exists() && d.join("launcher-20260101-000000.log").exists(), "other files are not touched");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// `display.monitor`: 0 is the primary wherever the system lists it, then the others in the system's order.
+    #[test]
+    fn monitor_numbering() {
+        assert_eq!(monitor_order(1, Some(0)), vec![0]);
+        assert_eq!(monitor_order(3, Some(0)), vec![0, 1, 2]);
+        assert_eq!(monitor_order(3, Some(1)), vec![1, 0, 2]);
+        assert_eq!(monitor_order(3, Some(2)), vec![2, 0, 1]);
+        // (no primary reported, or one that is not in the list: the first counts)
+        assert_eq!(monitor_order(2, None), vec![0, 1]);
+        assert_eq!(monitor_order(2, Some(5)), vec![0, 1]);
+        assert_eq!(monitor_order(0, None), Vec::<usize>::new());
+        // (an index past the end is the caller's fallback to the primary: `chosen_monitor`)
+        assert_eq!(monitor_order(2, Some(1)).get(2), None);
+    }
+
+    /// Alt+Enter: either Enter with Alt cycles once per press; repeats, synthetic presses and the release are swallowed;
+    /// Enter without Alt and other keys with Alt are not Alt+Enter.
+    #[test]
+    fn alt_enter_events() {
+        use winit::keyboard::KeyCode as K;
+        assert_eq!(alt_enter_event(true, K::Enter, true, false, false), Some(true));
+        assert_eq!(alt_enter_event(true, K::NumpadEnter, true, false, false), Some(true));
+        assert_eq!(alt_enter_event(true, K::Enter, true, true, false), Some(false));
+        assert_eq!(alt_enter_event(true, K::Enter, true, false, true), Some(false));
+        assert_eq!(alt_enter_event(true, K::Enter, false, false, false), Some(false));
+        assert_eq!(alt_enter_event(false, K::Enter, true, false, false), None);
+        assert_eq!(alt_enter_event(true, K::KeyE, true, false, false), None);
+        assert_eq!(alt_enter_event(true, K::AltLeft, true, false, false), None);
+        // (the cycle and the reserved key in the shared model)
+        assert_eq!([WindowMode::Windowed.next(), WindowMode::Borderless.next(), WindowMode::Fullscreen.next()], [WindowMode::Borderless, WindowMode::Fullscreen, WindowMode::Windowed]);
+        assert!(crate::keybinds::reserved(K::Enter) && !crate::keybinds::bindable(K::Enter));
+    }
+
+    #[test]
+    fn screenshot_names_do_not_collide() {
+        let d = tmp("shots");
+        let a = screenshot_name(&d, "20261015-120000");
+        assert_eq!(a.file_name().unwrap(), "game-20261015-120000.png");
+        std::fs::write(&a, "x").unwrap();
+        let b = screenshot_name(&d, "20261015-120000");
+        assert_eq!(b.file_name().unwrap(), "game-20261015-120000-2.png");
+        std::fs::write(&b, "x").unwrap();
+        assert_eq!(screenshot_name(&d, "20261015-120000").file_name().unwrap(), "game-20261015-120000-3.png");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn timestamp_has_the_documented_shape() {
+        let t = timestamp();
+        assert_eq!(t.len(), 15);
+        assert_eq!(t.as_bytes()[8], b'-');
+        assert!(t.chars().enumerate().all(|(i, c)| i == 8 || c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn crash_report_names_what_a_bug_report_needs() {
+        let r = crash_report("main", "boom", "src/x.rs:1:2", "frame 0");
+        for want in ["version:", "message:   boom", "place:     src/x.rs:1:2", "adapter:", "---- backtrace ----", "frame 0", "last 50 log lines"] {
+            assert!(r.contains(want), "{want} missing in\n{r}");
+        }
+    }
+
+    #[test]
+    fn backtrace_starts_at_the_panic() {
+        let bt = "   0: hook\n             at a.rs:1\n   1: rust_begin_unwind\n             at b.rs:2\n   2: core::panicking::panic_fmt\n             at c.rs:3\n   3: mcla::main\n";
+        assert_eq!(trim_backtrace(bt), "   2: core::panicking::panic_fmt\n             at c.rs:3\n   3: mcla::main");
+        assert_eq!(trim_backtrace("no frames"), "no frames");
+    }
+
+    #[test]
+    fn intro_modes() {
+        // (settings are not loaded in unit tests: the intro is the normal one)
+        assert!(intro_film() && intro_scene());
+    }
+}

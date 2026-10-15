@@ -1,0 +1,18 @@
+[package]
+name = "mcla-savedecode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Decoder of a save of the original Midnight Club: Los Angeles (Xbox 360 mc4.sav / decrypted PS3 RAGE.SAV) into the port's save"
+
+[lib]
+name = "mcla_savedecode"
+path = "src/lib.rs"
+
+[dependencies]
+serde_json.workspace = true
+aes.workspace = true
+
+[dev-dependencies]
+# (the default float parser may be one ulp off; the tests compare against the Python importer's text exactly)
+serde_json = { workspace = true, features = ["float_roundtrip"] }
