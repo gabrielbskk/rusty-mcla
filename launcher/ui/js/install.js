@@ -171,7 +171,7 @@
       STAGES.forEach((st) => {
         const wrap = document.createElement('div');
         wrap.dataset.stage = st.id;
-        wrap.innerHTML = '<div class="stage"><span class="n"><span class="mark"></span><span class="nm"></span></span><span class="st-r"></span></div><div class="bar thin" style="--p:0;margin:7px 0 0 26px" hidden><i></i></div>';
+        wrap.innerHTML = '<div class="stage"><span class="n"><span class="mark"></span><span class="nm"></span></span><span class="st-r"></span></div><div class="bar thin" style="--p:0;margin:5px 0 0 26px" hidden><i></i></div>';
         host.append(wrap);
       });
     }
@@ -449,6 +449,8 @@
       steps: $$('.stepper .st').map((e) => e.className.replace('st ', '') + ' ' + $('[data-step-d]', e).textContent),
       btn: $('#ins-start').hidden ? 'cancel' : $('#ins-start').textContent + (($('#ins-start').disabled) ? ' (disabled)' : ''),
       note: $('#ins-btn-note').textContent, log: $$('#ins-log > div').map((d) => d.textContent),
+      // free pixels under the build card's last element (the card's own bottom padding already taken off)
+      slack: (() => { const pg = $('[data-page="install"]'); const was = pg.hidden; pg.hidden = false; const c = $('#ins-stages').closest('.card'); const v = [...c.children].filter((e) => e.offsetParent !== null); const s = Math.round(c.getBoundingClientRect().bottom - parseFloat(getComputedStyle(c).paddingBottom) - v[v.length - 1].getBoundingClientRect().bottom); pg.hidden = was; return s; })(),
     });
     const t00 = Date.now();
     S.app.setInstalled(false);
@@ -497,5 +499,89 @@
     return rep;
   }
 
-  window.Install = { init, render, refreshInfo, test, state: S };
+  // Layout check (page self test): force the page into each state of the build card and measure every card of the page.
+  // slack = card bottom - bottom padding - bottom of the last visible element (>= 0: nothing touches the padding);
+  // over = elements whose right edge passes the card's right padding. The real state is restored afterwards.
+  function fitStates() {
+    const keys = ['iso', 'identity', 'warnings', 'checks', 'valErr', 'validating', 'hash', 'building', 'built', 'buildErr', 'cancelled', 'resumable', 'stage', 'ffmpegActive', 'ff', 't0', 'rate', 'info', 'log'];
+    const saved = {};
+    keys.forEach((k) => { saved[k] = S[k]; });
+    const pg = $('[data-page="install"]');
+    const wasHidden = pg.hidden;
+    pg.hidden = false;
+    const cardOf = { disc: $('#ins-err').closest('.card'), folder: $('#ins-folder').closest('.card'), build: $('#ins-stages').closest('.card'), log: $('#ins-log').closest('.card') };
+    const padOf = (c) => { const cs = getComputedStyle(c); return { b: parseFloat(cs.paddingBottom), r: parseFloat(cs.paddingRight) }; };
+    const measure = () => {
+      const out = {};
+      Object.keys(cardOf).forEach((k) => {
+        const c = cardOf[k]; const cb = c.getBoundingClientRect(); const p = padOf(c);
+        const vis = [...c.children].filter((e) => e.offsetParent !== null);
+        const last = vis[vis.length - 1]; const lb = last.getBoundingClientRect();
+        const over = [];
+        $$('*', c).filter((e) => e.offsetParent !== null && !e.closest('svg')).forEach((e) => {
+          const r = e.getBoundingClientRect();
+          if (r.width && r.right > cb.right - p.r + 1) over.push((e.id || e.className || e.tagName) + ':' + Math.round(r.right - (cb.right - p.r)));
+        });
+        out[k] = { slack: Math.round(cb.bottom - p.b - lb.bottom), over: over.slice(0, 3), scrollW: c.scrollWidth - c.clientWidth };
+      });
+      return out;
+    };
+    const base = () => {
+      S.iso = 'D:\\Games\\Xbox 360\\Midnight Club - Los Angeles - Complete Edition (USA, Europe).iso';
+      S.identity = { file_name: 'Midnight Club - Los Angeles - Complete Edition (USA, Europe).iso', size: 7838695424, partition_base: 0, title_id: '545407F8', region_mask: 'FFFFFFFF', rpf_entries: 23931, sha256: null, dump: 'not_checked' };
+      S.valErr = null; S.validating = false; S.warnings = [];
+      S.checks = {};
+      ROWS.forEach((r) => r.checks.forEach((id) => { S.checks[id] = { id, status: 'pass', text: '' }; }));
+      S.hash = { state: 'done', done: 0, total: 0, verified: true };
+      S.building = false; S.built = false; S.buildErr = null; S.cancelled = false; S.resumable = false;
+      S.stage = {}; S.ffmpegActive = false; S.ff = null; S.rate = null; S.t0 = Date.now();
+      S.info = Object.assign({ root: 'D:\\RustyMCLA', installed: false, free_bytes: 2358196629504, required_bytes: 15200000000, data_bytes: 13700000000, iso_size: 7838695424, ffmpeg_download_bytes: 0, ffmpeg_version: '9.0.2', ffmpeg_found: '9.0.2', building: false, has_partial: false }, saved.info || {}, { installed: false, has_partial: false, ffmpeg_found: '9.0.2' });
+      S.log = [];
+      ['[17:13:32] validate: The disc image is supported', '[17:13:33] install: Build started', '[17:13:40] extract: 22068 files written, 0 already there', '[17:13:41] shaders: 8 shader programs translated (8 written, 0 already there)', '[17:14:02] audio: 1631 sound files converted (557 banks, 1074 streams), 0 problems', '[17:15:34] stamp: 64735 files, 13.5 GB'].forEach((x) => S.log.push({ time: '17:15:34', text: x.slice(11), cls: '' }));
+    };
+    const ORDER = ['extract', 'shaders', 'audio', 'video', 'verify'];
+    const states = [];
+    states.push(['idle', () => {}]);
+    states.push(['partial (Resume)', () => { S.info.has_partial = true; }]);
+    ORDER.forEach((id, i) => {
+      states.push(['running ' + id, () => {
+        S.building = true;
+        ORDER.slice(0, i).forEach((p) => { S.stage[p] = { done: 1, total: 1, finished: true }; });
+        S.stage[id] = { done: 29, total: 100, finished: false };
+      }]);
+    });
+    states.push(['running audio, ffmpeg row', () => {
+      S.building = true; S.ffmpegActive = true; S.ff = { done: 29, total: 100 };
+      S.stage.extract = { done: 1, total: 1, finished: true }; S.stage.shaders = { done: 1, total: 1, finished: true }; S.stage.audio = { done: 0, total: 0, finished: false };
+    }]);
+    states.push(['cancelled (Resume)', () => { S.buildErr = { code: 'cancelled', detail: '' }; S.cancelled = true; S.resumable = true; S.stage.extract = { done: 1, total: 1, finished: true }; S.stage.audio = { done: 30, total: 100, finished: false }; }]);
+    const errCodes = Object.keys(I18N.table()).filter((k) => k.startsWith('dyn.err.')).map((k) => k.slice(8)).filter((c) => c !== 'cancelled');
+    errCodes.forEach((c) => states.push(['error ' + c, () => { S.buildErr = { code: c, detail: 'D:\\RustyMCLA\\data\\cache\\shaders_wgsl\\xs_water.wgsl: Access is denied. (os error 5)' }; S.stage.extract = { done: 1, total: 1, finished: true }; S.stage.shaders = { done: 3, total: 8, finished: false }; S.resumable = true; }]));
+    states.push(['done (Play + Build again)', () => { S.built = true; S.info.installed = true; ORDER.forEach((p) => { S.stage[p] = { done: 1, total: 1, finished: true }; }); }]);
+    states.push(['done, folder with Verify', () => { S.built = true; S.info.installed = true; S.hash = { state: 'done', done: 0, total: 0, verified: false }; ORDER.forEach((p) => { S.stage[p] = { done: 1, total: 1, finished: true }; }); S.log.push({ time: '17:15:36', text: 'verify: All 64735 files are in place.', cls: '' }); }]);
+    states.push(['repair (verify found damage, Resume)', () => { S.info.installed = true; S.info.has_partial = true; S.buildErr = { code: 'data_damaged', detail: '3 files are missing' }; S.resumable = true; }]);
+    const rep = {};
+    let min = { build: 1e9, disc: 1e9, folder: 1e9, log: 1e9 };
+    const worst = {};
+    const longest = t('dyn.left_min', [120]);
+    states.forEach(([name, setup]) => {
+      base(); setup();
+      render();
+      if (S.building) $('#ins-left').textContent = longest;
+      const m = measure();
+      const over = Object.keys(m).filter((k) => m[k].over.length || m[k].scrollW > 0);
+      rep[name] = { slack: Object.fromEntries(Object.keys(m).map((k) => [k, m[k].slack])), over: over.map((k) => k + ' ' + m[k].over.join(',') + (m[k].scrollW > 0 ? ' scroll+' + m[k].scrollW : '')) };
+      Object.keys(m).forEach((k) => { if (m[k].slack < min[k]) { min[k] = m[k].slack; worst[k] = name; } });
+    });
+    keys.forEach((k) => { S[k] = saved[k]; });
+    render();
+    pg.hidden = wasHidden;
+    // errors collapse into one row each only when they differ from the worst one
+    const errRows = Object.keys(rep).filter((n) => n.startsWith('error '));
+    const errWorst = errRows.reduce((a, n) => (a === null || rep[n].slack.build < rep[a].slack.build ? n : a), null);
+    errRows.forEach((n) => { if (n !== errWorst) delete rep[n]; });
+    return { min, worst, overflow: Object.keys(rep).filter((n) => rep[n].over.length), states: rep };
+  }
+
+  window.Install = { init, render, refreshInfo, test, fitStates, state: S };
 })();

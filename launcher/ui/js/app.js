@@ -296,6 +296,20 @@
       }
       state.tab = savedTab; refreshRail(); showPage(pageFor(savedTab));
 
+      // 1b. the Install page's cards in every state of the build (free space under the last element, horizontal overflow), in three themes
+      if (window.Install && Install.fitStates) {
+        report.installFit = {};
+        const prevTheme = Themes.current();
+        for (const th of [prevTheme, 'alucard', 'dracula']) {
+          Themes.apply(th);
+          const f = Install.fitStates();
+          report.installFit[th] = th === prevTheme ? f : { min: f.min, worst: f.worst, overflow: f.overflow };
+          if (f.overflow.length) bad('install page overflows horizontally in ' + th + ': ' + f.overflow.join('; '));
+          if (Object.values(f.min).some((v) => v < 0)) bad('install page: a card has no room under its last element in ' + th + ' ' + JSON.stringify(f.min));
+        }
+        Themes.apply(prevTheme);
+      }
+
       // 2. all themes: computed token values
       report.themes = {};
       const prev = Themes.current();
