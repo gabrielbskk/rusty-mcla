@@ -1,0 +1,51 @@
+{
+  "schema": 1,
+  "version": "0.2.0",
+  "min_launcher_version": "0.1.0",
+  "notes_url": "https://github.com/OWNER/rusty-mcla/releases/tag/v0.2.0",
+  "launcher": {
+    "version": "0.2.0",
+    "asset": "RustyMCLA.exe",
+    "size": 5000000,
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "signature": "untrusted comment: signature from minisign secret key\nRUQOFRwjKjE4P0ZNVFtiaXB3foWMk5qhqK+2vcTL0tng5+71AQgPFh0kKzI5QEdOVVxjanF4f4aNlJuiqbC3vsXM09rh6O/2Agk=\ntrusted comment: timestamp:0\nBRIfLDlGU2BteoeUoa67yNXi7wEOGyg1Qk9caXaDkJ2qt8TR3uv4ChckMT5LWGVyf4yZprPAzdrn9AYTIC06Rw==\n"
+  },
+  "game": {
+    "version": "0.2.0",
+    "asset": "game-0.2.0.zip",
+    "size": 40000000,
+    "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "data_version": 1
+  },
+  "iso": {
+    "name": "Midnight Club: Los Angeles - Complete Edition (USA, Europe), Xbox 360",
+    "size": 7838695424,
+    "sha256": "877a9415f695d27f8170d04d3f18aab13e2b4de3cbabda824e04c9338b2914e9",
+    "title_id": "545407F8",
+    "game_archive": "xarchive_cache.rpf",
+    "rpf_entries": 23931,
+    "required_files": ["default.xex", "xarchive_cache.rpf", "xarchive_audio.rpf", "xarchive_music.rpf", "intro720.bik", "attract720.bik"],
+    "audio_archives": ["xarchive_audio.rpf", "xarchive_music.rpf"]
+  },
+  "movies": [
+    { "name": "intro", "file": "intro720.bik" },
+    { "name": "attract", "file": "attract720.bik" }
+  ],
+  "ffmpeg": {
+    "version": "9.0.2",
+    "license": "GPL-3.0 (FFmpeg 9.0.2 essentials build by gyan.dev, built with --enable-gpl --enable-version3). Run only as a separate program; not distributed with Rusty MCLA.",
+    "downloads": {
+      "windows-x86_64": {
+        "url": "https://github.com/GyanD/codexffmpeg/releases/download/9.0.2/ffmpeg-9.0.2-essentials_build.zip",
+        "size": 114768076,
+        "sha256": "60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba",
+        "member": "ffmpeg-9.0.2-essentials_build/bin/ffmpeg.exe"
+      }
+    }
+  },
+  "space": {
+    "data_bytes": 13700000000,
+    "headroom_bytes": 1500000000,
+    "max_rel_path": 112
+  }
+}

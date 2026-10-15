@@ -1,0 +1,40 @@
+# Rusty MCLA launcher. Its own cargo workspace (NOT a member of mcla-rs): built with the MSVC toolchain and a static CRT
+# so the result is one exe. See README.md and docs/LAUNCHER.md.
+[package]
+name = "rusty-mcla"
+version = "0.1.0"
+edition = "2021"
+description = "Rusty MCLA launcher: installs, updates and starts the unofficial PC port"
+license = "GPL-3.0-only"
+publish = false
+
+[workspace]
+members = ["updater", "support"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"
+mcla-install = { path = "../mcla-rs/crates/install" }
+mcla-config = { path = "../mcla-rs/crates/config" }
+mcla-updater = { path = "updater" }
+mcla-support = { path = "support" }
+log = "0.4"
+url = "2"
+tokio = { version = "1", features = ["rt", "time"] }
+rfd = "0.15"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

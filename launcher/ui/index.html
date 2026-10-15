@@ -1,0 +1,777 @@
+<!doctype html>
+<html lang="en" data-theme="steel">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=1280">
+<title>Rusty MCLA</title>
+<link rel="stylesheet" href="css/themes.css">
+<link rel="stylesheet" href="css/launcher.css">
+<script src="js/themes.js" defer></script>
+<script src="js/i18n.js" defer></script>
+<script src="js/bridge.js" defer></script>
+<script src="js/install.js" defer></script>
+<script src="js/update.js" defer></script>
+<script src="js/controls.js" defer></script>
+<script src="js/support.js" defer></script>
+  <script src="js/app.js" defer></script>
+</head>
+<body>
+
+<!-- Icon sprite and the hero artwork (original SVG scene; colours come from the theme tokens). -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <defs>
+    <symbol id="i-home" viewBox="0 0 24 24"><path d="M4 11l8-7 8 7v9H4z"/><path d="M10 20v-6h4v6"/></symbol>
+    <symbol id="i-install" viewBox="0 0 24 24"><path d="M12 4v11M7 11l5 5 5-5M5 20h14"/></symbol>
+    <symbol id="i-mods" viewBox="0 0 24 24"><path d="M3 8l9-5 9 5v8l-9 5-9-5z"/><path d="M3 8l9 5 9-5M12 13v8"/></symbol>
+    <symbol id="i-music" viewBox="0 0 24 24"><path d="M9 18V6l10-2v12"/><circle cx="6.5" cy="18" r="2.5"/><circle cx="16.5" cy="16" r="2.5"/></symbol>
+    <symbol id="i-controls" viewBox="0 0 24 24"><rect x="2" y="7" width="20" height="11" rx="5"/><path d="M7 10v5M4.5 12.5h5M16 11.5h.01M18.5 13.5h.01"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/></symbol>
+    <symbol id="i-support" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3.5"/><path d="M5.6 5.6l3.9 3.9M14.5 14.5l3.9 3.9M18.4 5.6l-3.9 3.9M9.5 14.5l-3.9 3.9"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12l5 5 9-10"/></symbol>
+    <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></symbol>
+    <symbol id="i-chevron" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></symbol>
+    <symbol id="i-minus" viewBox="0 0 24 24"><path d="M5 12h14"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 4l13 8-13 8z"/></symbol>
+    <symbol id="i-prev" viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></symbol>
+    <symbol id="i-next" viewBox="0 0 24 24"><path d="M9 5l7 7-7 7"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></symbol>
+    <symbol id="i-car" viewBox="0 0 24 24"><path d="M3 15l2-5a2 2 0 0 1 2-1.4h10a2 2 0 0 1 2 1.4l2 5v3h-3M6 18H3v-3M7 15h10"/><circle cx="7.5" cy="17.5" r="1.4"/><circle cx="16.5" cy="17.5" r="1.4"/></symbol>
+    <symbol id="i-spin" viewBox="0 0 24 24"><path d="M12 3v4M12 17v4M3 12h4M17 12h4"/></symbol>
+    <symbol id="i-warn" viewBox="0 0 24 24"><path d="M12 4l9 16H3zM12 10v4M12 17h.01"/></symbol>
+
+    <!-- Hero: dusk skyline, sun, light trails, palm. Original artwork. -->
+    <symbol id="hero-art" viewBox="0 0 760 430">
+      <defs>
+        <linearGradient id="hSky" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" style="stop-color:var(--sky1)"/><stop offset=".42" style="stop-color:var(--sky2)"/>
+          <stop offset=".68" style="stop-color:var(--sky3)"/><stop offset=".78" style="stop-color:var(--sky4)"/><stop offset="1" style="stop-color:var(--sky4)"/>
+        </linearGradient>
+        <radialGradient id="hSun" cx=".5" cy=".5" r=".5">
+          <stop offset="0" style="stop-color:var(--sun)"/><stop offset=".45" style="stop-color:var(--sun);stop-opacity:.7"/><stop offset="1" style="stop-color:var(--sun);stop-opacity:0"/>
+        </radialGradient>
+        <pattern id="hWin" width="20" height="24" patternUnits="userSpaceOnUse">
+          <rect x="3" y="4" width="3" height="5" style="fill:var(--accent2)" opacity=".6"/><rect x="11" y="13" width="3" height="5" style="fill:var(--sun)" opacity=".5"/>
+        </pattern>
+        <mask id="hCity"><g fill="#fff"><rect x="0" y="190" width="60" height="110"/><rect x="60" y="140" width="46" height="160"/><rect x="106" y="175" width="70" height="125"/><rect x="176" y="110" width="52" height="190"/><rect x="228" y="170" width="80" height="130"/><rect x="308" y="150" width="50" height="150"/><rect x="358" y="95" width="70" height="205"/><rect x="428" y="165" width="54" height="135"/><rect x="560" y="130" width="64" height="170"/><rect x="624" y="180" width="52" height="120"/><rect x="676" y="115" width="84" height="185"/></g></mask>
+        <filter id="hBlur" x="-30%" y="-30%" width="160%" height="160%"><feGaussianBlur stdDeviation="5"/></filter>
+      </defs>
+      <rect width="760" height="430" fill="url(#hSky)"/>
+      <circle cx="520" cy="296" r="120" fill="url(#hSun)" opacity=".85"/>
+      <circle cx="520" cy="296" r="46" fill="#fff7ea" opacity=".9"/>
+      <g style="fill:var(--bld)"><rect x="0" y="190" width="60" height="110"/><rect x="60" y="140" width="46" height="160"/><rect x="106" y="175" width="70" height="125"/><rect x="176" y="110" width="52" height="190"/><rect x="228" y="170" width="80" height="130"/><rect x="308" y="150" width="50" height="150"/><rect x="358" y="95" width="70" height="205"/><rect x="428" y="165" width="54" height="135"/><rect x="560" y="130" width="64" height="170"/><rect x="624" y="180" width="52" height="120"/><rect x="676" y="115" width="84" height="185"/></g>
+      <rect class="extra" x="0" y="80" width="760" height="220" fill="url(#hWin)" mask="url(#hCity)" opacity=".75"/>
+      <rect x="0" y="300" width="760" height="130" style="fill:var(--scrim)"/>
+      <g class="extra" style="fill:var(--scrim)"><rect x="0" y="296" width="760" height="10"/><rect x="60" y="306" width="14" height="124"/><rect x="250" y="306" width="14" height="124"/><rect x="440" y="306" width="14" height="124"/><rect x="630" y="306" width="14" height="124"/></g>
+      <g stroke-linecap="round" fill="none">
+        <path d="M0 372 Q 380 352 760 372" style="stroke:var(--trail1)" stroke-width="9" opacity=".55" filter="url(#hBlur)"/>
+        <path d="M0 372 Q 380 352 760 372" stroke="#fff" stroke-width="1.8" opacity=".9"/>
+        <path d="M0 396 Q 380 368 760 396" style="stroke:var(--trail1)" stroke-width="9" opacity=".5" filter="url(#hBlur)"/>
+        <path d="M0 396 Q 380 368 760 396" style="stroke:var(--trail1)" stroke-width="1.8"/>
+        <path d="M0 340 Q 380 330 760 340" style="stroke:var(--trail2)" stroke-width="7" opacity=".45" filter="url(#hBlur)"/>
+        <path d="M0 340 Q 380 330 760 340" stroke="#fff" stroke-width="1.4" opacity=".9"/>
+      </g>
+      <g class="extra" fill="none" stroke-linecap="round" style="stroke:var(--scrim)"><path d="M700 430C706 350 690 300 650 262" stroke-width="9"/><path d="M650 262q-55-25-100 12M650 262q-35-55-95-42M650 262q12-55 45-72M650 262q50-30 105-10" stroke-width="4"/></g>
+    </symbol>
+  </defs>
+</svg>
+
+<div id="app">
+
+  <!-- ===== left rail ===== -->
+  <aside class="rail">
+    <div class="logo" aria-hidden="true">R</div>
+    <button class="tab" data-tab="home"><svg class="ic"><use href="#i-home"/></svg><span data-i18n="nav.home"></span></button>
+    <button class="tab" data-tab="install"><svg class="ic"><use href="#i-install"/></svg><span data-i18n="nav.install"></span><span class="tip" data-i18n="lock.setup"></span></button>
+    <button class="tab" data-tab="mods" aria-disabled="true" data-lock="later"><svg class="ic"><use href="#i-mods"/></svg><span data-i18n="nav.mods"></span><span class="tip" data-i18n="lock.mods"></span></button>
+    <button class="tab" data-tab="music" aria-disabled="true" data-lock="later"><svg class="ic"><use href="#i-music"/></svg><span data-i18n="nav.music"></span><span class="tip" data-i18n="lock.music"></span></button>
+    <button class="tab" data-tab="controls"><svg class="ic"><use href="#i-controls"/></svg><span data-i18n="nav.controls"></span><span class="tip" data-i18n="lock.setup"></span></button>
+    <button class="tab" data-tab="settings"><svg class="ic"><use href="#i-settings"/></svg><span data-i18n="nav.settings"></span></button>
+    <button class="tab" data-tab="support"><svg class="ic"><use href="#i-support"/></svg><span data-i18n="nav.support"></span></button>
+    <div class="grow"></div>
+    <button class="lang" id="lang-chip" data-i18n="nav.lang" data-i18n-attr="aria-label:nav.lang_label"></button>
+  </aside>
+
+  <!-- ===== title bar: drag region, minimise, close ===== -->
+  <header class="head" id="head">
+    <div class="head-title">
+      <span class="page-title" id="head-title"></span>
+      <span class="head-tag" id="head-tag" data-i18n="brand.tagline"></span>
+      <span class="chip warn head-flag" id="head-flag" data-i18n="preview.flag"></span>
+    </div>
+    <div class="head-right">
+      <span class="head-status" id="head-status" data-i18n="head.checked"></span>
+      <button class="wbtn" id="win-min" data-i18n-attr="aria-label:win.minimise"><svg class="ic"><use href="#i-minus"/></svg></button>
+      <button class="wbtn" id="win-close" data-i18n-attr="aria-label:win.close"><svg class="ic"><use href="#i-close"/></svg></button>
+    </div>
+  </header>
+
+  <!-- ================= HOME ================= -->
+  <section class="page" data-page="home" data-title-key="brand.name" data-head="brand" data-foot hidden>
+    <div class="hero">
+      <svg class="hero-art" viewBox="0 0 760 430" aria-hidden="true"><use href="#hero-art"/></svg>
+      <div class="shade"></div>
+      <!-- update banner: one box for the designed states (update available, downloading, stopped, offline, rebuild needed); js/update.js fills it -->
+      <div class="ubanner" id="upd-banner" role="status" hidden>
+        <div class="ub-label" id="ub-label"></div>
+        <div class="ub-row"><div class="ub-text" id="ub-text"></div><span class="ub-pct" id="ub-pct" hidden></span></div>
+        <div class="bar mid ub-bar" id="ub-bar" style="--p:0" hidden><i></i></div>
+        <div class="ub-actions" id="ub-actions"></div>
+      </div>
+      <div class="shot-label" id="shot-label" data-i18n="home.shot" hidden></div>
+      <div class="pager" id="shot-pager" hidden>
+        <button data-i18n-attr="aria-label:home.shot_prev"><svg class="ic"><use href="#i-prev"/></svg></button>
+        <button data-i18n-attr="aria-label:home.shot_next"><svg class="ic"><use href="#i-next"/></svg></button>
+      </div>
+      <!-- the PLAY button's messages: the game did not start (red), or it closed unexpectedly last time; js/support.js fills it -->
+      <div class="ubanner pbanner" id="play-banner" role="status" hidden>
+        <div class="ub-label" id="pb-label"></div>
+        <div class="ub-row"><div class="ub-text"><div id="pb-text"></div><div class="ub-detail" id="pb-detail"></div></div></div>
+        <div class="ub-actions" id="pb-actions"></div>
+      </div>
+      <div class="play-row">
+        <button class="play" id="play"><span id="play-label" data-i18n="home.play"></span><svg class="ic fill" id="play-ic"><use href="#i-play"/></svg></button>
+        <div class="hero-text"><span class="hero-state" id="hero-state" data-i18n="home.ready"></span><span class="hero-line" id="hero-line" data-i18n="home.ready_line"></span></div>
+      </div>
+    </div>
+
+    <section class="card slim" style="--x:904;--y:88;--w:344;--h:430;display:flex;flex-direction:column;padding:22px 22px 0">
+      <div class="label" data-i18n="notes.label"></div>
+      <div class="title-d notes-title" id="notes-title" style="font-size:28px;letter-spacing:.04em;margin-top:6px"></div>
+      <div class="notes-tag"><span class="ver" id="notes-ver"></span><span class="chip accent" id="notes-latest" data-i18n="notes.latest" hidden></span><span id="notes-date"></span></div>
+      <div class="notes-body">
+        <div class="notes-md" id="notes-md"></div>
+        <div class="fade"></div>
+      </div>
+      <div class="notes-foot"><a href="#" id="notes-full" hidden><span data-i18n="notes.full"></span> &#8599;</a></div>
+    </section>
+
+    <section class="card tight" style="--x:128;--y:534;--w:244;--h:194">
+      <div class="label sm" data-i18n="home.c_install"></div>
+      <div class="checks mt12">
+        <div><svg class="ic"><use href="#i-check"/></svg><span data-i18n="home.disc_ok"></span></div>
+        <div><svg class="ic"><use href="#i-check"/></svg><span data-i18n="home.data_ok"></span></div>
+        <div class="muted" style="font-size:13px;line-height:1.35;display:block"><span data-i18n="home.install_path"></span><br><span data-i18n="home.install_size"></span></div>
+      </div>
+    </section>
+    <section class="card tight" style="--x:388;--y:534;--w:244;--h:194">
+      <div class="label sm" data-i18n="home.c_save"></div>
+      <div class="mt12" style="font-size:14px;line-height:1.4"><span data-i18n="home.save_last"></span><br><span class="muted" id="home-save-when" data-i18n="home.save_when"></span></div>
+      <div class="stack mt12">
+        <button class="btn outline" id="home-backup" data-i18n="home.save_backup"></button>
+        <button class="btn ghost quiet" data-open-folder="saves" data-i18n="home.save_open"></button>
+      </div>
+    </section>
+    <section class="card tight" style="--x:648;--y:534;--w:240;--h:194">
+      <div class="label sm" data-i18n="home.c_updates"></div>
+      <div class="flex gap8 center mt12" style="font-size:15px"><svg class="ic tint bold" id="upd-card-icon" style="width:18px;height:18px"><use href="#i-check"/></svg><span id="upd-card-state" data-i18n="home.upd_latest"></span></div>
+      <div class="note s mt8" id="upd-card-checked" data-i18n="home.upd_checked"></div>
+      <button class="btn mt16" id="upd-card-check" data-i18n="home.upd_check"></button>
+    </section>
+    <section class="card tight" style="--x:904;--y:534;--w:344;--h:194;padding:18px 22px">
+      <div class="label sm" data-i18n="home.c_wrong"></div>
+      <div class="note mt10" style="font-size:14px" data-i18n="home.wrong_text"></div>
+      <div class="flex gap8 mt14">
+        <button class="btn md primary" id="home-export" data-i18n="home.wrong_export"></button>
+        <button class="btn ghost" id="home-report" data-i18n="home.wrong_report"></button>
+      </div>
+    </section>
+  </section>
+
+  <!-- ================= FIRST RUN (Home while nothing is installed) ================= -->
+  <section class="page" data-page="firstrun" data-title-key="brand.name" data-head="brand" hidden>
+    <div class="hero tall">
+      <svg class="hero-art plain" style="--extra:none" viewBox="0 0 760 430" aria-hidden="true"><use href="#hero-art"/></svg>
+      <div class="shade"></div>
+      <div class="welcome">
+        <div class="label" data-i18n="fr.welcome"></div>
+        <h2 data-i18n="fr.title"></h2>
+        <p data-i18n="fr.text"></p>
+        <div class="go">
+          <button class="play" id="start-setup" data-i18n="fr.start"></button>
+          <span data-i18n="fr.takes"></span>
+        </div>
+      </div>
+    </div>
+    <section class="card slim" style="--x:904;--y:88;--w:344;--h:430;padding:22px 22px 0">
+      <div class="label" data-i18n="fr.before"></div>
+      <div class="numbered mt14">
+        <div><span class="num">1</span><span data-i18n="fr.need1"></span></div>
+        <div><span class="num">2</span><span data-i18n="fr.need2"></span></div>
+        <div><span class="num">3</span><span data-i18n="fr.need3"></span></div>
+      </div>
+      <div class="note s mt18" style="padding-top:14px;border-top:1px solid var(--line);line-height:1.5" data-i18n="fr.legal"></div>
+    </section>
+    <section class="card tight step-card hot" style="--x:128;--y:534;--w:244;--h:194">
+      <div class="label sm" data-i18n="fr.step1"></div><div class="step-name" data-i18n="fr.s1_t"></div><div class="note mt8" data-i18n="fr.s1_d"></div>
+    </section>
+    <section class="card tight step-card" style="--x:388;--y:534;--w:244;--h:194">
+      <div class="label sm" data-i18n="fr.step2"></div><div class="step-name" data-i18n="fr.s2_t"></div><div class="note mt8" data-i18n="fr.s2_d"></div>
+    </section>
+    <section class="card tight step-card" style="--x:648;--y:534;--w:240;--h:194">
+      <div class="label sm" data-i18n="fr.step3"></div><div class="step-name" data-i18n="fr.s3_t"></div><div class="note mt8" data-i18n="fr.s3_d"></div>
+    </section>
+    <section class="card slim" style="--x:904;--y:534;--w:344;--h:194;padding:18px 22px">
+      <div class="label sm" data-i18n="fr.where"></div>
+      <div class="field sans sm mt12" style="height:36px" data-i18n="fr.folder"></div>
+      <div class="flex gap10 mt12"><button class="btn" data-later data-i18n="fr.change_folder"></button></div>
+      <div class="note s mt12"><span data-i18n="fr.offline"></span> <a href="#" id="fr-local-package" data-i18n="fr.offline_link"></a></div>
+    </section>
+  </section>
+
+  <!-- ================= INSTALL ================= -->
+  <section class="page" data-page="install" data-title-key="nav.install" data-head="plain" hidden>
+    <section class="card stepper" style="--x:128;--y:88;--w:1120;--h:64;padding:0 24px">
+      <div class="st todo" data-step="1"><span class="dot">1</span><div><b data-i18n="ins.st1"></b><small data-step-d="1" data-i18n="ins.st1_d"></small><small class="st-actions" id="pkg-actions" hidden><a href="#" id="pkg-retry" data-i18n="upd.retry_link"></a> &middot; <a href="#" id="pkg-local" data-i18n="fr.offline_link"></a></small></div></div>
+      <span class="join" data-join="1"></span>
+      <div class="st todo" data-step="2"><span class="dot">2</span><div><b data-i18n="ins.st2"></b><small data-step-d="2" data-i18n="ins.st2_d"></small></div></div>
+      <span class="join" data-join="2"></span>
+      <div class="st todo" data-step="3"><span class="dot">3</span><div><b data-i18n="ins.st3"></b><small data-step-d="3" data-i18n="ins.st3_d"></small></div></div>
+      <span class="join" data-join="3"></span>
+      <div class="st todo" data-step="4"><span class="dot">4</span><div><b data-i18n="ins.st4"></b><small data-step-d="4" data-i18n="ins.st4_d"></small></div></div>
+    </section>
+
+    <section class="card" style="--x:128;--y:168;--w:552;--h:340">
+      <div class="label" data-i18n="ins.disc"></div>
+      <div class="pick"><div class="field" id="ins-iso"></div><button class="btn" id="ins-browse" data-i18n="ins.browse"></button></div>
+      <div class="checks mt14" style="gap:9px;font-size:15px" id="ins-checks"></div>
+      <div class="hint-box mt14" id="ins-note" data-i18n="ins.dump_note"></div>
+      <div class="banner-box mt14" id="ins-err" hidden><b id="ins-err-title"></b><div class="note s mono" id="ins-err-detail" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></div><button class="btn sm err-export" id="ins-err-export" data-i18n="ins.export"></button></div>
+    </section>
+    <section class="card" style="--x:128;--y:524;--w:552;--h:204">
+      <div class="label-row" style="align-items:center"><span class="label" data-i18n="ins.folder"></span><button class="btn ghost" id="ins-verify" hidden data-i18n="ins.verify"></button></div>
+      <div class="pick"><div class="field" id="ins-folder"></div><button class="btn" data-later data-i18n="ins.change"></button></div>
+      <div class="label-row mt12 note" style="font-size:13.5px"><span id="ins-need"></span><span id="ins-free"></span></div>
+      <div class="bar mid mt8" id="ins-space-bar" style="--p:0"><i></i></div>
+      <div class="note s mt14" data-i18n="ins.keep_note"></div>
+    </section>
+
+    <section class="card hot" style="--x:696;--y:168;--w:552;--h:340">
+      <div class="label-row"><span class="label" data-i18n="ins.build"></span><span class="note s" id="ins-left"></span></div>
+      <div class="big-pct"><b id="ins-pct">0%</b><span class="note" style="font-size:14px" data-i18n="ins.overall"></span></div>
+      <div class="bar mt8" id="ins-overall" style="--p:0"><i></i></div>
+      <div class="flex mt16" style="flex-direction:column;gap:11px;font-size:15px" id="ins-stages"></div>
+      <div class="flex gap12 center mt18"><button class="btn lg primary" id="ins-start" disabled data-i18n="ins.start"></button><button class="btn lg" id="ins-cancel" hidden data-i18n="ins.cancel"></button><button class="btn lg primary" id="ins-play" hidden data-i18n="ins.play"></button><span class="note s" id="ins-btn-note"></span></div>
+    </section>
+    <section class="card clip" style="--x:696;--y:524;--w:552;--h:204;padding:16px 20px">
+      <div class="label-row" style="align-items:center"><span class="label" data-i18n="ins.log"></span><a href="#" id="ins-export" style="font-size:13px;text-decoration:none;font-weight:600" data-i18n="ins.export"></a></div>
+      <div class="logtail" id="ins-log"></div>
+    </section>
+  </section>
+
+  <!-- ================= CONTROLS ================= -->
+  <section class="page" data-page="controls" data-title-key="nav.controls" data-head="plain" hidden>
+    <nav class="pills" role="tablist">
+      <button class="pill" role="tab" data-sub="pad" data-i18n="ctl.pad"></button>
+      <button class="pill" role="tab" data-sub="kbd" data-i18n="ctl.kbd"></button>
+      <button class="pill" role="tab" aria-disabled="true"><span data-i18n="ctl.wheel"></span><svg class="ic"><use href="#i-lock"/></svg><small data-i18n="ctl.later"></small></button>
+    </nav>
+
+    <!-- keyboard -->
+    <div data-sub-page="kbd" hidden>
+      <section class="card clip col" style="--x:128;--y:132;--w:740;--h:596">
+        <div class="label-row" style="align-items:flex-start">
+          <div><div class="label" data-i18n="ctl.kbd"></div><div class="note mt6" id="kbd-note" data-i18n="ctl.kbd_intro"></div></div>
+          <div class="kbd-side"><button class="btn" style="flex:none" id="kbd-reset" data-i18n="ctl.reset"></button><span class="kbd-status" id="kbd-status" role="status"></span></div>
+        </div>
+        <div class="tbl-head"><span data-i18n="ctl.col_action"></span><span data-i18n="ctl.col_key1"></span><span data-i18n="ctl.col_key2"></span></div>
+        <div class="tbl-body" id="kbd-rows"></div>
+        <div class="fade"></div>
+      </section>
+      <section class="card slim" style="--x:884;--y:132;--w:364;--h:176">
+        <div class="label" data-i18n="ctl.change_t"></div>
+        <div class="bullets mt10"><div data-i18n="ctl.change1"></div><div data-i18n="ctl.change2"></div><div data-i18n="ctl.change3"></div></div>
+      </section>
+      <section class="card slim" style="--x:884;--y:324;--w:364;--h:196">
+        <div class="label" data-i18n="ctl.gamepad_t"></div>
+        <div class="pad-line"><span class="dotc"></span><span data-i18n="ctl.controller"></span></div>
+        <div class="note mt10" data-i18n="ctl.pad_text"></div>
+        <button class="btn mt12" data-goto-sub="pad" data-i18n="ctl.show_layout"></button>
+      </section>
+      <section class="card slim" style="--x:884;--y:536;--w:364;--h:192">
+        <div class="label" data-i18n="ctl.fixed_t"></div>
+        <div class="flex mt12" id="kbd-fixed" style="flex-direction:column;gap:8px"></div>
+        <div class="note xs mt12" data-i18n="ctl.fixed_note"></div>
+      </section>
+    </div>
+
+    <!-- gamepad -->
+    <div data-sub-page="pad" hidden>
+      <section class="card clip col" style="--x:128;--y:132;--w:740;--h:596">
+        <div class="label-row" style="align-items:flex-start">
+          <div><div class="label" data-i18n="ctl.pad_layout"></div><div class="note mt6" data-i18n="ctl.pad_intro"></div></div>
+          <span class="chip" style="flex:none;padding:5px 10px" data-i18n="ctl.readonly"></span>
+        </div>
+        <div class="tbl-head one"><span data-i18n="ctl.col_action"></span><span data-i18n="ctl.col_button"></span></div>
+        <div class="tbl-body" id="pad-rows"></div>
+        <div class="fade"></div>
+      </section>
+      <section class="card slim" style="--x:884;--y:132;--w:364;--h:176">
+        <div class="label" data-i18n="ctl.controller_t"></div>
+        <div class="pad-line"><span class="dotc"></span><span data-i18n="ctl.controller"></span></div>
+        <div class="note mt10" data-i18n="ctl.pad_ok"></div>
+      </section>
+      <section class="card slim" style="--x:884;--y:324;--w:364;--h:196">
+        <div class="label" data-i18n="ctl.change_layout_t"></div>
+        <div class="note mt10" data-i18n="ctl.change_layout_text"></div>
+      </section>
+      <section class="card slim" style="--x:884;--y:536;--w:364;--h:192">
+        <div class="label" data-i18n="ctl.vib_t"></div>
+        <div class="soon-row"><span data-i18n="ctl.vib"></span><span class="chip" style="padding:3px 8px;font-size:10px;letter-spacing:.12em" data-i18n="ctl.coming"></span></div>
+        <div class="soon-row"><span data-i18n="ctl.adaptive"></span><span class="chip" style="padding:3px 8px;font-size:10px;letter-spacing:.12em" data-i18n="ctl.coming"></span></div>
+        <div class="note xs mt14" data-i18n="ctl.vib_note"></div>
+      </section>
+    </div>
+  </section>
+
+  <!-- ================= SUPPORT ================= -->
+  <section class="page" data-page="support" data-title-key="nav.support" data-head="plain" hidden>
+    <section class="card" style="--x:128;--y:88;--w:552;--h:424">
+      <div class="label" data-i18n="sup.export_t"></div>
+      <div class="note mt8" data-i18n="sup.export_text"></div>
+      <div class="inc">
+        <div class="it"><button class="check" role="checkbox" data-inc="launcher_logs" aria-checked="true"><svg class="ic"><use href="#i-check"/></svg></button><span data-i18n="sup.inc1"></span><small></small></div>
+        <div class="it"><button class="check" role="checkbox" data-inc="build_logs" aria-checked="true"><svg class="ic"><use href="#i-check"/></svg></button><span data-i18n="sup.inc2"></span><small></small></div>
+        <div class="it"><button class="check" role="checkbox" data-inc="game_logs" aria-checked="true"><svg class="ic"><use href="#i-check"/></svg></button><span data-i18n="sup.inc3"></span><small></small></div>
+        <div class="it"><button class="check" role="checkbox" data-inc="system" aria-checked="true"><svg class="ic"><use href="#i-check"/></svg></button><span data-i18n="sup.inc4"></span><small data-i18n="sup.inc4_hint"></small></div>
+        <div class="it"><button class="check" role="checkbox" data-inc="settings" aria-checked="true"><svg class="ic"><use href="#i-check"/></svg></button><span data-i18n="sup.inc5"></span><small></small></div>
+        <div class="it"><button class="check" role="checkbox" data-inc="save" aria-checked="false"><svg class="ic"><use href="#i-check"/></svg></button><span data-i18n="sup.inc6"></span><small data-i18n="sup.inc6_hint"></small></div>
+        <div class="it"><button class="check" role="checkbox" data-inc="screenshots" aria-checked="false"><svg class="ic"><use href="#i-check"/></svg></button><span data-i18n="sup.inc7"></span><small data-i18n="sup.inc7_hint"></small></div>
+      </div>
+      <div class="hint-box mt14" style="font-size:12.5px" data-i18n="sup.user_note"></div>
+      <div class="flex center mt14" style="gap:14px"><button class="btn xl primary" id="sup-export" data-i18n="sup.export"></button><span class="note s"><span id="sup-saved" class="saved-to"></span> <a href="#" id="sup-change" data-i18n="sup.change"></a></span></div>
+    </section>
+    <section class="card" style="--x:128;--y:528;--w:552;--h:200">
+      <div class="label" data-i18n="sup.report_t"></div>
+      <div class="flex mt12" style="flex-direction:column;gap:11px;font-size:14.5px">
+        <div class="flex center gap12"><span class="num line">1</span><span data-i18n="sup.rep1"></span></div>
+        <div class="flex center gap12"><span class="num line">2</span><span style="flex:1" data-i18n="sup.rep2"></span><button class="btn outline" style="height:32px;font-size:12px;flex:none" id="sup-open-gh" data-i18n="sup.open_gh"></button></div>
+        <div class="flex center gap12"><span class="num line">3</span><span data-i18n="sup.rep3"></span></div>
+      </div>
+      <div class="note xs mt10" data-i18n="sup.rep_note"></div>
+    </section>
+    <section class="card" style="--x:696;--y:88;--w:552;--h:424">
+      <div class="label" data-i18n="sup.save_t"></div>
+      <div class="save-now"><div><div style="font-size:15px;font-weight:600" data-i18n="sup.cur"></div><div class="note xs" style="margin-top:2px" id="sup-cur-d"></div></div><span class="chip accent" id="sup-chip" style="padding:3px 8px;font-size:11px" data-i18n="sup.in_use"></span></div>
+      <div class="flex gap8 mt12 wrap"><button class="btn md primary" id="sup-backup" data-i18n="sup.backup_now"></button><button class="btn md" data-open-folder="saves" data-i18n="sup.open_folder"></button><button class="btn md" id="sup-import" data-i18n="sup.import"></button></div>
+      <div class="bk-head"><span data-i18n="sup.backups"></span><label class="keep"><span data-i18n="sup.keeping_a"></span> <select id="sup-keep" data-i18n-attr="aria-label:sup.keeping_a"><option value="5">5</option><option value="10">10</option><option value="20">20</option><option value="50">50</option></select></label></div>
+      <div class="bk-list" id="sup-backups"></div>
+    </section>
+    <section class="card" style="--x:696;--y:528;--w:552;--h:200">
+      <div class="label-row" style="align-items:center"><span class="label" data-i18n="sup.system"></span><button class="btn sm" id="sup-copy" data-i18n="sup.copy"></button></div>
+      <div class="kv">
+        <span data-i18n="sys.launcher"></span><span id="sys-launcher" data-bind="launcher-version"></span>
+        <span data-i18n="sys.game"></span><span id="sys-game" data-i18n="sys.v_ver"></span>
+        <span data-i18n="sys.windows"></span><span id="sys-windows" data-i18n="sys.v_os"></span>
+        <span data-i18n="sys.graphics"></span><span id="sys-graphics" data-i18n="sys.v_gpu"></span>
+        <span data-i18n="sys.webview"></span><span id="sys-webview" data-i18n="sys.v_wv"></span>
+      </div>
+    </section>
+  </section>
+
+  <!-- ================= SETTINGS ================= -->
+  <section class="page" data-page="settings" data-title-key="nav.settings" data-head="plain" data-foot hidden>
+    <nav class="pills" role="tablist">
+      <button class="pill" role="tab" data-sub="general" data-i18n="set.general"></button>
+      <button class="pill" role="tab" data-sub="appearance" data-i18n="set.appearance"></button>
+      <button class="pill" role="tab" data-sub="display" data-i18n="set.display"></button>
+      <button class="pill" role="tab" data-sub="folders" data-i18n="set.folders"></button>
+      <button class="pill" role="tab" data-sub="about" data-i18n="set.about"></button>
+    </nav>
+
+    <!-- General -->
+    <div data-sub-page="general" hidden>
+      <section class="card" style="--x:128;--y:132;--w:552;--h:308">
+        <div class="label" data-i18n="set.updates"></div>
+        <div class="rows">
+          <div class="row"><div><div class="row-t" data-i18n="set.check"></div><div class="row-d" data-i18n="set.check_d"></div></div><button class="switch" role="switch" data-bool="check_updates"><i></i></button></div>
+          <div class="row"><div><div class="row-t" data-i18n="set.installed"></div><div class="row-d" id="set-installed-d" data-i18n="set.installed_d"></div></div><button class="btn" id="set-check-now" data-i18n="set.check_now"></button></div>
+          <div class="row"><div><div class="row-t" data-i18n="set.pick_ver"></div><div class="row-d" data-i18n="set.pick_ver_d"></div></div><button class="btn" id="set-choose-ver" data-i18n="set.choose_ver"></button></div>
+          <div class="row"><div><div class="row-t" data-i18n="set.skipped"></div><div class="row-d" id="skipped-text" data-i18n="set.skipped_d"></div></div><button class="btn" id="skipped-clear" disabled data-i18n="set.clear"></button></div>
+        </div>
+      </section>
+      <section class="card" style="--x:128;--y:456;--w:552;--h:272">
+        <div class="label" data-i18n="set.playing"></div>
+        <div class="rows compact">
+          <div class="row"><div><div class="row-t" data-i18n="set.close"></div><div class="row-d" data-i18n="set.close_d"></div></div><button class="switch" role="switch" data-bool="close_on_launch"><i></i></button></div>
+          <div class="row"><div><div class="row-t" data-i18n="set.backup"></div><div class="row-d" data-i18n="set.backup_d"></div></div><button class="switch" role="switch" data-bool="backup_before_update"><i></i></button></div>
+          <div class="row"><div><div class="row-t" data-i18n="set.notes"></div><div class="row-d" data-i18n="set.notes_d"></div></div><button class="switch" role="switch" data-bool="show_notes_after_update"><i></i></button></div>
+          <div class="row"><div><div class="row-t" data-i18n="set.prev"></div><div class="row-d" id="set-prev-d" data-i18n="set.prev_d"></div></div><button class="btn" id="set-prev-btn" disabled data-i18n="set.prev_btn"></button></div>
+        </div>
+      </section>
+      <section class="card" style="--x:696;--y:132;--w:552;--h:308">
+        <div class="label" data-i18n="set.language"></div>
+        <div class="rows">
+          <div class="row"><div><div class="row-t" data-i18n="set.lang_row"></div><div class="row-d" data-i18n="set.lang_d"></div></div>
+            <div class="select"><select id="lang-select" data-select="language"></select><svg class="ic"><use href="#i-chevron"/></svg></div></div>
+          <div class="row"><div><div class="row-t" data-i18n="set.fmt"></div><div class="row-d" data-i18n="set.fmt_d"></div></div>
+            <div class="select"><select disabled><option data-i18n="set.fmt_follow"></option></select><svg class="ic"><use href="#i-chevron"/></svg></div></div>
+        </div>
+        <div class="note s mt16" style="line-height:1.5" data-i18n="set.lang_note"></div>
+      </section>
+      <section class="card" style="--x:696;--y:456;--w:552;--h:272">
+        <div class="label" data-i18n="set.startup"></div>
+        <div class="rows">
+          <div class="row"><div><div class="row-t" data-i18n="set.open_on"></div><div class="row-d" data-i18n="set.open_on_d"></div></div>
+            <div class="select"><select data-select="open_on"><option value="home" data-i18n="nav.home"></option><option value="install" data-i18n="nav.install"></option><option value="controls" data-i18n="nav.controls"></option><option value="settings" data-i18n="nav.settings"></option><option value="support" data-i18n="nav.support"></option></select><svg class="ic"><use href="#i-chevron"/></svg></div></div>
+          <div class="row"><div><div class="row-t" data-i18n="set.remember"></div><div class="row-d" data-i18n="set.remember_d"></div></div><button class="switch" role="switch" data-bool="remember_window"><i></i></button></div>
+        </div>
+      </section>
+    </div>
+
+    <!-- Appearance -->
+    <div data-sub-page="appearance" hidden>
+      <section class="card" style="--x:128;--y:132;--w:1120;--h:442">
+        <div class="label-row"><span class="label" data-i18n="set.theme"></span><span class="note s" data-i18n="set.theme_d"></span></div>
+        <div class="themes" id="theme-grid" role="radiogroup" data-i18n-attr="aria-label:set.theme"></div>
+      </section>
+      <section class="card" style="--x:128;--y:590;--w:1120;--h:138">
+        <div class="label" data-i18n="set.bg"></div>
+        <div class="bg-grid">
+          <div class="label-row" style="align-items:flex-start;gap:12px"><div><div class="t" data-i18n="set.rotate"></div><div class="row-d" style="line-height:1.4" data-i18n="set.rotate_d"></div></div><button class="switch" style="margin-top:2px" role="switch" data-bool="background.rotate"><i></i></button></div>
+          <div><div class="t" data-i18n="set.interval"></div><div class="select wide mt8"><select data-select="background.interval_s" data-number><option value="5" data-i18n="set.int_5"></option><option value="10" data-i18n="set.int_10"></option><option value="20" data-i18n="set.int_20"></option><option value="30" data-i18n="set.int_30"></option><option value="60" data-i18n="set.int_60"></option></select><svg class="ic"><use href="#i-chevron"/></svg></div></div>
+          <div><div class="t" data-i18n="set.shots_folder"></div><div class="flex gap10 mt8"><div class="field sm sans" style="flex:1;font-size:13px" data-bind="folder-screenshots"></div><button class="btn" style="width:84px;padding:0;font-size:12px" data-later data-i18n="set.change"></button><button class="btn" style="width:84px;padding:0;font-size:12px" data-open-folder="screenshots" data-i18n="set.open"></button></div></div>
+        </div>
+      </section>
+    </div>
+
+    <!-- Display and game: everything greyed until the game reads the key -->
+    <div data-sub-page="display" hidden>
+      <section class="card" style="--x:128;--y:132;--w:1120;--h:596">
+        <div class="label" data-i18n="set.display_t"></div>
+        <div class="banner-box" data-i18n="set.display_note"></div>
+        <div class="opt-grid">
+          <div class="opt" aria-disabled="true"><div class="opt-t"><span data-i18n="set.o_intro"></span><span class="chip tiny" data-i18n="set.not_yet"></span></div><div class="seg"><span class="on" data-i18n="set.o_normal"></span><span data-i18n="set.o_fast"></span><span data-i18n="set.o_skip"></span></div></div>
+          <div class="opt" aria-disabled="true"><div class="opt-t"><span data-i18n="set.o_window"></span><span class="chip tiny" data-i18n="set.not_yet"></span></div><div class="seg"><span data-i18n="set.o_windowed"></span><span data-i18n="set.o_borderless"></span><span class="on" data-i18n="set.o_fullscreen"></span></div></div>
+          <div class="opt" aria-disabled="true"><div class="opt-t"><span data-i18n="set.o_res"></span><span class="chip tiny" data-i18n="set.not_yet"></span></div><div class="select wide mt10" style="margin-top:10px"><select disabled><option data-i18n="set.o_res_v"></option></select><svg class="ic"><use href="#i-chevron"/></svg></div></div>
+          <div class="opt" aria-disabled="true"><div class="opt-t"><span data-i18n="set.o_fps"></span><span class="chip tiny" data-i18n="set.not_yet"></span></div><div class="slider"><div class="track"><i style="left:55%"></i></div><span class="val" data-i18n="set.o_fps_v"></span></div></div>
+          <div class="opt" aria-disabled="true"><div class="opt-t"><span data-i18n="set.o_vsync"></span><span class="chip tiny" data-i18n="set.not_yet"></span></div><div class="flex center" style="height:34px;margin-top:10px"><span class="switch" aria-checked="false"><i></i></span></div></div>
+          <div class="opt" aria-disabled="true"><div class="opt-t"><span data-i18n="set.o_upscale"></span><span class="chip tiny" data-i18n="set.not_yet"></span></div><div class="seg"><span class="on" data-i18n="set.o_off"></span><span data-i18n="set.o_bilinear"></span><span data-i18n="set.o_fsr"></span></div></div>
+          <div class="opt" aria-disabled="true"><div class="opt-t"><span data-i18n="set.o_scale"></span><span class="chip tiny" data-i18n="set.not_yet"></span></div><div class="slider"><div class="track"><i style="left:80%"></i></div><span class="val" data-i18n="set.o_scale_v"></span></div></div>
+          <div class="opt" aria-disabled="true"><div class="opt-t"><span data-i18n="set.o_aa"></span><span class="chip tiny" data-i18n="set.not_yet"></span></div><div class="select wide" style="margin-top:10px"><select disabled><option data-i18n="set.o_aa_v"></option></select><svg class="ic"><use href="#i-chevron"/></svg></div></div>
+          <div class="opt live"><div class="opt-t"><span data-i18n="set.o_monitor"></span><span class="mon-status" id="monitor-status" role="status"></span></div><div class="select wide" style="margin-top:10px"><select id="monitor-select" data-i18n-attr="aria-label:set.o_monitor"></select><svg class="ic"><use href="#i-chevron"/></svg></div></div>
+        </div>
+      </section>
+    </div>
+
+    <!-- Folders -->
+    <div data-sub-page="folders" hidden>
+      <section class="card" style="--x:128;--y:132;--w:1120;--h:596">
+        <div class="label" data-i18n="set.folders"></div>
+        <div class="rows" id="folder-rows"></div>
+        <div class="note s mt14" data-i18n="f.note"></div>
+      </section>
+    </div>
+
+    <!-- About -->
+    <div data-sub-page="about" hidden>
+      <section class="card" style="--x:128;--y:132;--w:552;--h:596">
+        <div class="label" data-i18n="set.about"></div>
+        <div class="about-id"><div class="logo" aria-hidden="true">R</div><div><div class="wordmark" data-i18n="brand.name"></div><div class="label caps mt4" style="letter-spacing:.26em;font-size:12px" data-i18n="brand.tagline"></div></div></div>
+        <div class="kv about">
+          <div data-i18n="about.launcher"></div><div data-bind="launcher-version"></div>
+          <div data-i18n="about.game"></div><div data-i18n="sys.v_ver"></div>
+          <div data-i18n="about.data"></div><div data-i18n="about.data_v"></div>
+          <div data-i18n="about.built"></div><div class="mono" style="font-size:13px" data-i18n="about.commit"></div>
+          <div data-i18n="about.licence"></div><div data-i18n="about.gpl"></div>
+        </div>
+        <div class="flex gap10 mt22"><button class="btn lg primary" style="font-size:12.5px" id="about-check" data-i18n="about.check"></button><button class="btn lg" style="padding:0 16px" data-later data-i18n="about.copy"></button></div>
+      </section>
+      <section class="card" style="--x:696;--y:132;--w:552;--h:596">
+        <div class="label" data-i18n="about.links_t"></div>
+        <div class="links mt12">
+          <a href="#" data-web="repo"><span data-i18n="link.project"></span><span class="ext">&#8599;</span></a>
+          <a href="#" data-web="releases"><span data-i18n="link.releases"></span><span class="ext">&#8599;</span></a>
+          <a href="#" data-web="issues"><span data-i18n="link.report"></span><span class="ext">&#8599;</span></a>
+          <a href="#" data-later><span data-i18n="link.licences"></span><span class="ext">&#8599;</span></a>
+        </div>
+        <div class="fan-note mt22" data-i18n="about.fan"></div>
+        <div class="note s mt14" style="line-height:1.5" data-i18n="about.nofiles"></div>
+      </section>
+    </div>
+  </section>
+
+  <!-- PREVIEWS: locked Mods and Music pages, a design preview only (no tab reaches them) -->
+    <section class="page locked-preview" data-page="mods-preview" data-title-key="nav.mods" data-head="preview" hidden>
+    <nav class="pills">
+      <button class="pill" role="tab" aria-selected="true" data-i18n="mods.tab_my_mods"></button>
+      <button class="pill" role="tab" aria-selected="false" data-i18n="mods.tab_find"></button>
+      <button class="pill" role="tab" aria-selected="false" data-i18n="mods.tab_folder"></button>
+    </nav>
+
+    <div class="card clip" style="--x:128;--y:132;--w:552;--h:596">
+      <div class="label-row">
+        <span class="label" data-i18n="mods.my_mods"></span>
+        <span class="note s" data-i18n="mods.count"></span>
+      </div>
+      <div class="flex gap10 mt12">
+        <div class="search"><svg class="ic"><use href="#i-search"/></svg><span data-i18n="mods.search"></span></div>
+      </div>
+      <div class="tags">
+        <span class="on" data-i18n="mods.filter_all"></span>
+        <span data-i18n="mods.filter_cars"></span>
+        <span data-i18n="mods.filter_parts"></span>
+        <span data-i18n="mods.filter_liveries"></span>
+      </div>
+      <div class="mod-list mt12">
+        <div class="mod-row sel">
+          <span class="thumb"><svg class="ic"><use href="#i-car"/></svg></span>
+          <div>
+            <div class="mod-n"><span data-i18n="mods.mod_name"></span></div>
+            <div class="mod-s" data-i18n="mods.sub_car"></div>
+          </div>
+          <span class="note xs" style="text-align:right" data-i18n="mods.state_on"></span>
+          <button class="switch" role="switch" aria-checked="true"><i></i></button>
+        </div>
+        <div class="mod-row">
+          <span class="thumb"><svg class="ic"><use href="#i-car"/></svg></span>
+          <div>
+            <div class="mod-n">
+              <span data-i18n="mods.mod_name"></span>
+              <span class="chip warn" data-i18n="mods.badge_conflict"></span>
+            </div>
+            <div class="mod-s" data-i18n="mods.sub_car"></div>
+          </div>
+          <span class="note xs" style="text-align:right" data-i18n="mods.state_on"></span>
+          <button class="switch" role="switch" aria-checked="true"><i></i></button>
+        </div>
+        <div class="mod-row">
+          <span class="thumb"><svg class="ic"><use href="#i-car"/></svg></span>
+          <div>
+            <div class="mod-n"><span data-i18n="mods.mod_name"></span></div>
+            <div class="mod-s" data-i18n="mods.sub_part"></div>
+          </div>
+          <span class="note xs" style="text-align:right" data-i18n="mods.state_on"></span>
+          <button class="switch" role="switch" aria-checked="true"><i></i></button>
+        </div>
+        <div class="mod-row">
+          <span class="thumb"><svg class="ic"><use href="#i-car"/></svg></span>
+          <div>
+            <div class="mod-n">
+              <span data-i18n="mods.mod_name"></span>
+              <span class="chip" data-i18n="mods.badge_update"></span>
+            </div>
+            <div class="mod-s" data-i18n="mods.sub_livery"></div>
+          </div>
+          <span class="note xs" style="text-align:right" data-i18n="mods.state_off"></span>
+          <button class="switch" role="switch" aria-checked="false"><i></i></button>
+        </div>
+        <div class="mod-row">
+          <span class="thumb"><svg class="ic"><use href="#i-car"/></svg></span>
+          <div>
+            <div class="mod-n"><span data-i18n="mods.mod_name"></span></div>
+            <div class="mod-s" data-i18n="mods.sub_car"></div>
+          </div>
+          <span class="note xs" style="text-align:right" data-i18n="mods.state_off"></span>
+          <button class="switch" role="switch" aria-checked="false"><i></i></button>
+        </div>
+        <div class="mod-row">
+          <span class="thumb"><svg class="ic"><use href="#i-car"/></svg></span>
+          <div>
+            <div class="mod-n"><span data-i18n="mods.mod_name"></span></div>
+            <div class="mod-s" data-i18n="mods.sub_part"></div>
+          </div>
+          <span class="note xs" style="text-align:right" data-i18n="mods.state_on"></span>
+          <button class="switch" role="switch" aria-checked="true"><i></i></button>
+        </div>
+        <div class="mod-row">
+          <span class="thumb"><svg class="ic"><use href="#i-car"/></svg></span>
+          <div>
+            <div class="mod-n"><span data-i18n="mods.mod_name"></span></div>
+            <div class="mod-s" data-i18n="mods.sub_livery"></div>
+          </div>
+          <span class="note xs" style="text-align:right" data-i18n="mods.state_on"></span>
+          <button class="switch" role="switch" aria-checked="true"><i></i></button>
+        </div>
+      </div>
+      <div class="fade" style="height:60px"></div>
+    </div>
+
+    <div class="card" style="--x:696;--y:132;--w:552;--h:380">
+      <div class="label" data-i18n="mods.selected_mod"></div>
+      <div class="dash" data-i18n="mods.preview_picture"></div>
+      <div class="label-row mt14">
+        <span class="title-d" style="font-size:22px;letter-spacing:.04em" data-i18n="mods.mod_name"></span>
+        <span class="note s" data-i18n="mods.sub_car"></span>
+      </div>
+      <div class="note mt6" style="font-size:14px" data-i18n="mods.description"></div>
+      <div class="checks mt12">
+        <div><svg class="ic"><use href="#i-check"/></svg><span data-i18n="mods.compat_game"></span></div>
+        <div><svg class="ic warn"><use href="#i-warn"/></svg><span data-i18n="mods.conflict_with"></span></div>
+      </div>
+      <div class="flex gap10 mt16">
+        <button class="btn md primary" data-i18n="mods.turn_on"></button>
+        <button class="btn md" data-i18n="mods.update"></button>
+        <button class="btn md" data-i18n="mods.remove"></button>
+      </div>
+    </div>
+
+    <div class="card" style="--x:696;--y:528;--w:552;--h:200">
+      <div class="label" data-i18n="mods.mods_folder"></div>
+      <div class="flex gap10 mt12">
+        <div class="field sans" style="flex:1;height:38px" data-i18n="mods.install_folder"></div>
+        <button class="btn lg" style="width:104px;padding:0" data-i18n="mods.open"></button>
+      </div>
+      <div class="flex gap10 mt12">
+        <button class="btn md outline" data-i18n="mods.install_file"></button>
+      </div>
+      <div class="note s mt12" data-i18n="mods.folder_note"></div>
+    </div>
+  </section>
+
+  <section class="page locked-preview" data-page="music-preview" data-title-key="nav.music" data-head="preview" hidden>
+    <nav class="pills">
+      <button class="pill" role="tab" aria-selected="true" data-i18n="music.tab_your_music"></button>
+      <button class="pill" role="tab" aria-selected="false" data-i18n="music.tab_spotify"></button>
+      <button class="pill" role="tab" aria-selected="false" data-i18n="music.tab_in_game"></button>
+    </nav>
+
+    <div class="card clip" style="--x:128;--y:132;--w:552;--h:500">
+      <div class="label-row">
+        <span class="label" data-i18n="music.your_music"></span>
+        <span class="note s" data-i18n="music.count"></span>
+      </div>
+      <div class="note mt8" data-i18n="music.what_plays"></div>
+      <div class="seg accent mt8" style="height:36px">
+        <span data-i18n="music.mode_mine"></span>
+        <span class="on" data-i18n="music.mode_both"></span>
+        <span data-i18n="music.mode_game"></span>
+      </div>
+      <div class="song-head">
+        <span></span>
+        <span data-i18n="music.col_title"></span>
+        <span data-i18n="music.col_artist"></span>
+        <span style="text-align:right" data-i18n="music.col_time"></span>
+      </div>
+      <div>
+        <div class="song">
+          <span></span>
+          <span data-i18n="music.song_title"></span>
+          <span class="art" data-i18n="music.artist"></span>
+          <span class="tm" data-i18n="music.duration"></span>
+        </div>
+        <div class="song on">
+          <span class="eq"><i></i><i></i><i></i></span>
+          <span data-i18n="music.song_title"></span>
+          <span class="art" data-i18n="music.artist"></span>
+          <span class="tm" data-i18n="music.duration"></span>
+        </div>
+        <div class="song">
+          <span></span>
+          <span data-i18n="music.song_title"></span>
+          <span class="art" data-i18n="music.artist"></span>
+          <span class="tm" data-i18n="music.duration"></span>
+        </div>
+        <div class="song">
+          <span></span>
+          <span data-i18n="music.song_title"></span>
+          <span class="art" data-i18n="music.artist"></span>
+          <span class="tm" data-i18n="music.duration"></span>
+        </div>
+        <div class="song">
+          <span></span>
+          <span data-i18n="music.song_title"></span>
+          <span class="art" data-i18n="music.artist"></span>
+          <span class="tm" data-i18n="music.duration"></span>
+        </div>
+        <div class="song">
+          <span></span>
+          <span data-i18n="music.song_title"></span>
+          <span class="art" data-i18n="music.artist"></span>
+          <span class="tm" data-i18n="music.duration"></span>
+        </div>
+        <div class="song">
+          <span></span>
+          <span data-i18n="music.song_title"></span>
+          <span class="art" data-i18n="music.artist"></span>
+          <span class="tm" data-i18n="music.duration"></span>
+        </div>
+      </div>
+      <div class="fade" style="height:50px"></div>
+    </div>
+
+    <div class="card" style="--x:696;--y:132;--w:552;--h:248">
+      <div class="label" data-i18n="music.music_folders"></div>
+      <div class="mt8">
+        <div class="fold-row">
+          <div class="field" data-i18n="music.folder_path"></div>
+          <span class="note s" style="text-align:right" data-i18n="music.folder_songs"></span>
+          <button class="btn" data-i18n="music.remove"></button>
+        </div>
+        <div class="fold-row">
+          <div class="field" data-i18n="music.folder_path"></div>
+          <span class="note s" style="text-align:right" data-i18n="music.folder_songs"></span>
+          <button class="btn" data-i18n="music.remove"></button>
+        </div>
+      </div>
+      <div class="flex center gap12 mt14">
+        <button class="btn md primary" data-i18n="music.add_folder"></button>
+        <span class="note xs" data-i18n="music.file_types"></span>
+      </div>
+    </div>
+
+    <div class="card" style="--x:696;--y:396;--w:552;--h:236">
+      <div class="label" data-i18n="music.spotify"></div>
+      <div class="flex center gap10 mt12" style="font-size:15px"><span class="dotc off"></span><span data-i18n="music.not_connected"></span></div>
+      <div class="note mt8" style="line-height:1.5" data-i18n="music.spotify_note"></div>
+      <button class="btn md outline mt14" data-i18n="music.connect_spotify"></button>
+    </div>
+
+    <div class="card player" style="--x:128;--y:648;--w:1120;--h:80">
+      <div class="flex center gap12" style="min-width:0">
+        <span class="thumb" style="width:48px;height:48px"></span>
+        <div>
+          <div class="row-t" data-i18n="music.song_title"></div>
+          <div class="row-d" data-i18n="music.player_from"></div>
+        </div>
+      </div>
+      <div>
+        <div class="bar thin" style="--p:38"><i></i></div>
+        <div class="note xs mt4" style="display:flex;justify-content:space-between;font-size:11.5px">
+          <span data-i18n="music.duration"></span><span data-i18n="music.duration"></span>
+        </div>
+      </div>
+      <div class="flex center gap10" style="justify-content:center">
+        <button class="round" data-i18n-attr="aria-label:music.prev_song"><svg class="ic fill"><use href="#i-prev"/></svg></button>
+        <button class="round big" data-i18n-attr="aria-label:music.play_pause"><svg class="ic fill"><use href="#i-play"/></svg></button>
+        <button class="round" data-i18n-attr="aria-label:music.next_song"><svg class="ic fill"><use href="#i-next"/></svg></button>
+      </div>
+      <div class="note xs" style="line-height:1.5">
+        <span data-i18n="music.keys_intro"></span> <span class="kbd">N</span> <span data-i18n="music.key_next"></span> <span class="kbd">B</span> <span data-i18n="music.key_toggle"></span>
+      </div>
+    </div>
+  </section>
+
+  <!-- install a specific version: the release list (Settings > General) -->
+  <div class="dlg-back" id="ver-dialog" hidden>
+    <section class="dlg" role="dialog" aria-modal="true" aria-labelledby="ver-title">
+      <div class="label" id="ver-title" data-i18n="ver.title"></div>
+      <div class="note mt8" data-i18n="ver.note"></div>
+      <div class="ver-list" id="ver-list"></div>
+      <div class="flex center gap12 mt14" style="justify-content:space-between"><span class="note s" id="ver-status"></span><button class="btn md" id="ver-close" data-i18n="ver.close"></button></div>
+    </section>
+  </div>
+
+  <!-- Support: asks before a save is replaced (restore, import) or the game folder is changed (js/support.js `ask`) -->
+  <div class="dlg-back" id="sup-dialog" hidden>
+    <section class="dlg narrow" role="dialog" aria-modal="true" aria-labelledby="sup-dlg-title">
+      <div class="label" id="sup-dlg-title"></div>
+      <div class="note mt10" style="font-size:15px;color:var(--ink);line-height:1.45;white-space:pre-line" id="sup-dlg-text"></div>
+      <div class="flex gap10 mt18" style="justify-content:flex-end"><button class="btn md" id="sup-dlg-no" data-i18n="sup.dlg_cancel"></button><button class="btn md primary" id="sup-dlg-yes"></button></div>
+    </section>
+  </div>
+
+  <!-- Controls > Keyboard: a key that is already used -->
+  <div class="dlg-back" id="kbd-dialog" hidden>
+    <section class="dlg narrow" role="dialog" aria-modal="true" aria-labelledby="kbd-ask-title">
+      <div class="label" id="kbd-ask-title" data-i18n="ctl.ask_t"></div>
+      <div class="note mt10" style="font-size:15px;color:var(--ink)" id="kbd-ask-text"></div>
+      <div class="flex gap10 mt18" style="justify-content:flex-end"><button class="btn md" id="kbd-ask-no" data-i18n="ctl.ask_cancel"></button><button class="btn md primary" id="kbd-ask-yes" data-i18n="ctl.ask_replace"></button></div>
+    </section>
+  </div>
+
+  <div class="foot" id="foot" data-i18n="foot.fan" hidden></div>
+  <div class="toast" id="toast" role="status" hidden><svg class="ic"><use href="#i-check"/></svg><span id="toast-text"></span><a href="#" id="toast-action" hidden></a></div>
+</div>
+</body>
+</html>

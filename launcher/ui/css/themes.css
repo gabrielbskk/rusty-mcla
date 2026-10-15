@@ -1,0 +1,212 @@
+/* Theme tokens. One attribute on the root (<html data-theme="...">) switches the whole launcher.
+   Values come from the design canvas (docs/LAUNCHER.md, "Visual design"). Dracula and Alucard are the Dracula project's
+   published palettes; the launcher is unaffiliated with it.
+
+   Tokens:  bg rail panel ink muted accent accent2 onaccent line line2 wash
+            sky1..sky4 sun bld trail1 trail2 scrim heroInk heroAccent   (+ warn, bad for messages)
+   Rules:   small labels use accent2, accent is for fills / borders / bullets, text on accent uses onaccent;
+            the hero keeps its own dark scrim and light heroInk so a light theme still reads over the picture. */
+
+/* The hero's own colours follow the theme's unless a theme overrides them (Alucard does). */
+:root,
+[data-theme] {
+  --scrim: var(--bg);
+  --heroInk: var(--ink);
+  --heroAccent: var(--accent2);
+}
+
+/* Steel and Coral: the default, also what an unknown theme id falls back to. */
+:root,
+:root[data-theme="steel"],
+[data-theme="steel"] {
+  --bg: #0b0c10;
+  --rail: #10131a;
+  --panel: #121821;
+  --ink: #e8edf3;
+  --muted: #93a2b3;
+  --accent: #ff4b3e;
+  --accent2: #bfe6ff;
+  --onaccent: #0b0c10;
+  --line: rgba(255, 255, 255, 0.07);
+  --line2: rgba(255, 255, 255, 0.2);
+  --wash: rgba(255, 255, 255, 0.06);
+  --sky1: #0b0c10;
+  --sky2: #18222f;
+  --sky3: #34475c;
+  --sky4: #5d6b7c;
+  --sun: #ff7a6e;
+  --bld: #0f1620;
+  --trail1: #ff4b3e;
+  --trail2: #bfe6ff;
+  --warn: #ffb020;
+  --bad: #ff6b6b;
+}
+
+[data-theme="graphite"] {
+  --bg: #0c0d0b;
+  --rail: #111310;
+  --panel: #161914;
+  --ink: #eef2e6;
+  --muted: #9aa28c;
+  --accent: #c8ff3d;
+  --accent2: #e3ff8a;
+  --onaccent: #0c0d0b;
+  --sky1: #0c0d0b;
+  --sky2: #1a2118;
+  --sky3: #2e3d27;
+  --sky4: #526a3d;
+  --sun: #c8ff3d;
+  --bld: #0f130e;
+  --trail1: #c8ff3d;
+  --trail2: #ffffff;
+}
+
+[data-theme="crimson"] {
+  --bg: #070b14;
+  --rail: #0b111d;
+  --panel: #0e1626;
+  --ink: #e6efff;
+  --muted: #8fa3c4;
+  --accent: #e0243c;
+  --accent2: #ff7a8a;
+  --onaccent: #ffffff;
+  --sky1: #070b14;
+  --sky2: #0f1e3d;
+  --sky3: #2b2a5e;
+  --sky4: #5a2a66;
+  --sun: #ff5a70;
+  --bld: #091020;
+  --trail1: #e0243c;
+  --trail2: #cfe3ff;
+}
+
+[data-theme="sodium"] {
+  --bg: #0d0d0f;
+  --rail: #131316;
+  --panel: #18181c;
+  --ink: #f1f0ec;
+  --muted: #a09e98;
+  --accent: #ffb020;
+  --accent2: #ffd27a;
+  --onaccent: #0d0d0f;
+  --sky1: #0d0d0f;
+  --sky2: #1f1e24;
+  --sky3: #3a3436;
+  --sky4: #7a5328;
+  --sun: #ffb020;
+  --bld: #111114;
+  --trail1: #ffb020;
+  --trail2: #f1f0ec;
+}
+
+[data-theme="teal"] {
+  --bg: #060f0f;
+  --rail: #0a1615;
+  --panel: #0d1c1b;
+  --ink: #e4f5f1;
+  --muted: #8fb3ad;
+  --accent: #1fd1b0;
+  --accent2: #ff9a55;
+  --onaccent: #060f0f;
+  --sky1: #060f0f;
+  --sky2: #0c2a2a;
+  --sky3: #115a55;
+  --sky4: #1fa58c;
+  --sun: #7ff0d8;
+  --bld: #081413;
+  --trail1: #1fd1b0;
+  --trail2: #ff8a3d;
+}
+
+[data-theme="dracula"] {
+  --bg: #282a36;
+  --rail: #21222c;
+  --panel: #303241;
+  --ink: #f8f8f2;
+  --muted: #9aa5ce;
+  --accent: #bd93f9;
+  --accent2: #ff79c6;
+  --onaccent: #282a36;
+  --sky1: #1b1c25;
+  --sky2: #2e2a4f;
+  --sky3: #6a4aa5;
+  --sky4: #ff79c6;
+  --sun: #ff79c6;
+  --bld: #14151c;
+  --trail1: #ff79c6;
+  --trail2: #8be9fd;
+}
+
+/* Alucard: the light theme. The hero keeps a dark scrim and a light ink on top of its picture. */
+[data-theme="alucard"] {
+  --bg: #fffbeb;
+  --rail: #efe8cf;
+  --panel: #f4eed6;
+  --ink: #1f1f1f;
+  --muted: #6c664b;
+  --accent: #644ac9;
+  --accent2: #a3144d;
+  --onaccent: #ffffff;
+  --line: rgba(31, 31, 31, 0.12);
+  --line2: rgba(31, 31, 31, 0.28);
+  --wash: rgba(31, 31, 31, 0.05);
+  --sky1: #14131c;
+  --sky2: #2a2650;
+  --sky3: #5a3f9e;
+  --sky4: #c0527a;
+  --sun: #ffb3d1;
+  --bld: #100f18;
+  --trail1: #ff7aa8;
+  --trail2: #8be9fd;
+  --scrim: #14131c;
+  --heroInk: #f5f2e8;
+  --heroAccent: #ffb3d1;
+  /* the amber / red of the dark themes are too light on cream; same hues, darker (the design did not vary them) */
+  --warn: #9a5b00;
+  --bad: #b42318;
+}
+
+/* Match system: Steel and Coral at night, Alucard by day. The attribute stays "system"; only the tokens follow the OS. */
+@media (prefers-color-scheme: light) {
+  [data-theme="system"] {
+    --bg: #fffbeb;
+    --rail: #efe8cf;
+    --panel: #f4eed6;
+    --ink: #1f1f1f;
+    --muted: #6c664b;
+    --accent: #644ac9;
+    --accent2: #a3144d;
+    --onaccent: #ffffff;
+    --line: rgba(31, 31, 31, 0.12);
+    --line2: rgba(31, 31, 31, 0.28);
+    --wash: rgba(31, 31, 31, 0.05);
+    --sky1: #14131c;
+    --sky2: #2a2650;
+    --sky3: #5a3f9e;
+    --sky4: #c0527a;
+    --sun: #ffb3d1;
+    --bld: #100f18;
+    --trail1: #ff7aa8;
+    --trail2: #8be9fd;
+    --scrim: #14131c;
+    --heroInk: #f5f2e8;
+    --heroAccent: #ffb3d1;
+    --warn: #9a5b00;
+    --bad: #b42318;
+  }
+}
+
+/* Derived tokens (the design's "A16", "A60" ... values), computed from the theme's own colours. */
+:root {
+  --accent-a16: color-mix(in srgb, var(--accent) 16%, transparent);
+  --accent-a45: color-mix(in srgb, var(--accent) 45%, transparent);
+  --accent-a60: color-mix(in srgb, var(--accent) 60%, transparent);
+  --muted-dim: color-mix(in srgb, var(--muted) 53%, transparent);
+  --warn-a10: color-mix(in srgb, var(--warn) 10%, transparent);
+  --warn-a16: color-mix(in srgb, var(--warn) 16%, transparent);
+  --bad-a10: color-mix(in srgb, var(--bad) 10%, transparent);
+  --scrim-clear: color-mix(in srgb, var(--scrim) 0%, transparent);
+  --scrim-solid: color-mix(in srgb, var(--scrim) 95%, transparent);
+  --scrim-glass: color-mix(in srgb, var(--scrim) 72%, transparent);
+  --panel-clear: color-mix(in srgb, var(--panel) 0%, transparent);
+}

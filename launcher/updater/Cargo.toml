@@ -1,0 +1,40 @@
+# Update system of the Rusty MCLA launcher: release check, manifest, release notes, game package, launcher self-update.
+# No Tauri here, so everything can be tested against a local mock of the GitHub API (tests/, examples/).
+[package]
+name = "mcla-updater"
+version = "0.1.0"
+edition = "2021"
+description = "Rusty MCLA update system (GitHub Releases client, manifest.json, game package, self-update)"
+license = "GPL-3.0-only"
+publish = false
+
+[lib]
+name = "mcla_updater"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mk-manifest"
+path = "src/bin/mk_manifest.rs"
+
+[dependencies]
+mcla-install = { path = "../../mcla-rs/crates/install" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+semver = "1"
+sha2 = "0.10"
+url = "2"
+log = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+tokio = { version = "1", features = ["rt", "fs", "io-util", "time", "sync", "macros"] }
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "stream"] }
+pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
+ammonia = "4"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+minisign-verify = "0.2"
+
+[dev-dependencies]
+tiny_http = "0.12"
+tempfile = "3"
+minisign = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

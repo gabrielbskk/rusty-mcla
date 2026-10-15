@@ -1,0 +1,15 @@
+{
+  "_comment": "Where the launcher looks for releases (the one place to change it). The repository is private until the project is made public: a private repository answers 404 to the launcher, so update checks show 'could not check' until then. Environment RUSTY_MCLA_RELEASE_REPO=owner/name overrides it for testing a fork.",
+  "repo": "holdmysocks/rusty-mcla",
+  "api_base": "https://api.github.com",
+  "web_base": "https://github.com",
+  "allowed_hosts": [
+    "api.github.com",
+    "github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+    "github-releases.githubusercontent.com"
+  ],
+  "launcher_asset": "RustyMCLA.exe",
+  "manifest_asset": "manifest.json"
+}
