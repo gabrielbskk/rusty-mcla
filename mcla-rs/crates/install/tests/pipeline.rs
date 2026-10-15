@@ -150,7 +150,10 @@ fn verify_without_a_list_is_data_damaged() {
 
 #[test]
 fn preflight_checks_the_folder() {
-    let m = Manifest::embedded();
+    // the folder checks must not depend on how much disk the machine running the test has: ask for almost nothing
+    let mut m = Manifest::embedded();
+    m.space.data_bytes = 1;
+    m.space.headroom_bytes = 1;
     let root = temp("pre");
     let ok = mcla_install::preflight::preflight(&root.join("fresh"), None, &m, &Ctx::silent()).unwrap();
     assert!(ok.free_bytes > 0);

@@ -14896,7 +14896,7 @@ mod tests {
     #[test]
     fn cruising_slot_system() {
         let mut s = SlotSystem::load(&data_dir());
-        if s.slots.is_empty() {
+        if s.slots.iter().all(|d| d.is_empty()) {
             return;
         }
         // (the file: five districts, three slots each with the script of its loop, one
