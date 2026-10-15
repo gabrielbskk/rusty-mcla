@@ -1,0 +1,202 @@
+name: Release
+
+# Builds the launcher (MSVC, static CRT) and the game package, and creates a DRAFT GitHub release holding:
+#   RustyMCLA.exe            the launcher
+#   game-<version>.zip       the game program (mcla.exe) and the licence, extracted by the launcher into game/
+#   manifest.unsigned.json   the release manifest without the launcher signature
+#   SHA256SUMS.txt           checksums of the above
+# The launcher signature cannot be made here: the private key stays offline. After this workflow, run tools/sign-release.ps1 on
+# your own machine; it signs RustyMCLA.exe, makes the real manifest.json and uploads it to the draft. Then review the draft and publish it.
+# Procedure: docs (LAUNCHER.md, "Release procedure") and BUILDING.md.
+#
+# Start it by pushing a tag (git tag v0.1.0 && git push origin v0.1.0), or by hand from the Actions tab with the version.
+# The version must equal the launcher's own version (launcher/Cargo.toml and launcher/tauri.conf.json): the launcher compares them
+# to decide whether a release is newer than itself.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, without the v (for example 0.1.0). The draft is made for tag v<version>; the tag is created when the draft is published.'
+        required: true
+        type: string
+      allow_unset_key:
+        description: 'Allow a build although launcher/update-key.pub is still the placeholder (a rehearsal; such a launcher cannot update itself)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # create the draft release; nothing else is granted
+
+concurrency:
+  group: release-${{ github.ref }}-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_VERSION: "1.99.0"
+  GNU_TOOLCHAIN: 1.99.0-x86_64-pc-windows-gnu
+  MSVC_TOOLCHAIN: 1.99.0-x86_64-pc-windows-msvc
+  WINLIBS_URL: https://github.com/brechtsanders/winlibs_mingw/releases/download/16.2.0posix-14.0.0-ucrt-r1/winlibs-x86_64-posix-seh-gcc-16.2.0-mingw-w64ucrt-14.0.0-r1.7z
+  WINLIBS_SHA256: 9714f9e55905000ec2a066ae033abdfe8c93083a925e3fe015d3c7cc4bb1c918
+
+jobs:
+  draft:
+    name: Build and draft the release
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Work out the version and check it
+        id: ver
+        shell: pwsh
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          ALLOW_UNSET_KEY: ${{ inputs.allow_unset_key }}
+        run: |
+          if ($env:EVENT -eq 'workflow_dispatch') { $tag = "v$($env:INPUT_VERSION)" } else { $tag = $env:REF_NAME }
+          if ($tag -notmatch '^v(\d+\.\d+\.\d+)$') { throw "tag '$tag' is not of the form v1.2.3" }
+          $version = $Matches[1]
+
+          $cargo = [regex]::Match((Get-Content launcher\Cargo.toml -Raw), '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
+          $tauri = (Get-Content launcher\tauri.conf.json -Raw | ConvertFrom-Json).version
+          if ($cargo -ne $version -or $tauri -ne $version) {
+            throw "release $version, but launcher/Cargo.toml says $cargo and launcher/tauri.conf.json says $tauri. Make all three equal (and commit) before tagging."
+          }
+
+          # the launcher in this release has the key compiled in; with the placeholder it could never update itself
+          $key = Get-Content launcher\update-key.pub
+          $keyOk = ($key.Count -ge 2) -and ($key[0] -match '^untrusted comment:') -and ($key[0] -notmatch 'NOT SET') -and ($key[1] -match '^RW[A-Za-z0-9+/]{54}$')
+          if (-not $keyOk) {
+            if ($env:ALLOW_UNSET_KEY -eq 'true') { Write-Warning "launcher/update-key.pub is not a real public key: this build is a rehearsal and cannot be signed" }
+            else { throw "launcher/update-key.pub does not hold a real minisign public key. Put the public half of your offline key there, commit, and tag again." }
+          }
+
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "release $version (tag $tag), launcher version $cargo"
+
+      - name: Rust toolchains (GNU for the game, MSVC for the launcher)
+        shell: pwsh
+        run: |
+          rustup toolchain install $env:GNU_TOOLCHAIN --profile minimal
+          rustup toolchain install $env:MSVC_TOOLCHAIN --profile minimal
+          rustup run $env:GNU_TOOLCHAIN rustc --version
+          rustup run $env:MSVC_TOOLCHAIN rustc --version
+
+      - name: Restore WinLibs
+        id: winlibs-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: C:\winlibs
+          key: winlibs-${{ env.WINLIBS_SHA256 }}
+
+      - name: Download WinLibs (mingw-w64)
+        if: steps.winlibs-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri $env:WINLIBS_URL -OutFile "$env:RUNNER_TEMP\winlibs.7z"
+          $hash = (Get-FileHash -Algorithm SHA256 "$env:RUNNER_TEMP\winlibs.7z").Hash.ToLower()
+          if ($hash -ne $env:WINLIBS_SHA256) { throw "WinLibs download has sha256 $hash, expected $env:WINLIBS_SHA256" }
+          7z x "$env:RUNNER_TEMP\winlibs.7z" -oC:\winlibs -y | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "7z failed" }
+
+      - name: WinLibs on PATH
+        shell: pwsh
+        run: |
+          "C:\winlibs\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          & C:\winlibs\mingw64\bin\gcc.exe --version | Select-Object -First 1
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            mcla-rs
+            launcher
+          key: release-${{ env.RUST_VERSION }}
+
+      - name: Build the launcher and mk-manifest (MSVC, static CRT)
+        working-directory: launcher
+        env:
+          RUSTUP_TOOLCHAIN: ${{ env.MSVC_TOOLCHAIN }}
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo build --release -p rusty-mcla -p mcla-updater --bin rusty-mcla --bin mk-manifest
+
+      - name: Build the game (GNU)
+        working-directory: mcla-rs
+        env:
+          RUSTUP_TOOLCHAIN: ${{ env.GNU_TOOLCHAIN }}
+        run: cargo build --release -p mcla
+
+      - name: Package
+        id: pack
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          New-Item -ItemType Directory -Force out, stage | Out-Null
+          Copy-Item launcher\target\release\rusty-mcla.exe out\RustyMCLA.exe
+          Copy-Item mcla-rs\target\release\mcla.exe stage\mcla.exe
+          Copy-Item LICENSE stage\LICENSE
+          $zip = "out\game-$($env:VERSION).zip"
+          Compress-Archive -Path stage\* -DestinationPath $zip -CompressionLevel Optimal
+
+          # what the launcher's installer expects: mcla.exe at the top level, nothing in sub-folders
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $z = [IO.Compression.ZipFile]::OpenRead((Resolve-Path $zip).Path)
+          $names = $z.Entries | ForEach-Object { $_.FullName }
+          $z.Dispose()
+          Write-Host "game package entries: $($names -join ', ')"
+          if ($names -notcontains 'mcla.exe') { throw "mcla.exe is not at the top level of the game package" }
+          if ($names | Where-Object { $_ -match '[\\/]' }) { throw "the game package must not contain folders" }
+
+          $l = (Get-FileHash -Algorithm SHA256 out\RustyMCLA.exe).Hash.ToLower()
+          $g = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+          "$l *RustyMCLA.exe`n$g *game-$($env:VERSION).zip" | Out-File -FilePath out\SHA256SUMS.txt -Encoding ascii
+          "sha_launcher=$l" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "sha_game=$g" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Get-ChildItem out | Select-Object Name, Length | Format-Table -AutoSize
+
+      - name: Unsigned release manifest
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          & launcher\target\release\mk-manifest.exe --assets out --version $env:VERSION --unsigned --repo $env:GITHUB_REPOSITORY --out out\manifest.unsigned.json
+          if ($LASTEXITCODE -ne 0) { throw "mk-manifest failed" }
+
+      - name: Release notes
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          SHA_LAUNCHER: ${{ steps.pack.outputs.sha_launcher }}
+          SHA_GAME: ${{ steps.pack.outputs.sha_game }}
+        run: |
+          $body = Get-Content .github\release-notes-template.md -Raw
+          $run = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          $body = $body.Replace('{{VERSION}}', $env:VERSION).Replace('{{COMMIT}}', $env:GITHUB_SHA).Replace('{{RUN_URL}}', $run)
+          $body = $body.Replace('{{SHA_LAUNCHER}}', $env:SHA_LAUNCHER).Replace('{{SHA_GAME}}', $env:SHA_GAME)
+          if ($body -match '\{\{') { throw "unreplaced placeholder in the release notes" }
+          Set-Content -Path out\release-notes.md -Value $body -Encoding utf8
+
+      - name: Create the draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          $ghArgs = @('release', 'create', $env:TAG,
+            "out\RustyMCLA.exe", "out\game-$($env:VERSION).zip", "out\manifest.unsigned.json", "out\SHA256SUMS.txt",
+            '--draft', '--title', "Rusty MCLA $($env:VERSION)", '--notes-file', 'out\release-notes.md', '--target', $env:GITHUB_SHA)
+          if ($env:EVENT -eq 'push') { $ghArgs += '--verify-tag' }
+          & gh @ghArgs
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed (is there already a release or draft for $($env:TAG)? delete it first)" }
+          Write-Host "Draft created. Next: run tools\sign-release.ps1 -Tag $($env:TAG) on your own machine, then review and publish the draft."

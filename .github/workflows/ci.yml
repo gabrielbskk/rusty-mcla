@@ -1,0 +1,199 @@
+name: CI
+
+# Clean build and tests of both workspaces on every push and pull request. Nothing is uploaded and no secret is used.
+#
+#  game      the game workspace (mcla-rs) with the GNU toolchain and WinLibs UCRT mingw-w64, the same combination the project builds with locally
+#  launcher  the launcher workspace with MSVC and a static CRT (one exe, no runtime to install)
+#  licenses  cargo-deny: every dependency licence must be compatible with GPL-3.0-only (deny.toml)
+#  linux / macos  "does it still compile there" checks; continue-on-error until they have proven themselves
+#
+# Tests that need the user's disc, extracted data or a real save skip themselves (or are #[ignore]d) when the files are missing, so a
+# plain runner passes without any game data.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_VERSION: "1.99.0"
+  # WinLibs mingw-w64 (UCRT, POSIX threads, SEH): the GNU toolchain's C compiler/linker. Pinned by version and SHA-256.
+  WINLIBS_URL: https://github.com/brechtsanders/winlibs_mingw/releases/download/16.2.0posix-14.0.0-ucrt-r1/winlibs-x86_64-posix-seh-gcc-16.2.0-mingw-w64ucrt-14.0.0-r1.7z
+  WINLIBS_SHA256: 9714f9e55905000ec2a066ae033abdfe8c93083a925e3fe015d3c7cc4bb1c918
+
+jobs:
+  game:
+    name: Game workspace (Windows, GNU)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Rust toolchain (GNU)
+        shell: pwsh
+        run: |
+          rustup toolchain install "$env:RUST_VERSION-x86_64-pc-windows-gnu" --profile minimal
+          "RUSTUP_TOOLCHAIN=$env:RUST_VERSION-x86_64-pc-windows-gnu" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          rustup run "$env:RUST_VERSION-x86_64-pc-windows-gnu" rustc --version
+
+      - name: Restore WinLibs
+        id: winlibs-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: C:\winlibs
+          key: winlibs-${{ env.WINLIBS_SHA256 }}
+
+      - name: Download WinLibs (mingw-w64)
+        if: steps.winlibs-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri $env:WINLIBS_URL -OutFile "$env:RUNNER_TEMP\winlibs.7z"
+          $hash = (Get-FileHash -Algorithm SHA256 "$env:RUNNER_TEMP\winlibs.7z").Hash.ToLower()
+          if ($hash -ne $env:WINLIBS_SHA256) { throw "WinLibs download has sha256 $hash, expected $env:WINLIBS_SHA256" }
+          7z x "$env:RUNNER_TEMP\winlibs.7z" -oC:\winlibs -y | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "7z failed" }
+
+      - name: WinLibs on PATH
+        shell: pwsh
+        run: |
+          "C:\winlibs\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          & C:\winlibs\mingw64\bin\gcc.exe --version | Select-Object -First 1
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: mcla-rs
+          key: gnu-${{ env.RUST_VERSION }}
+
+      - name: Test (release)
+        working-directory: mcla-rs
+        run: cargo test --release --workspace --no-fail-fast
+
+      - name: Build the game and the tool (release)
+        working-directory: mcla-rs
+        run: cargo build --release -p mcla -p mcla-tool
+
+  launcher:
+    name: Launcher workspace (Windows, MSVC, static CRT)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Rust toolchain (MSVC)
+        shell: pwsh
+        run: |
+          rustup toolchain install "$env:RUST_VERSION-x86_64-pc-windows-msvc" --profile minimal
+          "RUSTUP_TOOLCHAIN=$env:RUST_VERSION-x86_64-pc-windows-msvc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          rustup run "$env:RUST_VERSION-x86_64-pc-windows-msvc" rustc --version
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: launcher
+          key: msvc-${{ env.RUST_VERSION }}
+
+      - name: Test (release)
+        working-directory: launcher
+        run: cargo test --release --workspace --no-fail-fast
+
+      - name: Build the launcher and mk-manifest (release)
+        working-directory: launcher
+        run: cargo build --release -p rusty-mcla -p mcla-updater --bin rusty-mcla --bin mk-manifest
+
+      - name: The launcher is one exe that imports only Windows system DLLs
+        shell: pwsh
+        run: |
+          $bytes = [IO.File]::ReadAllBytes("launcher\target\release\rusty-mcla.exe")
+          $text = [Text.Encoding]::GetEncoding(28591).GetString($bytes)
+          $dlls = [regex]::Matches($text, '[A-Za-z0-9_\-\.]{2,60}\.dll', 'IgnoreCase') | ForEach-Object { $_.Value.ToLower() } | Sort-Object -Unique
+          $dlls
+          $bad = $dlls | Where-Object { $_ -match 'vcruntime|msvcp|webview2loader|libssl|libcrypto|libgcc|libstdc' }
+          if ($bad) { throw "unexpected runtime dependencies: $bad" }
+
+  licenses:
+    name: Dependency licences (cargo-deny)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        manifest: [mcla-rs/Cargo.toml, launcher/Cargo.toml]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          manifest-path: ${{ matrix.manifest }}
+          command: check
+          command-arguments: licenses sources
+
+  linux:
+    name: Compile check (Linux)
+    runs-on: ubuntu-latest
+    continue-on-error: true   # not proven yet; Linux is planned, not supported
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: System packages (Tauri / WebKitGTK, audio, input)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev libssl-dev libxdo-dev libasound2-dev libudev-dev
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          echo "RUSTUP_TOOLCHAIN=$RUST_VERSION" >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            mcla-rs
+            launcher
+          key: linux-${{ env.RUST_VERSION }}
+
+      - name: Platform-independent crates, tests
+        working-directory: mcla-rs
+        run: cargo test --release -p mcla-formats -p mcla-config -p mcla-install -p mcla-savedecode -p mcla-flash --no-fail-fast
+
+      - name: Launcher, check
+        working-directory: launcher
+        run: cargo check --release --workspace
+
+  macos:
+    name: Compile check (macOS)
+    runs-on: macos-latest
+    continue-on-error: true   # not proven yet; macOS is planned, not supported
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          echo "RUSTUP_TOOLCHAIN=$RUST_VERSION" >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            mcla-rs
+            launcher
+          key: macos-${{ env.RUST_VERSION }}
+
+      - name: Platform-independent crates, tests
+        working-directory: mcla-rs
+        run: cargo test --release -p mcla-formats -p mcla-config -p mcla-install -p mcla-savedecode -p mcla-flash --no-fail-fast
+
+      - name: Launcher, check
+        working-directory: launcher
+        run: cargo check --release --workspace
