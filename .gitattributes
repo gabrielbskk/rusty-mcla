@@ -1,0 +1,6 @@
+# Normalise line endings; binary files are left alone.
+* text=auto
+*.png binary
+*.ico binary
+*.zip binary
+*.exe binary

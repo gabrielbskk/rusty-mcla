@@ -1,0 +1,42 @@
+# Build output
+target/
+**/target/
+
+# Game data and disc image (huge, from the user's own copy of the game)
+*.iso
+/extracted/
+/export/
+/save/
+*.7z
+
+# Scratch folder
+/work/
+
+# Python / editor noise
+__pycache__/
+*.pyc
+.vscode/
+.idea/
+Thumbs.db
+
+# Documents
+/docs/
+
+# Added for the first publish (release audit): things that must never be committed
+hudmap_frame.png
+/docs/reference/recomp/
+
+# Saves, keys, secrets
+mcla_save*.json
+*.sav
+RAGE.SAV
+PARAM.*
+*.key
+*.pem
+*.minisig
+.env
+.env.*
+
+# Build products and signing scratch of a release
+/release-out/
+*.pickle

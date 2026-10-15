@@ -1,0 +1,35 @@
+# Dependency licence policy (cargo-deny). The project is GPL-3.0-only (see LICENSE); everything below is compatible with that.
+# Checked for both workspaces:  cargo deny --manifest-path mcla-rs/Cargo.toml check licenses sources
+#                               cargo deny --manifest-path launcher/Cargo.toml check licenses sources
+[licenses]
+confidence-threshold = 0.9
+allow = [
+    "GPL-3.0-only",
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "CC0-1.0",
+    "Unlicense",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+]
+# egui's bundled fonts (epaint_default_fonts, in the game's F1 overlay) are under font licences; their texts must accompany a binary release.
+exceptions = [
+    { allow = ["OFL-1.1", "Ubuntu-font-1.0"], crate = "epaint_default_fonts" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+[bans]
+multiple-versions = "allow"
