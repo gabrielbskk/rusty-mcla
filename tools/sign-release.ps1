@@ -91,7 +91,8 @@ if ($Minisign -eq "" -or -not (Test-Path $Minisign)) { Fail "minisign.exe not fo
 if ($KeyFile -eq "") { if ($env:MINISIGN_KEY) { $KeyFile = $env:MINISIGN_KEY } else { $KeyFile = Join-Path $HOME ".minisign\minisign.key" } }
 if (-not (Test-Path $KeyFile)) { Fail "secret key file not found: $KeyFile (pass -KeyFile <path>; keep that file offline)" }
 # a safety net, not a check of the key: the secret key must not be inside a git checkout that could publish it
-$keyFull = (Resolve-Path $KeyFile).Path
+# ProviderPath, not Path: for a key on a network share Path is "Microsoft.PowerShell.Core\FileSystem::\\server\share\..." which minisign cannot open
+$keyFull = (Resolve-Path $KeyFile).ProviderPath
 if ($keyFull.StartsWith($RepoRoot, [System.StringComparison]::OrdinalIgnoreCase)) { Fail "the secret key is inside the repository folder ($keyFull). Move it out of the checkout first." }
 
 if ($DraftDir -eq "") {
