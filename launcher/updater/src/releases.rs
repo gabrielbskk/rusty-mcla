@@ -402,11 +402,11 @@ mod tests {
     fn release_objects_are_read_strictly_enough() {
         let cfg = ReleaseConfig::embedded("0.1.0");
         let ok = br#"{"tag_name":"v1.2.3","name":"N","body":"B","published_at":"2026-01-01T00:00:00Z","assets":[
-            {"name":"a.zip","size":5,"browser_download_url":"https://github.com/OWNER/rusty-mcla/releases/download/v1.2.3/a.zip"},
+            {"name":"a.zip","size":5,"browser_download_url":"https://github.com/holdmysocks/rusty-mcla/releases/download/v1.2.3/a.zip"},
             {"name":"b.zip","size":5,"browser_download_url":"https://evil.example/b.zip"}]}"#;
         let r = parse_release(ok, &cfg).unwrap();
         assert_eq!((r.tag.as_str(), r.version().as_deref(), r.assets.len()), ("v1.2.3", Some("1.2.3"), 1));
-        assert_eq!(r.html_url, "https://github.com/OWNER/rusty-mcla/releases/tag/v1.2.3", "a missing html_url falls back to the configured repository");
+        assert_eq!(r.html_url, "https://github.com/holdmysocks/rusty-mcla/releases/tag/v1.2.3", "a missing html_url falls back to the configured repository");
         assert!(parse_release(br#"{"tag_name":"latest"}"#, &cfg).is_err());
         assert!(parse_release(br#"{"name":"x"}"#, &cfg).is_err());
         assert!(parse_release(b"[]", &cfg).is_err());

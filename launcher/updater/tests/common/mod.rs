@@ -195,7 +195,7 @@ pub struct Paths {
     pub launcher: String,
 }
 
-pub const REPO: &str = "OWNER/rusty-mcla";
+pub const REPO: &str = "holdmysocks/rusty-mcla";
 
 /// A complete release `version` for a mock at `base`: launcher exe (signed with `key`), game zip, manifest, release JSON.
 pub fn fixture(base: &str, version: &str, key: &TestKey, data_version: u32, body: &str) -> Fixture {

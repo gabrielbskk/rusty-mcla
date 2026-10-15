@@ -231,13 +231,27 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_shipped_placeholder_key_means_no_self_update() {
+    fn a_placeholder_key_means_no_self_update() {
         let (key, d) = (new_key(), tempfile::tempdir().unwrap());
         let f = d.path().join("new.exe");
         std::fs::write(&f, FILE).unwrap();
-        let e = verify_file(&f, &asset_for(FILE, &key), &ReleaseConfig::embedded("0.1.0"), &Cancel::new()).unwrap_err();
+        let mut cfg = ReleaseConfig::embedded("0.1.0");
+        cfg.public_key = "untrusted comment: NOT SET. Replace this whole file with the public key made offline by `minisign -G`.\n".to_string();
+        let e = verify_file(&f, &asset_for(FILE, &key), &cfg, &Cancel::new()).unwrap_err();
         assert_eq!(e.kind, Kind::Signature);
         assert!(e.detail.contains("no signing key"));
+    }
+
+    #[test]
+    fn the_shipped_public_key_is_a_real_minisign_key() {
+        // launcher/update-key.pub holds the maintainer's public key (made offline on 2026-10-15); it must decode, and a signature by any other key must not verify with it
+        let cfg = ReleaseConfig::embedded("0.1.0");
+        assert!(minisign_verify::PublicKey::decode(&cfg.public_key).is_ok(), "the shipped update-key.pub must be a valid minisign public key");
+        assert!(cfg.public_key.contains("0B74E78DA50B7E18"));
+        let (other, d) = (new_key(), tempfile::tempdir().unwrap());
+        let f = d.path().join("new.exe");
+        std::fs::write(&f, FILE).unwrap();
+        assert_eq!(verify_file(&f, &asset_for(FILE, &other), &cfg, &Cancel::new()).unwrap_err().kind, Kind::Signature);
     }
 
     #[test]

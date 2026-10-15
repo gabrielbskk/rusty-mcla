@@ -451,6 +451,8 @@ async fn self_update_refuses_a_file_signed_by_another_key_and_a_missing_key() {
     cfg2.api_base = r.mock.base.clone();
     cfg2.web_base = r.mock.base.clone();
     cfg2.mock_authority = Some(r.mock.base.trim_start_matches("http://").to_string());
+    // the shipped update-key.pub is now the real key: simulate a build whose key file is still the placeholder
+    cfg2.public_key = "untrusted comment: NOT SET. Replace this whole file with the public key made offline by `minisign -G`.\n".to_string();
     let http = Http::new(Arc::new(cfg2)).unwrap();
     r.mock.clear_hits();
     let e = selfupdate::download_and_stage(&http, &rel, &m, &exe, &Cancel::new(), &mcla_updater::no_progress()).await.unwrap_err();
