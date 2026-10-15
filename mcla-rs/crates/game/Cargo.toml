@@ -12,6 +12,7 @@ path = "src/main.rs"
 mcla-formats = { path = "../formats" }
 mcla-flash = { path = "../flash" }
 mcla-config = { path = "../config" }
+mcla-shaders = { path = "../shaders" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 anyhow.workspace = true
 log.workspace = true

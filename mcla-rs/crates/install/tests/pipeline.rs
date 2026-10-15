@@ -210,10 +210,57 @@ fn local_manifest_round_trips() {
         files_bytes: 9,
         files_list_sha256: "00".into(),
         audio_problems: 0,
+        shaders: Default::default(),
     };
     lm.save(&l).unwrap();
     let back = LocalManifest::load(&l).unwrap();
     assert_eq!(back.files_count, 2);
     assert_eq!(back.paths["cache"], "data/cache");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn shader_files_are_their_own_stage_and_a_changed_file_is_found() {
+    use mcla_install::layout::LocalManifest;
+    let root = temp("shaders");
+    let l = Layout::new(&root);
+    let dir = l.cache().join("shaders_wgsl");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(l.install_dir()).unwrap();
+    std::fs::write(dir.join("xs_sky.wgsl"), b"fn xs_sky_vs() {}").unwrap();
+    std::fs::write(l.cache().join("other"), b"12345").unwrap();
+    let files = vec![
+        mcla_install::extract::FileRecord { path: "cache/other".into(), size: 5 },
+        mcla_install::extract::FileRecord { path: "cache/shaders_wgsl/xs_sky.wgsl".into(), size: 17 },
+    ];
+    write_file_atomic(&l.files_list(), list_text(&files).as_bytes()).unwrap();
+    // the manifest knows the file's hash
+    let hashes = mcla_install::shaders::hashes_of(&l.cache(), &["xs_sky.wgsl"]).unwrap();
+    let mut lm = {
+        let text = serde_json::json!({
+            "schema": 1, "data_version": 2, "installed_unix": 1,
+            "iso": { "file_name": "x.iso", "size": 5, "partition_base": 0, "title_id": "1", "region_mask": "2", "rpf_entries": 3, "sha256": null, "dump": "not_checked" },
+            "ffmpeg": null, "paths": {}, "stages": {}, "files_list": "", "files_count": 2, "files_bytes": 22, "files_list_sha256": "00", "audio_problems": 0
+        });
+        serde_json::from_value::<LocalManifest>(text).unwrap()
+    };
+    lm.shaders = hashes;
+    lm.save(&l).unwrap();
+    let ctx = Ctx::silent();
+    assert!(mcla_install::verify::verify(&l, &ctx).unwrap().ok());
+    // same size, other content: only the hash tells
+    std::fs::write(dir.join("xs_sky.wgsl"), b"fn xs_sky_vs() {;").unwrap();
+    let rep = mcla_install::verify::verify(&l, &ctx).unwrap();
+    assert_eq!(rep.changed, vec!["cache/shaders_wgsl/xs_sky.wgsl".to_string()]);
+    assert!(rep.missing.is_empty() && rep.wrong_size.is_empty());
+    assert_eq!(rep.damaged_stages(), vec!["shaders"], "a changed shader file must not send the whole extraction again");
+    let mut st = State::default();
+    st.done.insert("extract".into(), true);
+    st.done.insert("shaders".into(), true);
+    st.save(&l).unwrap();
+    mcla_install::verify::prepare_repair(&l, &rep).unwrap();
+    let st = State::load(&l);
+    assert!(st.is_done("extract") && !st.is_done("shaders"));
+    assert!(!dir.join("xs_sky.wgsl").exists());
     let _ = std::fs::remove_dir_all(&root);
 }

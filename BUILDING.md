@@ -63,7 +63,7 @@ The window's page (`launcher/ui`) is embedded at compile time, so rebuild after 
 
 You need your own disc image of the Xbox 360 *Midnight Club: Los Angeles, Complete Edition (USA, Europe)*; nothing of the game is in this repository.
 
-**Build the game data once** (about two minutes, about 14 GB of disk; it downloads a pinned `ffmpeg` if there is none):
+**Build the game data once** (about two minutes, about 14 GB of disk; it downloads a pinned `ffmpeg` if there is none). This also translates the original's sky, road and sea shader programs from your disc into `data\cache\shaders_wgsl\` (a second or two); the game needs them and they are not in this repository:
 
 ```powershell
 mcla-rs\target\release\mcla-tool.exe install "C:\path\to\the-disc.iso" C:\RustyMCLA

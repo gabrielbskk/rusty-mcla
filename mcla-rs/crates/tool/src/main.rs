@@ -31,6 +31,7 @@ fn main() -> Result<()> {
         "rpf" => cmd_rpf(&args[2..]),
         "extract" => cmd_extract(&args[2..]),
         "install" => cmd_install(&args[2..]),
+        "shaders-wgsl" => cmd_shaders_wgsl(&args[2..]),
         "ffmpeg" => cmd_ffmpeg(&args[2..]),
         "plainscripts" => cmd_plainscripts(&args[2..]),
         "xmemtest" => cmd_xmemtest(&args[2..]),
@@ -545,6 +546,37 @@ fn cmd_install(a: &[String]) -> Result<()> {
             eprintln!("run the game with: mcla --data \"{}\"", Path::new(&pos[1]).join("data").join("cache").display());
         }
     }
+    Ok(())
+}
+
+/// `shaders-wgsl <data cache folder> [--iso <iso>]`: translate the game's sky / road / sea shader programs into `<folder>/shaders_wgsl/`
+/// (the install stage "Translate shaders", for an existing extraction). The disc image is only needed when `<folder>/shaders/exe/exe_82801b00`
+/// (the cloud pass cut out of default.xex) is not there yet. Prints the SHA-256 of every file.
+fn cmd_shaders_wgsl(a: &[String]) -> Result<()> {
+    let (mut pos, mut iso) = (Vec::new(), None);
+    let mut it = a.iter();
+    while let Some(s) = it.next() {
+        match s.as_str() {
+            "--iso" => iso = Some(PathBuf::from(it.next().context("--iso needs a file")?)),
+            f if f.starts_with("--") => bail!("unknown option {}", f),
+            _ => pos.push(s.clone()),
+        }
+    }
+    if pos.len() != 1 {
+        bail!("usage: mcla-tool shaders-wgsl <data cache folder> [--iso <iso>]");
+    }
+    let xiso = match &iso {
+        Some(p) => Some(Xiso::open(p)?),
+        None => None,
+    };
+    let cache = Path::new(&pos[0]);
+    let t0 = std::time::Instant::now();
+    let rep = mcla_install::shaders::run(cache, xiso.as_ref(), &cli_ctx()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let hashes = mcla_install::shaders::hashes(cache).map_err(|e| anyhow::anyhow!("{e}"))?;
+    for f in &rep.files {
+        println!("{}  {:>7} bytes  {}  {}", hashes.get(f.name).map(|s| s.as_str()).unwrap_or("?"), f.bytes, if f.written { "written  " } else { "unchanged" }, f.name);
+    }
+    eprintln!("{} files, {} written{} in {:.2} s", rep.files.len(), rep.written(), if rep.effect_cut { ", the executable's effect was cut out of the disc" } else { "" }, t0.elapsed().as_secs_f64());
     Ok(())
 }
 

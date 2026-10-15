@@ -1,7 +1,7 @@
 # Rusty MCLA launcher
 
 The launcher for the unofficial PC port (see `../docs/LAUNCHER.md` for the plan, the decisions and the visual design).
-This folder is the **launcher shell**: window, tabs, themes, language support, settings and logs, plus the live **Install page** (disc validation, build with progress, Cancel / Resume, verify) on top of the
+This folder is the **launcher shell**: window, tabs, themes, language support, settings and logs, plus the live **Install page** (disc validation, build with progress, Cancel / Resume, verify; the build stages are extract, translate shaders, audio, video, verify) on top of the
 `mcla-install` crate (`../mcla-rs/crates/install`, used by path; MSVC and GNU both build it). The **update system** (release check, notes, game package, launcher self-update; library `updater/`, glue `src/update.rs`, page `ui/js/update.js`) is built, and so is the **Controls tab** (the game's own keyboard bindings, read from and written into the save through `mcla_config::keybinds`; `src/controls.rs`, `ui/js/controls.js`) with the live **Monitor** row in Settings > Display and game (`src/display.rs`); **Export Logs, the save manager and Play** are built too (library `support/`, glue `src/support.rs`, page `ui/js/support.js`); only CI is later work (listed in "Status and open list" of `../docs/LAUNCHER.md`).
 
 Tauri 2 + a plain HTML/CSS/JS page. No npm, no bundler, no Tauri CLI: the only toolchain is Rust. It is its own cargo workspace,

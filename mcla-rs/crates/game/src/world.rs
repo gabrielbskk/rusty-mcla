@@ -273,7 +273,7 @@ fn classify(shader: &str, flags: u32) -> MatMode {
         // (MCLA_WATER_OLD=1: the sea drawn blended with the generic rule, as until 2026-10-14)
         MatMode::Blend
     } else if s.contains("oceanwaterlod") {
-        // (the sea, CityOceanWater / CityOceanWaterLOD: the game's own programs - render/xs_water.wgsl;
+        // (the sea, CityOceanWater / CityOceanWaterLOD: the game's own programs - xs_water.wgsl, render/xs.rs;
         // the pond water, CityPondWater, has programs of its own and stays blended)
         MatMode::OceanWaterLod
     } else if s.contains("oceanwater") {

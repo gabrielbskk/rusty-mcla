@@ -1677,6 +1677,7 @@ dependencies = [
  "mcla-config",
  "mcla-flash",
  "mcla-formats",
+ "mcla-shaders",
  "memmap2",
  "png",
  "pollster",
@@ -1732,6 +1733,7 @@ dependencies = [
  "fs2",
  "log",
  "mcla-formats",
+ "mcla-shaders",
  "rayon",
  "serde",
  "serde_json",
@@ -1746,6 +1748,14 @@ version = "0.1.0"
 dependencies = [
  "aes",
  "serde_json",
+]
+
+[[package]]
+name = "mcla-shaders"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "sha2",
 ]
 
 [[package]]

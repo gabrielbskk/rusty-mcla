@@ -1,0 +1,16 @@
+[package]
+name = "mcla-shaders"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rusty MCLA: translates the game's own Xbox 360 shader microcode (read from the user's disc) to WGSL on the user's machine"
+
+[lib]
+name = "mcla_shaders"
+path = "src/lib.rs"
+
+[dependencies]
+regex = "1"
+
+[dev-dependencies]
+sha2 = "0.10"

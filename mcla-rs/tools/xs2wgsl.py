@@ -1,5 +1,9 @@
 """Xenos shader microcode -> WGSL, instruction by instruction, for the game's rgxa effect files.
 
+REFERENCE IMPLEMENTATION. The install pipeline does this in Rust (crates/shaders, `mcla-tool shaders-wgsl <data cache folder>`), on the
+player's machine, from the player's own disc; the generated WGSL is not kept in the repository. The Rust output is byte-identical to this
+script's (apart from the first comment line); this file (with xsh.py and xsrun.py) stays as the readable description of the rules.
+
     xs2wgsl.py <fxl file> <program name> [function name]      prints the WGSL of one program
 
 The output is a function over a register machine - nothing is simplified, so it computes what

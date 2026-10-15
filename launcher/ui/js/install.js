@@ -15,7 +15,8 @@
   ];
   // Build stages as the page shows them. ffmpeg shares the audio row, verify shares the stamp.
   const STAGES = [
-    { id: 'extract', names: ['extract'], key: 'dyn.s_extract', weight: 0.10 },
+    { id: 'extract', names: ['extract'], key: 'dyn.s_extract', weight: 0.09 },
+    { id: 'shaders', names: ['shaders'], key: 'dyn.s_shaders', weight: 0.01 },
     { id: 'audio', names: ['ffmpeg', 'audio'], key: 'dyn.s_audio', weight: 0.82 },
     { id: 'video', names: ['video'], key: 'dyn.s_video', weight: 0.06 },
     { id: 'verify', names: ['stamp', 'verify'], key: 'dyn.s_verify', weight: 0.02 },

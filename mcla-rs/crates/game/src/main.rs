@@ -5721,6 +5721,15 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
             let world_ref = &world;
             let out = eg.ctx.run(raw, |ctx| {
                 action = game.ui(ctx, vehicles, world_ref, hud);
+                if let Some(msg) = render::xs::problem() {
+                    // (the translated shader files are missing: one notice; the log has the same sentence)
+                    egui::Area::new(egui::Id::new("xs_missing")).anchor(egui::Align2::CENTER_TOP, [0.0, 20.0]).order(egui::Order::Foreground).show(ctx, |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            ui.set_max_width(640.0);
+                            ui.colored_label(egui::Color32::from_rgb(255, 120, 100), msg);
+                        });
+                    });
+                }
                 if show {
                     egui::Window::new("debug").default_pos([10.0, 10.0]).resizable(false).default_open(false).show(ctx, |ui| {
                         ui.label(format!("{:.0} fps  {:.2} ms", fps, ms));

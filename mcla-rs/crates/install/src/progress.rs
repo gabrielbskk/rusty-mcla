@@ -12,6 +12,7 @@ pub enum Stage {
     Validate,
     Checksum,
     Extract,
+    Shaders,
     Ffmpeg,
     Audio,
     Video,
@@ -26,6 +27,7 @@ impl Stage {
             Stage::Validate => "validate",
             Stage::Checksum => "checksum",
             Stage::Extract => "extract",
+            Stage::Shaders => "shaders",
             Stage::Ffmpeg => "ffmpeg",
             Stage::Audio => "audio",
             Stage::Video => "video",
@@ -34,7 +36,7 @@ impl Stage {
         }
     }
     /// The stages of an install, in order (Checksum runs beside the others).
-    pub const INSTALL: [Stage; 8] = [Stage::Preflight, Stage::Validate, Stage::Extract, Stage::Ffmpeg, Stage::Audio, Stage::Video, Stage::Stamp, Stage::Verify];
+    pub const INSTALL: [Stage; 9] = [Stage::Preflight, Stage::Validate, Stage::Extract, Stage::Shaders, Stage::Ffmpeg, Stage::Audio, Stage::Video, Stage::Stamp, Stage::Verify];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

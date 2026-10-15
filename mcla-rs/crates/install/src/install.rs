@@ -8,6 +8,7 @@ use crate::ffmpeg;
 use crate::layout::{list_hash, list_text, scan, write_file_atomic, FfmpegNote, Layout, LocalManifest, StageSummary, State};
 use crate::manifest::Manifest;
 use crate::preflight;
+use crate::shaders;
 use crate::progress::{Cancel, Ctx, Event, Stage, Unit};
 use crate::validate::{hash_iso_with_stop, Disc, DumpState, HashResult};
 use crate::verify;
@@ -18,6 +19,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 const NAMES: &str = include_str!("../../../names.txt");
+
+/// The data version at which each stage's output last changed. When the manifest's `data_version` moves, the finished flags of the stages
+/// that did not change since the data was built are kept, so a rebuild runs only the new or changed stages (version 2 added "shaders":
+/// existing data keeps its extraction, audio and video and only translates the shader programs).
+const STAGE_SINCE: [(&str, u32); 4] = [("extract", 1), ("audio", 1), ("video", 1), ("shaders", 2)];
 
 #[derive(Debug, Clone)]
 pub struct InstallOptions {
@@ -92,8 +98,21 @@ pub fn install(opts: &InstallOptions, ctx: &Ctx) -> Result<InstallOutcome> {
     ctx.check()?;
 
     let mut state = State::load(&l);
-    if state.iso_size != disc.identity.size || state.iso_name != disc.identity.file_name || state.data_version != m.data_version {
+    if state.data_version == 0 {
+        // no work state (an older launcher removed it, or the data came from another tool): a finished build says what it contains
+        if let Some(lm) = LocalManifest::load(&l).filter(|lm| lm.iso.size == disc.identity.size && lm.iso.file_name == disc.identity.file_name) {
+            let done = ["extract", "audio", "video"].iter().map(|s| (s.to_string(), true)).collect();
+            state = State { data_version: lm.data_version, iso_size: lm.iso.size, iso_name: lm.iso.file_name.clone(), done };
+        }
+    }
+    let mut migrated = false;
+    if state.iso_size != disc.identity.size || state.iso_name != disc.identity.file_name {
         state = State { data_version: m.data_version, iso_size: disc.identity.size, iso_name: disc.identity.file_name.clone(), done: BTreeMap::new() };
+    } else if state.data_version != m.data_version {
+        let old = state.data_version;
+        state.done.retain(|k, _| STAGE_SINCE.iter().any(|(n, since)| n == k && old >= *since));
+        state.data_version = m.data_version;
+        migrated = !state.done.is_empty();
     }
     state.save(&l)?;
 
@@ -105,7 +124,7 @@ pub fn install(opts: &InstallOptions, ctx: &Ctx) -> Result<InstallOutcome> {
     } else {
         None
     };
-    let r = run_stages(opts, ctx, &l, &mut disc, &mut state, &mut hash);
+    let r = run_stages(opts, ctx, &l, &mut disc, &mut state, &mut hash, migrated);
     stop.cancel();
     if let Some(h) = hash.take() {
         let _ = h.join();
@@ -115,22 +134,38 @@ pub fn install(opts: &InstallOptions, ctx: &Ctx) -> Result<InstallOutcome> {
     Ok(out)
 }
 
-fn run_stages(opts: &InstallOptions, ctx: &Ctx, l: &Layout, disc: &mut Disc, state: &mut State, hash: &mut Option<std::thread::JoinHandle<Result<HashResult>>>) -> Result<InstallOutcome> {
+/// `migrated`: the data was built with an older data version and its finished stages are kept (nothing to extract again).
+fn run_stages(opts: &InstallOptions, ctx: &Ctx, l: &Layout, disc: &mut Disc, state: &mut State, hash: &mut Option<std::thread::JoinHandle<Result<HashResult>>>, migrated: bool) -> Result<InstallOutcome> {
     let m = &opts.manifest;
     let names = names();
     // 3. extract
-    ctx.message(Stage::Extract, "Extracting the game data");
-    let rpf = Rpf3::open(Arc::new(disc.iso.file(&m.iso.game_archive).map_err(|e| InstallError::new(ErrorKind::MissingFile, format!("{e:#}")))?), &disc.key).map_err(|e| InstallError::new(ErrorKind::UnsupportedEdition, format!("{e:#}")))?;
-    let rep = extract::extract_archive(&rpf, &l.cache(), &names, ExtractOptions::default(), Stage::Extract, ctx)?;
-    if !rep.failed.is_empty() {
-        let first: Vec<String> = rep.failed.iter().take(5).map(|(p, e)| format!("{p}: {e}")).collect();
-        return Err(InstallError::new(ErrorKind::DataDamaged, format!("{} archive entries could not be extracted: {}", rep.failed.len(), first.join("; "))));
+    let (extract_written, extract_skipped);
+    if migrated && state.is_done("extract") {
+        extract_written = 0;
+        extract_skipped = 0;
+        stage_done(ctx, Stage::Extract, "Game data already extracted");
+    } else {
+        ctx.message(Stage::Extract, "Extracting the game data");
+        let rpf = Rpf3::open(Arc::new(disc.iso.file(&m.iso.game_archive).map_err(|e| InstallError::new(ErrorKind::MissingFile, format!("{e:#}")))?), &disc.key).map_err(|e| InstallError::new(ErrorKind::UnsupportedEdition, format!("{e:#}")))?;
+        let rep = extract::extract_archive(&rpf, &l.cache(), &names, ExtractOptions::default(), Stage::Extract, ctx)?;
+        if !rep.failed.is_empty() {
+            let first: Vec<String> = rep.failed.iter().take(5).map(|(p, e)| format!("{p}: {e}")).collect();
+            return Err(InstallError::new(ErrorKind::DataDamaged, format!("{} archive entries could not be extracted: {}", rep.failed.len(), first.join("; "))));
+        }
+        state.done.insert("extract".into(), true);
+        state.save(l)?;
+        stage_done(ctx, Stage::Extract, &format!("{} files written, {} already there", rep.written, rep.skipped));
+        extract_written = rep.written;
+        extract_skipped = rep.skipped;
     }
-    state.done.insert("extract".into(), true);
+    ctx.check()?;
+
+    // 3b. translate the sky / road / sea shader programs of the original (a derivative of the game's data, so made here and never shipped)
+    let srep = shaders::run(&l.cache(), Some(&disc.iso), ctx)?;
+    state.done.insert("shaders".into(), true);
     state.save(l)?;
-    stage_done(ctx, Stage::Extract, &format!("{} files written, {} already there", rep.written, rep.skipped));
-    let (extract_written, extract_skipped) = (rep.written, rep.skipped);
-    drop(rep);
+    stage_done(ctx, Stage::Shaders, &format!("{} shader programs translated ({} written, {} already there)", srep.files.len(), srep.written(), srep.files.len() - srep.written()));
+    ctx.check()?;
 
     // 4. ffmpeg
     let need_audio = !state.is_done("audio");
@@ -226,6 +261,7 @@ fn run_stages(opts: &InstallOptions, ctx: &Ctx, l: &Layout, disc: &mut Disc, sta
         files_bytes: files.iter().map(|f| f.size).sum(),
         files_list_sha256: list_hash(&text),
         audio_problems: audio_problems.len(),
+        shaders: shaders::hashes(&l.cache())?,
     };
     local.save(l)?;
     state.done.insert("stamp".into(), true);

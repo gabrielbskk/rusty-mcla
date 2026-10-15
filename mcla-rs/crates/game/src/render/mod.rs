@@ -3,6 +3,7 @@
 pub mod car_lamps;
 pub mod post;
 pub mod skyhat;
+pub mod xs;
 
 use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
@@ -373,7 +374,7 @@ pub enum MatMode {
     /// glass props (PSPropGlass and its night program): door leaves, glass walls - blended, both sides
     PropGlass = 26,
     /// the detailed sea (CityOceanWater): the game's own programs, VSCityOceanWater (waves moved by
-    /// the vertex colour) + PSCityOceanWater - render/xs_water.wgsl; opaque, as the original draws it
+    /// the vertex colour) + PSCityOceanWater - xs_water.wgsl (translated at install time, xs.rs); opaque, as the original draws it
     OceanWater = 27,
     /// the far sea (CityOceanWaterLOD): flat, the same pixel program
     OceanWaterLod = 28,
@@ -587,6 +588,8 @@ pub struct Gpu {
 
 impl Gpu {
     pub async fn new(window: Arc<winit::window::Window>) -> Result<Gpu> {
+        // (the game's own sky / road / sea programs: translated from the disc at install time, read once here - xs.rs)
+        xs::load(&crate::hooks::get().map(|r| r.data.path.clone()).unwrap_or_else(|| std::path::PathBuf::from(".")));
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
             ..Default::default()
@@ -1136,7 +1139,7 @@ impl Gpu {
         let identity_obj = make_object_binding(&device, &obj_layout, &ObjectUniform::default());
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("city"),
-            source: wgpu::ShaderSource::Wgsl(paint_tuned(concat!(include_str!("city.wgsl"), include_str!("xs_road.wgsl"), include_str!("xs_roadn.wgsl"), include_str!("xs_water.wgsl"))).into()),
+            source: wgpu::ShaderSource::Wgsl(paint_tuned(&[include_str!("city.wgsl"), xs::text("xs_road.wgsl"), xs::text("xs_roadn.wgsl"), xs::text("xs_water.wgsl")].concat()).into()),
         });
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("city pl"),
@@ -1558,7 +1561,7 @@ impl Gpu {
         // the wet road's planar reflection: the far models mirrored, the dome mirrored behind
         let refl_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("road reflection"),
-            source: wgpu::ShaderSource::Wgsl(concat!(include_str!("refl.wgsl"), include_str!("xs_sky.wgsl"), include_str!("xs_sky_cheap.wgsl")).into()),
+            source: wgpu::ShaderSource::Wgsl([include_str!("refl.wgsl"), xs::text("xs_sky.wgsl"), xs::text("xs_sky_cheap.wgsl")].concat().into()),
         });
         let refl_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("road reflection"),

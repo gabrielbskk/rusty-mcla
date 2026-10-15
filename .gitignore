@@ -26,6 +26,10 @@ Thumbs.db
 hudmap_frame.png
 /docs/reference/recomp/
 
+# Generated from the player's own disc at install time (translations of the game's shader programs, crates/shaders): never committed
+xs_*.wgsl
+shaders_wgsl/
+
 # Saves, keys, secrets
 mcla_save*.json
 *.sav

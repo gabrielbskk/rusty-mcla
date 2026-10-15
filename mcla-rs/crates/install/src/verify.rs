@@ -4,26 +4,42 @@ use crate::error::{ErrorKind, InstallError, Result};
 use crate::layout::{parse_list, Layout, State};
 use crate::progress::{Ctx, Stage, Unit};
 use rayon::prelude::*;
+use sha2::Digest;
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct VerifyReport {
     pub checked: usize,
     pub missing: Vec<String>,
     pub wrong_size: Vec<String>,
+    /// Translated shader files (`cache/shaders_wgsl/*`) whose content differs from the hash in `manifest.local.json`.
+    #[serde(default)]
+    pub changed: Vec<String>,
 }
 
 impl VerifyReport {
     pub fn ok(&self) -> bool {
-        self.missing.is_empty() && self.wrong_size.is_empty()
+        self.missing.is_empty() && self.wrong_size.is_empty() && self.changed.is_empty()
     }
     pub fn damaged(&self) -> usize {
-        self.missing.len() + self.wrong_size.len()
+        self.missing.len() + self.wrong_size.len() + self.changed.len()
     }
-    /// Stage ids (`extract`, `audio`, `video`) that have damaged files.
+    /// Stage ids (`extract`, `shaders`, `audio`, `video`) that have damaged files.
     pub fn damaged_stages(&self) -> Vec<&'static str> {
         let mut v = Vec::new();
-        for (prefix, stage) in [("cache/", "extract"), ("audio_pc/", "audio"), ("video_pc/", "video")] {
-            if self.missing.iter().chain(self.wrong_size.iter()).any(|p| p.starts_with(prefix)) {
+        let (mut extract, mut shaders, mut audio, mut video) = (false, false, false, false);
+        for p in self.missing.iter().chain(self.wrong_size.iter()).chain(self.changed.iter()) {
+            if crate::shaders::OWNED_PREFIXES.iter().any(|o| p.starts_with(o)) {
+                shaders = true;
+            } else if p.starts_with("cache/") {
+                extract = true;
+            } else if p.starts_with("audio_pc/") {
+                audio = true;
+            } else if p.starts_with("video_pc/") {
+                video = true;
+            }
+        }
+        for (on, stage) in [(extract, "extract"), (shaders, "shaders"), (audio, "audio"), (video, "video")] {
+            if on {
                 v.push(stage);
             }
         }
@@ -53,13 +69,28 @@ pub fn verify(l: &Layout, ctx: &Ctx) -> Result<VerifyReport> {
     let (mut missing, mut wrong_size) = bad.into_inner().unwrap_or_default();
     missing.sort();
     wrong_size.sort();
-    Ok(VerifyReport { checked: list.len(), missing, wrong_size })
+    // the translated shaders are checked by content (a few hundred KB): the same size can hide a changed file
+    let mut changed = Vec::new();
+    if let Some(lm) = crate::layout::LocalManifest::load(l) {
+        for (name, want) in &lm.shaders {
+            let rel = format!("cache/{}/{}", crate::shaders::OUT_DIR, name);
+            if missing.contains(&rel) || wrong_size.contains(&rel) {
+                continue;
+            }
+            let got = std::fs::read(data.join(&rel)).map(|b| crate::validate::hex(&sha2::Sha256::digest(&b))).unwrap_or_default();
+            if got != *want {
+                changed.push(rel);
+            }
+        }
+        changed.sort();
+    }
+    Ok(VerifyReport { checked: list.len(), missing, wrong_size, changed })
 }
 
 /// Prepare a repair: delete files of the wrong size and clear the `done` flag of every damaged stage, so the next install run rebuilds
 /// only what is missing.
 pub fn prepare_repair(l: &Layout, report: &VerifyReport) -> Result<()> {
-    for p in &report.wrong_size {
+    for p in report.wrong_size.iter().chain(report.changed.iter()) {
         let _ = std::fs::remove_file(l.data().join(p));
     }
     let mut st = State::load(l);

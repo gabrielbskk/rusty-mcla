@@ -44,6 +44,8 @@ pub enum ErrorKind {
     Manifest,
     /// Something is wrong in the built data folder (verify).
     DataDamaged,
+    /// The shader programs could not be translated from the disc's data.
+    Shaders,
     /// Other I/O error (disk full, access denied while writing, ...).
     Io,
 }
@@ -71,6 +73,7 @@ impl ErrorKind {
             ErrorKind::Convert => "convert",
             ErrorKind::Manifest => "manifest",
             ErrorKind::DataDamaged => "data_damaged",
+            ErrorKind::Shaders => "shaders",
             ErrorKind::Io => "io",
         }
     }
@@ -97,6 +100,7 @@ impl ErrorKind {
             ErrorKind::Convert => "ffmpeg could not convert one of the files. See the build log.",
             ErrorKind::Manifest => "The install manifest is damaged or from a newer launcher.",
             ErrorKind::DataDamaged => "The built data folder is incomplete or damaged. Run Repair.",
+            ErrorKind::Shaders => "The sky, road and sea shader programs could not be translated from the game data. See the build log.",
             ErrorKind::Io => "A file could not be written (disk full, access denied or the file is in use).",
         }
     }

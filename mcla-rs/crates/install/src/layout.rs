@@ -102,6 +102,9 @@ pub struct LocalManifest {
     pub files_list_sha256: String,
     /// Audio files/waves ffmpeg could not convert (kept in the build log).
     pub audio_problems: usize,
+    /// SHA-256 of the translated shader files `cache/shaders_wgsl/*.wgsl` (name -> hex); verify compares them. Absent before data version 2.
+    #[serde(default)]
+    pub shaders: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

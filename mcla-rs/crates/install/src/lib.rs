@@ -16,6 +16,7 @@ pub mod layout;
 pub mod manifest;
 pub mod preflight;
 pub mod progress;
+pub mod shaders;
 pub mod validate;
 pub mod verify;
 pub mod video;

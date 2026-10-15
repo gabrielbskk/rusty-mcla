@@ -1,4 +1,5 @@
 """Xbox 360 (Xenos) shader microcode disassembler for the game's rgxa effect files.
+(Reference for crates/shaders/src/xenos.rs, which finds and translates the programs at install time.)
 usage: python xsh.py <fxl file> [shader name substring]   (lists the programs, disassembles the matches)
 """
 import struct, sys, re
