@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""Generate THIRD-PARTY-NOTICES.md: the licences of everything that ends up in the shipped binaries.
+
+usage: python tools/gen-third-party-notices.py            (run from the repository root; needs cargo and the crate sources downloaded,
+                                                          i.e. `cargo fetch` or a build has been done in both workspaces)
+
+It asks `cargo metadata` for the crates that are really linked (normal dependencies only, for the Windows target of each workspace),
+lists them with their SPDX licence expression, and copies the licence / notice files found in each crate's source package, once per
+distinct text. Crates whose package carries no licence file are listed with their SPDX expression and a pointer to their repository.
+Re-run it when the dependencies change and commit the result.
+"""
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+WORKSPACES = [
+    ("Game and tools (`mcla-rs`, `mcla.exe` and `mcla-tool.exe`)", "mcla-rs", "x86_64-pc-windows-gnu"),
+    ("Launcher (`launcher`, `RustyMCLA.exe`)", "launcher", "x86_64-pc-windows-msvc"),
+]
+LICENSE_FILE = re.compile(r"^(licen[cs]e|copying|notice|unlicense|copyright)([-_. ].*)?$", re.I)
+EXTRA_DIRS = ("fonts", "license", "licenses", "LICENSES")
+
+
+def cargo_metadata(ws, target):
+    out = subprocess.run(
+        ["cargo", "metadata", "--format-version", "1", "--locked", "--filter-platform", target, "--manifest-path", os.path.join(ROOT, ws, "Cargo.toml")],
+        check=True, capture_output=True, text=True, encoding="utf-8",
+    ).stdout
+    return json.loads(out)
+
+
+def shipped(meta):
+    """Packages reachable from the workspace members through normal (not dev, not build) dependency edges."""
+    nodes = {n["id"]: n for n in meta["resolve"]["nodes"]}
+    pk = {p["id"]: p for p in meta["packages"]}
+    todo = list(meta["workspace_members"])
+    seen = set(todo)
+    while todo:
+        n = nodes.get(todo.pop())
+        if not n:
+            continue
+        for d in n["deps"]:
+            if any(k.get("kind") is None for k in d["dep_kinds"]) and d["pkg"] not in seen:
+                seen.add(d["pkg"])
+                todo.append(d["pkg"])
+    members = set(meta["workspace_members"])
+    return sorted((pk[i] for i in seen if i not in members and pk[i].get("source")), key=lambda p: (p["name"], p["version"]))
+
+
+def license_files(pkg):
+    base = os.path.dirname(pkg["manifest_path"])
+    found = []
+    for entry in sorted(os.listdir(base)):
+        p = os.path.join(base, entry)
+        if os.path.isfile(p) and LICENSE_FILE.match(entry):
+            found.append((entry, p))
+    for sub in EXTRA_DIRS:
+        d = os.path.join(base, sub)
+        if os.path.isdir(d):
+            for entry in sorted(os.listdir(d)):
+                p = os.path.join(d, entry)
+                if os.path.isfile(p) and entry.lower().endswith((".txt", ".md")) and ("licen" in entry.lower() or "ofl" in entry.lower() or "ufl" in entry.lower() or sub != "fonts"):
+                    found.append((sub + "/" + entry, p))
+    return found
+
+
+def norm(text):
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def main():
+    texts = {}  # hash -> (text, set of "name version")
+    missing = []  # crates whose source package carries no licence file
+    lines = []
+    total = 0
+    for title, ws, target in WORKSPACES:
+        meta = cargo_metadata(ws, target)
+        pkgs = shipped(meta)
+        total += len(pkgs)
+        lines.append(f"## {title}\n")
+        lines.append(f"{len(pkgs)} third-party crates linked into the Windows build (`{target}`):\n")
+        lines.append("| Crate | Version | Licence | Source |")
+        lines.append("|---|---|---|---|")
+        for p in pkgs:
+            repo = p.get("repository") or p.get("homepage") or f"https://crates.io/crates/{p['name']}"
+            lines.append(f"| {p['name']} | {p['version']} | {p.get('license') or p.get('license_file') or 'see source'} | {repo} |")
+            got = 0
+            for _, path in license_files(p):
+                try:
+                    t = open(path, encoding="utf-8", errors="replace").read()
+                except OSError:
+                    continue
+                got += 1
+                h = hashlib.sha256(norm(t).encode()).hexdigest()
+                texts.setdefault(h, (t.strip("\n"), set()))[1].add(f"{p['name']} {p['version']}")
+            if not got:
+                missing.append((p["name"], p["version"], p.get("license") or "see source", ", ".join(p.get("authors") or []) or "the authors of the crate", repo))
+        lines.append("")
+    head = [
+        "# Third-party notices",
+        "",
+        "Rusty MCLA is licensed under the GNU General Public License, version 3 only (see `LICENSE`).",
+        "This file lists the third-party software that is compiled into the released programs, with its licences.",
+        "It is generated by `tools/gen-third-party-notices.py` from the Cargo dependency graphs of both workspaces; do not edit it by hand.",
+        "",
+        "## Not included in the releases",
+        "",
+        "- **No game data.** Nothing from *Midnight Club: Los Angeles* (code, art, audio, video, keys) is distributed. The game's data is built on your computer from your own disc.",
+        "- **ffmpeg** is not bundled. The launcher downloads a pinned upstream Windows build (GPLv3, https://www.gyan.dev/ffmpeg/builds/) on your computer when the data is built and runs it as a separate program.",
+        "- **Microsoft Edge WebView2** (the web view the launcher uses) is part of Windows or installed by Microsoft; it is not redistributed here.",
+        "",
+        "## Fonts compiled into the game",
+        "",
+        "The game's debug overlay and menus use egui's default fonts (crate `epaint_default_fonts`): Hack (MIT licence of the Hack and Bitstream Vera fonts), Ubuntu-Light (Ubuntu Font Licence 1.0),",
+        "NotoEmoji (SIL Open Font Licence 1.1) and emoji-icon-font (MIT). Their licence texts are in the licence section below under `epaint_default_fonts`.",
+        "",
+    ]
+    out = head + lines
+    out.append("## Licence texts\n")
+    out.append(f"{len(texts)} distinct licence or notice texts. Each text is shown once, followed by the crates whose source package carries it. Crates that are not listed under any text "
+               "carry no licence file in their package; their licence is the SPDX expression in the table above (the full text of those standard licences is available at https://spdx.org/licenses/).\n")
+    for n, (h, (t, users)) in enumerate(sorted(texts.items(), key=lambda kv: (-len(kv[1][1]), kv[0])), 1):
+        names = sorted(users)
+        out.append(f"### Text {n} ({len(names)} crate{'s' if len(names) != 1 else ''})\n")
+        out.append("Used by: " + ", ".join(names) + "\n")
+        out.append("```text")
+        out.append(t)
+        out.append("```\n")
+    if missing:
+        seen = set()
+        missing = [m for m in missing if not (m in seen or seen.add(m))]
+        out.append("## Crates whose package carries no licence file\n")
+        out.append("These crates state their licence in their metadata but their source package contains no licence file. Their licences are the SPDX expressions below; "
+                   "the standard texts are the ones above (Apache-2.0, MPL-2.0 and the MIT licence of other crates), and the standard MIT and BSD-3-Clause texts are repeated at the end of this section. "
+                   "The copyright holders are the crate authors named here.\n")
+        out.append("| Crate | Version | Licence | Authors | Source |")
+        out.append("|---|---|---|---|---|")
+        for n, v, lic, au, repo in missing:
+            out.append(f"| {n} | {v} | {lic} | {au} | {repo} |")
+        out.append("")
+        out.append("### Standard MIT licence text\n")
+        out.append("```text\nMIT License\n\nCopyright (c) the authors named in the table above for the crate concerned\n\n"
+                   "Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the \"Software\"), "
+                   "to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, "
+                   "and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:\n\n"
+                   "The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.\n\n"
+                   "THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, "
+                   "FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, "
+                   "WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.\n```\n")
+        out.append("### Standard BSD-3-Clause licence text\n")
+        out.append("```text\nBSD 3-Clause License\n\nCopyright (c) the authors named in the table above for the crate concerned\n\n"
+                   "Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:\n\n"
+                   "1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.\n\n"
+                   "2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation "
+                   "and/or other materials provided with the distribution.\n\n"
+                   "3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software "
+                   "without specific prior written permission.\n\n"
+                   "THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS \"AS IS\" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, "
+                   "THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS "
+                   "BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE "
+                   "GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT "
+                   "LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.\n```\n")
+    sys.stdout.reconfigure(encoding="utf-8")
+    path = os.path.join(ROOT, "THIRD-PARTY-NOTICES.md")
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(out))
+    print(f"wrote {path}: {total} crate entries, {len(texts)} distinct texts, {os.path.getsize(path)} bytes")
+
+
+if __name__ == "__main__":
+    main()

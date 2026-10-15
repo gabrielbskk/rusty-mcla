@@ -144,6 +144,8 @@ jobs:
           Copy-Item launcher\target\release\rusty-mcla.exe out\RustyMCLA.exe
           Copy-Item mcla-rs\target\release\mcla.exe stage\mcla.exe
           Copy-Item LICENSE stage\LICENSE
+          Copy-Item THIRD-PARTY-NOTICES.md stage\THIRD-PARTY-NOTICES.md
+          Copy-Item THIRD-PARTY-NOTICES.md out\THIRD-PARTY-NOTICES.md
           $zip = "out\game-$($env:VERSION).zip"
           Compress-Archive -Path stage\* -DestinationPath $zip -CompressionLevel Optimal
 
@@ -194,7 +196,7 @@ jobs:
           EVENT: ${{ github.event_name }}
         run: |
           $ghArgs = @('release', 'create', $env:TAG,
-            "out\RustyMCLA.exe", "out\game-$($env:VERSION).zip", "out\manifest.unsigned.json", "out\SHA256SUMS.txt",
+            "out\RustyMCLA.exe", "out\game-$($env:VERSION).zip", "out\manifest.unsigned.json", "out\SHA256SUMS.txt", "out\THIRD-PARTY-NOTICES.md",
             '--draft', '--title', "Rusty MCLA $($env:VERSION)", '--notes-file', 'out\release-notes.md', '--target', $env:GITHUB_SHA)
           if ($env:EVENT -eq 'push') { $ghArgs += '--verify-tag' }
           & gh @ghArgs

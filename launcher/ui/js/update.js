@@ -254,7 +254,10 @@
     $$('[data-i18n="sys.v_ver"]').forEach((n) => { n.textContent = gv ? t('dyn.upd.game_ver', [gv]) : t('dyn.upd.no_game'); });
     const rl = $('#hero-line');
     if (rl) rl.textContent = gv ? t('home.ready_line', [gv]) : t('dyn.upd.ready_no_game');
-    $$('[data-web]').forEach((a) => { a.dataset.href = st.links[a.dataset.web] || ''; });
+    $$('[data-web]').forEach((a) => {
+      // "licences" is a file in the repository (THIRD-PARTY-NOTICES.md), not a field of the release links
+      a.dataset.href = st.links[a.dataset.web] || (a.dataset.web === 'licences' && st.links.repo ? st.links.repo + '/blob/main/THIRD-PARTY-NOTICES.md' : '');
+    });
   }
 
   // ---------- step 1 of the Install stepper: the game package ----------
