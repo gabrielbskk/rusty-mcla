@@ -38,7 +38,7 @@ Postponed for later: online play, custom music (including Spotify), car mods, co
 
 ## Reporting problems
 
-Open an issue. The launcher's Support tab can export a log file for you to attach (your Windows user name is removed first).
+Open an issue. The launcher's Support tab can export a log file for you to attach (your Windows user name is removed first). Please only submit issues for crashes at this state of the game, others will be closed at this state. There will be MANY bugs that will eventually be worked out as progress keeps getting made. This request will change once more progress is made.
 Please **do not post or ask for game files or disc images** in issues.
 
 ## Licence and notice
