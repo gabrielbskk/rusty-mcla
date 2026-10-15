@@ -2,6 +2,8 @@
 
 An unofficial PC port of *Midnight Club: Los Angeles* (Complete Edition), written in Rust.
 
+![The Rusty MCLA launcher, ready to play](assets/launcher-home.png)
+
 It is a new game engine that reads the original game's own data from **your copy of the disc** and runs the game natively on PC
 (Vulkan, DirectX 12 and Metal through wgpu). Nothing of the original game is included in this repository or in its releases.
 
@@ -44,6 +46,7 @@ Please **do not post or ask for game files or disc images** in issues.
 ## Licence and notice
 
 The code is licensed under the **GNU General Public License, version 3 only** (see `LICENSE`). Contributions are accepted under the same licence.
+The licences of the third-party software compiled into the programs are listed in [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md).
 
 This is an unofficial fan project. It is not affiliated with, authorised or endorsed by Rockstar Games or Take-Two Interactive.
 "Midnight Club" and "Midnight Club: Los Angeles" and related names and artwork belong to their owners and are used here only to say which game this
