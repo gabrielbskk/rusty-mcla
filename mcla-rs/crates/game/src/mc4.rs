@@ -13033,7 +13033,7 @@ mod tests {
         m.set_shuffle(false);
         assert_eq!(&m.order[8].arr[..2], &[0, 1]);
         // (the port's tracks: every song finds its file by the asset's name)
-        let assets: Vec<String> = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../work/save/port/music_assets.txt")).map(|t| t.lines().map(|l| l.trim().to_string()).collect()).unwrap_or_default();
+        let assets: Vec<String> = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/music_assets.txt")).map(|t| t.lines().map(|l| l.trim().to_string()).collect()).unwrap_or_default();
         if !assets.is_empty() {
             m.bind_files(&assets);
             assert_eq!(m.songs.iter().filter(|s| s.file.is_none()).map(|s| s.object.as_str()).collect::<Vec<_>>(), Vec::<&str>::new());
