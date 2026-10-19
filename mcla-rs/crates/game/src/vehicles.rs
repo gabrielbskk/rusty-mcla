@@ -2082,6 +2082,33 @@ if keep || c.state.pos.distance(center) < 450.0 {
                 }
             }
         }
+        // (diagnostics, N-VP-3: MCLA_WHEEL_GROUND="<update>[;x,y,z,R...]" prints at that update the
+        // player's drawn wheels - middle, drawn radius - and how far each tyre's bottom stands off the
+        // collision triangle under it, along its normal; then the same for the given middles)
+        if let Ok(v) = std::env::var("MCLA_WHEEL_GROUND") {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let mut it = v.split(';');
+            let at: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(300);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == at {
+                let off = |m: Vec3, r: f32| world.collider.ground(m, 1.0, 3.0).map(|h| ((m - h.point).dot(h.normal) - r, h.point.y, h.normal));
+                for c in self.cars.iter().filter(|c| c.is_player || std::env::var("MCLA_WHEEL_GROUND_ALL").is_ok()) {
+                    let up = c.state.rot * Vec3::Y;
+                    eprintln!("wheel ground: car {} player {} setup {:?} pos {:?} up {:?} speed {:.2}", c.model.name, c.is_player, c.setup, c.state.pos, up, c.state.speed());
+                    for i in 0..4 {
+                        let r = c.params().veh.as_ref().map(|v| if i < 2 { v.t.wheel_front.radius } else { v.t.wheel_back.radius }).unwrap_or(c.model.params.wheel_radius);
+                        let m = c.state.wheels[i].world_pos;
+                        let local = c.state.rot.inverse() * (m - c.state.pos);
+                        eprintln!("wheel ground: {i} middle {:?} local {:?} physics r {r:.4} drawn {:.4} bottom off {:?}", m, local, r + 0.00635, off(m, r + 0.00635));
+                    }
+                }
+                for s in it {
+                    let q: Vec<f32> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                    if q.len() == 4 {
+                        eprintln!("wheel ground: given {:?} R {:.4} bottom off {:?}", Vec3::new(q[0], q[1], q[2]), q[3], off(Vec3::new(q[0], q[1], q[2]), q[3]));
+                    }
+                }
+            }
+        }
         let n = self.cars.len();
         // AI inputs (with simple car-ahead avoidance)
         let positions: Vec<(Vec3, Vec3, f32)> = self.cars.iter().map(|c| (c.state.pos, c.state.forward(), c.state.speed())).collect();

@@ -5318,6 +5318,28 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                 self.cam.fov_y = 0.7;
             }
         }
+        // diagnostics (N-VP-3): "i,dist,height,fov" - side view of the player's wheel i, the lens aimed
+        // at the drawn tyre's lowest point (hub - car up x drawn radius) from `height` above it, so
+        // that point is the image's middle
+        if let Ok(v) = std::env::var("MCLA_WHEEL_CAM") {
+            let f: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            if let Some(c) = self.vehicles.player() {
+                let i = f.first().copied().unwrap_or(0.0) as usize & 3;
+                let render_state = c.render_state(self.vehicles.render_alpha);
+                let up = render_state.rot * Vec3::Y;
+                let side = render_state.rot * if i % 2 == 0 { Vec3::NEG_X } else { Vec3::X };
+                let r = c.params().veh.as_ref().map(|v| if i < 2 { v.t.wheel_front.radius } else { v.t.wheel_back.radius }).unwrap_or(c.model.params.wheel_radius) + 0.00635;
+                let bottom = render_state.wheels[i].world_pos - up * r;
+                self.chase.pos = bottom + side * f.get(1).copied().unwrap_or(6.0) + Vec3::Y * f.get(2).copied().unwrap_or(0.15);
+                self.chase.look = bottom;
+                self.chase.up = Vec3::Y;
+                self.cam.pos = self.chase.pos;
+                self.cam.fov_y = f.get(3).copied().unwrap_or(6.0).to_radians();
+                if self.frame_no % 60 == 0 {
+                    eprintln!("wheel cam: {} wheel {i} bottom {:?} r {r:.4} cam {:?}", c.model.name, bottom, self.cam.pos);
+                }
+            }
+        }
         // diagnostics: look at the n-th nearest pedestrian from the front
         if let Ok(v) = std::env::var("MCLA_PED_CAM") {
             let k: usize = v.parse().unwrap_or(0);

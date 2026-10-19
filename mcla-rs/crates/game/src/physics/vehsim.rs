@@ -5579,7 +5579,14 @@ fn physics_frame(st: &mut CarState, vs: &mut VehState, p: &CarParams, vt: &VehTu
         let attach = if vt.bike {
             (p.wheel_pos[physical] + p.wheel_pos[physical + 1]) * 0.5
         } else { p.wheel_pos[physical] };
-        let ram = if hyd_fitted { hyd.height[physical] } else { 0.0 };
+        // (the set-up's ride height, SuspensionOffset, as in the contact above: a lowered car's
+        // wheels sit that much higher in its body. Left out, a lowered rival's wheels were drawn
+        // that far into the road - N-VP-3, the Range Rover's 0.125 / 0.1125 m)
+        let wt = match hyd_wheels.as_ref() {
+            Some((f, b)) => if physical < 2 { f } else { b },
+            None => if physical < 2 { &t.wheel_front } else { &t.wheel_back },
+        };
+        let ram = if hyd_fitted { hyd.height[physical] } else { 0.0 } + wt.suspension_offset;
         let local = attach - Vec3::Y * (p.susp_rest + ram - vs.wheels[physical].comp);
         st.wheels[i].world_pos = st.pos + st.rot * local;
     }
@@ -5881,6 +5888,51 @@ mod contact_integration_tests {
                             "{name}, initial speed {speed}, frame {frame}, wheel {i}: hub {local:?}, axle {axle:?}");
                     }
                 }
+            }
+        }
+    }
+
+    /// N-VP-3: the drawn tyre (radius + 6.35 mm about the drawn hub) of a standing car meets the
+    /// ground as the crown does: its lowest point 0 - 10 mm above the plane, lowered set-ups too.
+    /// (Before 2026-10-19 the drawn hubs left out SuspensionOffset: the Range Rover's tournament
+    /// set-up, -0.125 / -0.1125, had its tyres drawn 0.12 / 0.10 m into the road.)
+    #[test]
+    #[ignore = "requires MCLA_DATA_DIR containing Complete Edition vehicle resources"]
+    fn drawn_tyres_of_lowered_set_ups_stand_on_the_ground() {
+        let root = std::path::PathBuf::from(std::env::var("MCLA_DATA_DIR").expect("MCLA_DATA_DIR"));
+        let assets = crate::assets::Assets::new(&root);
+        let mut world = WorldCollider::default();
+        world.sectors.insert(0, super::super::collision::SectorMesh::build(vec![
+            [Vec3::new(-64.0, 0.0, -64.0), Vec3::new(-64.0, 0.0, 64.0), Vec3::new(64.0, 0.0, -64.0)],
+            [Vec3::new(64.0, 0.0, -64.0), Vec3::new(-64.0, 0.0, 64.0), Vec3::new(64.0, 0.0, 64.0)],
+        ]));
+        for (name, cfg) in [("vpd_lr_sport_08", "SC_tournament_vpd_lr_sport_08"), ("vpd_lr_sport_08", "vpd_lr_sport_08"), ("vp_aud_r8_08", "vp_aud_r8_08"), ("vp_aud_r8_08", "SC_GH_33_3_vp_aud_r8_08"), ("vp_sln_s281_06", "GH_08_3_vp_sln_s281_06"), ("vp_lam_murcielago_06", "GH_04_3_vp_lam_murcielago_06"), ("vp_duc_999r_06", "GH_16_4_vp_duc_999r_06")] {
+            let car = crate::vehicle_model::load_car(&assets, &root.join("resources/vehicle").join(name)).unwrap();
+            let mut params = crate::vehicles::car_params(&car);
+            let s = car.simtune.as_ref().unwrap();
+            let bytes = std::fs::read(root.join("resources/vehicle/configs").join(format!("{cfg}.xcc"))).unwrap();
+            let fit = (**s).clone().fit(&bytes).unwrap();
+            let mut t = s.base.clone();
+            for (axle, wt) in [&mut t.wheel_front, &mut t.wheel_back].into_iter().enumerate() {
+                wt.radius = fit.radius[axle];
+                wt.width = fit.width[axle];
+                wt.suspension_offset = fit.offset[axle];
+            }
+            for (i, w) in params.wheel_pos.iter_mut().enumerate() {
+                if fit.half_track[i / 2] > 0.0 { w.x = w.x.signum() * fit.half_track[i / 2]; }
+            }
+            let mut tune = VehTune::new(t);
+            tune.bike = car.bike;
+            if let Some(hubs) = car.hubs { tune.seat((hubs[0].y + hubs[2].y) * 0.5); }
+            let radius = [tune.t.wheel_front.radius, tune.t.wheel_back.radius];
+            params.veh = Some(std::sync::Arc::new(tune));
+            let mut state = CarState::new(Vec3::new(0.0, 0.3, 0.0), 0.0);
+            for _ in 0..240 { state.step(&params, CarInput::default(), &world, 1.0 / 60.0); }
+            for i in 0..4 {
+                let up = state.rot * Vec3::Y;
+                let bottom = state.wheels[i].world_pos - up * (radius[i / 2] + 0.00635);
+                eprintln!("{name} {cfg} offset {:?} wheel {i}: drawn tyre bottom {:.4} m", fit.offset, bottom.y);
+                assert!((0.0..0.012).contains(&bottom.y), "{name} {cfg} wheel {i}: drawn tyre bottom at {:.4} m", bottom.y);
             }
         }
     }
