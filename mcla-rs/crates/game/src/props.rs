@@ -162,6 +162,8 @@ struct Foot {
     mass: f32,
     /// sound category (see `sound::prop_sound`)
     snd: u8,
+    /// the type's name hash: its audio object in game.dat (`collaudio`)
+    audio: u32,
     /// posts: radius of the wide capsule round them, the zone of the deflection (0: none)
     wide: f32,
 }
@@ -456,7 +458,7 @@ fn physics_foot(prop: &mcla_formats::rage::props::Prop, placed: Option<u32>) -> 
     if let Some(p) = prop.post() {
         let r = ((p.max.x - p.min.x) * 0.5).max(0.04);
         let y0 = p.min.y.max(0.0);
-        return Some(Foot { kind: Solidity::Solid, center: Vec2::new((p.min.x + p.max.x) * 0.5, (p.min.z + p.max.z) * 0.5), half: Vec2::splat(r), y0, height: (p.max.y - y0).max(0.1), mass: prop.mass, snd, wide: (prop.parts[0].max.x - prop.parts[0].min.x) * 0.5 });
+        return Some(Foot { kind: Solidity::Solid, center: Vec2::new((p.min.x + p.max.x) * 0.5, (p.min.z + p.max.z) * 0.5), half: Vec2::splat(r), y0, height: (p.max.y - y0).max(0.1), mass: prop.mass, snd, audio: mcla_formats::hash::joaat(&name), wide: (prop.parts[0].max.x - prop.parts[0].min.x) * 0.5 });
     }
     if prop.parts.is_empty() {
         return None;
@@ -489,7 +491,7 @@ fn physics_foot(prop: &mcla_formats::rage::props::Prop, placed: Option<u32>) -> 
         }
     };
     let y0 = lo.max(0.0);
-    Some(Foot { kind, center: (mn + mx) * 0.5, half: ((mx - mn) * 0.5).max(Vec2::splat(0.04)), y0, height: (top - y0).max(0.1), mass: prop.mass.max(1.0), snd, wide: 0.0 })
+    Some(Foot { kind, center: (mn + mx) * 0.5, half: ((mx - mn) * 0.5).max(Vec2::splat(0.04)), y0, height: (top - y0).max(0.1), mass: prop.mass.max(1.0), snd, audio: mcla_formats::hash::joaat(&name), wide: 0.0 })
 }
 
 /// The particle props have no model: each stands for effects of the disc's effect list
@@ -970,7 +972,7 @@ impl Props {
             race_models.insert(name.to_string(), (mi, tris));
         }
         // collision footprint per model
-        let mut feet: Vec<Foot> = vec![Foot { kind: Solidity::None, center: Vec2::ZERO, half: Vec2::ZERO, y0: 0.0, height: 0.0, mass: 0.0, snd: 0, wide: 0.0 }; models.len()];
+        let mut feet: Vec<Foot> = vec![Foot { kind: Solidity::None, center: Vec2::ZERO, half: Vec2::ZERO, y0: 0.0, height: 0.0, mass: 0.0, audio: 0, snd: 0, wide: 0.0 }; models.len()];
         for (&pi, mi) in model_of.iter() {
             let Some(mi) = *mi else { continue };
             let prop = &all[pi];
@@ -1021,7 +1023,7 @@ impl Props {
             let size = prop.max - prop.min;
             // thin panels (fences, signs) are light; boxes heavier
             let mass = (size.x.max(0.05) * size.y.max(0.05) * size.z.max(0.05) * 45.0).clamp(4.0, 350.0);
-            feet[mi] = Foot { kind, center, half: half.max(Vec2::splat(0.04)), y0: prop.min.y, height, mass, snd: crate::sound::prop_sound(&name), wide: 0.0 };
+            feet[mi] = Foot { kind, center, half: half.max(Vec2::splat(0.04)), y0: prop.min.y, height, mass, snd: crate::sound::prop_sound(&name), audio: mcla_formats::hash::joaat(&name), wide: 0.0 };
         }
         // ... which is only the fallback: the type's own collision shape and mass where it has one
         for (&pi, mi) in model_of.iter() {
@@ -1253,7 +1255,7 @@ impl Props {
                 let half = Vec2::new((p.max.x - p.min.x) * 0.5, (p.max.z - p.min.z) * 0.5).max(Vec2::splat(0.04));
                 let y0 = p.min.y.max(0.0);
                 let mass = if p.mass > 0.0 { p.mass } else { prop.mass / prop.parts.len() as f32 };
-                let foot = Foot { kind: Solidity::Dynamic, center: Vec2::new((p.min.x + p.max.x) * 0.5, (p.min.z + p.max.z) * 0.5), half, y0, height: (p.max.y - y0).max(0.1), mass, snd, wide: 0.0 };
+                let foot = Foot { kind: Solidity::Dynamic, center: Vec2::new((p.min.x + p.max.x) * 0.5, (p.min.z + p.max.z) * 0.5), half, y0, height: (p.max.y - y0).max(0.1), mass, snd, audio: mcla_formats::hash::joaat(&prop.name), wide: 0.0 };
                 colliders.push(Collider { inst: u32::MAX, foot, pos: *pos, rot: *rot, scale: 1.0, knocked: false });
             }
         }
@@ -1867,7 +1869,7 @@ impl Props {
                             }
                             c.knocked = true;
                             self.knocked += 1;
-                            self.hits.push(crate::sound::PropHit { pos: c.pos, kind: c.foot.snd, speed, knocked: true });
+                            self.hits.push(crate::sound::PropHit { pos: c.pos, kind: c.foot.snd, model: c.foot.audio, speed, knocked: true });
                             st.vel *= 1.0 - ratio * 0.9;
                             st.last_impact = st.last_impact.max(speed * ratio * 2.0);
                             st.damage = (st.damage + speed * ratio * 0.01).min(1.0);
@@ -1875,7 +1877,7 @@ impl Props {
                             // immovable: push the car out and bounce it off
                             st.correct_position(n3 * depth);
                             if vn < -1.5 {
-                                self.hits.push(crate::sound::PropHit { pos: c.pos, kind: c.foot.snd, speed: -vn, knocked: false });
+                                self.hits.push(crate::sound::PropHit { pos: c.pos, kind: c.foot.snd, model: c.foot.audio, speed: -vn, knocked: false });
                             }
                             if vn < 0.0 {
                                 let tang = st.vel - n3 * vn;

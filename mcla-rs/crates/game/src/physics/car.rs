@@ -231,6 +231,27 @@ pub struct CarState {
     pub engine_factor: f32,
     /// state of the ported simulation (drivetrain, tyres)
     pub veh: Option<Box<super::vehsim::VehState>>,
+    /// this frame's contacts as the collision audio reads them (cleared by `Vehicles::update`), and a count of the
+    /// solves that gave them
+    pub touches: Vec<AudioTouch>,
+    pub touch_calls: u32,
+}
+
+/// A contact of the car as the original's collision audio reads it (sub_82381FB0, docs/reference/audio/COLLISION_AUDIO_RULE.md).
+#[derive(Clone, Copy, Debug)]
+pub struct AudioTouch {
+    /// which solve it came from (`CarState::touch_calls` at the time): each solve is one call of the audio callback
+    pub call: u32,
+    pub pos: Vec3,
+    /// from the car into what it touches
+    pub normal: Vec3,
+    /// the car's velocity at the point less the other's (before the solve answers it)
+    pub vel: Vec3,
+    /// the car's own material there (car_side / car_roof / car_undercarriage / car_wheel) and the other's
+    pub own: super::collision::Surface,
+    pub other: super::collision::Surface,
+    /// the other is a racing vehicle
+    pub vehicle: bool,
 }
 
 impl CarState {
@@ -259,6 +280,8 @@ impl CarState {
             last_impact: 0.0, wipeout: 0.0, upset: 0.0, zones: [0.0; 4], zone_half: [0.9, 2.2], dents: [[0.0; 4]; 6],
             engine_factor: 1.0,
             veh: None,
+            touches: Vec::new(),
+            touch_calls: 0,
         }
     }
 

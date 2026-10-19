@@ -51,6 +51,8 @@ pub fn prop_sound(name: &str) -> u8 {
 pub struct PropHit {
     pub pos: Vec3,
     pub kind: u8,
+    /// the prop type's name hash (its game.dat audio object)
+    pub model: u32,
     pub speed: f32,
     pub knocked: bool,
 }
@@ -92,12 +94,58 @@ pub struct Sound {
     started: bool,
     /// ambience bed name -> stream file (relative to the audio root)
     beds: Option<hashbrown::HashMap<String, String>>,
+    /// the original's sound objects (sounds.dat ...) and whether loading them was tried
+    pub lib: Option<crate::sndobj::SoundLib>,
+    lib_tried: bool,
+    /// the player car's engine sound, for the car it was made for
+    engine: Option<(String, crate::engaudio::EngineSound)>,
+    /// the original's collision sounds (with `lib`)
+    coll: Option<crate::collaudio::CollisionAudio>,
+    /// the original's district ambience (with `lib`)
+    amb: Option<crate::ambaudio::Ambience>,
 }
 
 impl Sound {
     #[allow(clippy::too_many_arguments)]
     pub fn update(&mut self, a: &mut Audio, vehicles: &Vehicles, game: &Game, police: &Police, ability: &Abilities, prop_hits: &[PropHit], cam_pos: Vec3, cam_right: Vec3, rain: f32, horn: bool, night: bool, dt: f32) {
         a.set_listener(cam_pos, cam_right);
+        if !self.lib_tried {
+            self.lib_tried = true;
+            self.lib = crate::sndobj::SoundLib::load(a.root(), &a.cfg);
+            if self.lib.is_some() {
+                // (cfg = <data>/audio/X360/config)
+                let data = a.cfg.ancestors().nth(3).map(|p| p.to_path_buf()).unwrap_or_default();
+                self.coll = Some(crate::collaudio::CollisionAudio::new(&data));
+                self.amb = self.lib.as_ref().and_then(crate::ambaudio::Ambience::new);
+            }
+            if self.lib.is_none() {
+                log::warn!("audio: {} not loaded - the original's sound objects are not played", a.cfg.display());
+            }
+        }
+        if let Some(lib) = &mut self.lib {
+            lib.listener = (cam_pos, cam_right, Vec3::Y.cross(cam_right));
+        }
+        // ---- collisions (collaudio.rs): every car's contacts of the frame, the props' hits
+        if let (Some(lib), Some(coll)) = (&mut self.lib, &mut self.coll) {
+            coll.begin_frame(dt);
+            for (i, c) in vehicles.cars.iter().enumerate() {
+                if c.state.touches.is_empty() && !c.is_player {
+                    continue;
+                }
+                let owner = if c.is_player {
+                    crate::collaudio::Owner::Player
+                } else if c.racer {
+                    crate::collaudio::Owner::Opponent
+                } else {
+                    crate::collaudio::Owner::Ambient
+                };
+                coll.car(lib, i, &c.model.name, owner, c.model.bike, &c.state, c.is_player);
+            }
+            coll.retain(lib, |i| i < vehicles.cars.len());
+            for h in prop_hits {
+                coll.prop(lib, h.model, h.pos, h.speed, h.knocked);
+            }
+        }
         let in_menu = game.in_menu();
         let driving = matches!(game.mode, Mode::FreeRoam | Mode::Race);
         self.impact_cool = (self.impact_cool - dt).max(0.0);
@@ -166,7 +214,14 @@ impl Sound {
 
         // ---- the player's car -----------------------------------------------------
         let Some(p) = vehicles.player() else {
-            a.end_frame();
+            if let (Some(lib), Some((_, e))) = (&mut self.lib, &mut self.engine) {
+                e.stop(lib);
+            }
+            self.engine = None;
+            if let (Some(lib), Some(amb)) = (&mut self.lib, &mut self.amb) {
+                amb.stop(lib);
+            }
+            self.finish(a, dt);
             return;
         };
         let st = &p.state;
@@ -175,12 +230,42 @@ impl Sound {
         let name = p.model.name.clone();
         let throttle = if in_menu { 0.0 } else { p.input.throttle };
         let eng_vol = if in_menu { 0.28 } else { 0.62 };
-        // engine sits a little towards the centre of the mix whatever the camera does
-        a.engine(0, &name, st.rpm, throttle, (eng_vol, eng_vol));
+        // the original's engine sound (engaudio.rs); the port's own cross-fade where the car's audio objects are missing
+        if let Some(lib) = &mut self.lib {
+            if self.engine.as_ref().map_or(true, |(n, _)| *n != name) {
+                if let Some((_, e)) = &mut self.engine {
+                    e.stop(lib);
+                }
+                self.engine = crate::engaudio::EngineSound::new(lib, &name, p.model.bike).map(|e| (name.clone(), e));
+            }
+        }
+        let orig_engine = self.engine.is_some();
+        if let (Some(lib), Some((_, eng))) = (&mut self.lib, &mut self.engine) {
+            let vs = st.veh.as_deref();
+            let e = p.model.params.veh.as_ref().map(|t| &t.t.engine.s);
+            let inp = crate::engaudio::EngineIn {
+                pos: st.pos,
+                rpm: vs.map_or(st.rpm, |v| v.engine_w * 9.549_296),
+                idle_rpm: e.map_or(800.0, |e| e.idle_rpm),
+                max_rpm: e.map_or(7000.0, |e| e.max_rpm),
+                torque: vs.map_or(0.0, |v| v.engine_torque),
+                full_torque: p.model.params.veh.as_ref().map_or(1.0, |t| t.sync_torque),
+                pedal: vs.map_or(throttle, |v| v.engine_pedal),
+                throttle_in: throttle,
+                speed,
+                gear: vs.map_or(st.gear, |v| v.gear),
+                shift: vs.map_or(0, |v| if v.gear_change.active { v.gear_change.direction } else { 0 }),
+                idle_only: in_menu,
+            };
+            eng.update(lib, &inp, dt);
+        } else {
+            // engine sits a little towards the centre of the mix whatever the camera does
+            a.engine(0, &name, st.rpm, throttle, (eng_vol, eng_vol));
+        }
 
         if driving {
             // gear changes
-            if st.gear != self.gear && self.gear > 0 && st.gear > 0 {
+            if !orig_engine && st.gear != self.gear && self.gear > 0 && st.gear > 0 {
                 let k = if st.rpm > 5000.0 { "gearshift_hi_ck_1" } else { "gearshift_ck_1" };
                 a.play(&format!("{AUX}/{k}"), 0.5);
                 if st.gear > self.gear && throttle > 0.7 && p.model.params.accel.first().copied().unwrap_or(0.0) > 4.5 {
@@ -191,7 +276,7 @@ impl Sound {
                 }
             }
             // lifting off at high revs: the exhaust pops
-            if self.throttle > 0.8 && throttle < 0.2 && st.rpm > p.model.params.redline * 0.75 && self.backfire_cool <= 0.0 {
+            if !orig_engine && self.throttle > 0.8 && throttle < 0.2 && st.rpm > p.model.params.redline * 0.75 && self.backfire_cool <= 0.0 {
                 if let Some(k) = a.pick(AUX, "backfire_0") {
                     a.play(&k, 0.45);
                     self.backfire_cool = 2.5;
@@ -219,7 +304,10 @@ impl Sound {
             // nitrous
             let nitro = st.nitro_on();
             if nitro && !self.nitro_on {
-                a.play(&format!("{AUX}/nitrous_01_fin_l"), 0.7);
+                match &mut self.lib {
+                    Some(lib) => crate::engaudio::nitro_fire(lib, &name, st.pos),
+                    None => a.play(&format!("{AUX}/nitrous_01_fin_l"), 0.7),
+                }
             }
             if !nitro && self.nitro_on {
                 a.play(&format!("{AUX}/nitrous_tail"), 0.4);
@@ -277,7 +365,7 @@ impl Sound {
             self.airborne = !grounded && st.airborne_time > 0.35;
             // crashes
             let dd = st.damage - self.damage;
-            if (dd > 0.004 || st.last_impact > 0.45) && self.impact_cool <= 0.0 {
+            if self.coll.is_none() && (dd > 0.004 || st.last_impact > 0.45) && self.impact_cool <= 0.0 {
                 let hard = dd > 0.04 || speed > 22.0;
                 let k = if hard { a.pick(CAR_BANG, "vehicle_bangers_impact") } else { a.pick(CAR_BANG, "jw_mc4_body_dent") };
                 if let Some(k) = k {
@@ -308,7 +396,7 @@ impl Sound {
         self.throttle = throttle;
 
         // ---- props ----------------------------------------------------------------
-        for h in prop_hits {
+        for h in prop_hits.iter().filter(|_| self.coll.is_none()) {
             let vol = (0.35 + h.speed / 40.0).min(1.0);
             let key = match h.kind {
                 1 => a.pick(PROP_BANG, "bngr_prop_wood_0"),
@@ -473,10 +561,26 @@ impl Sound {
                 (_, true) => "WILSHIRE_NIGHT",
             }
         };
-        let bed = self.beds.as_ref().and_then(|m| m.get(base)).cloned();
-        a.set_bed(bed.as_deref(), if in_menu { 0.25 } else { 0.4 });
+        if let (Some(lib), Some(amb)) = (&mut self.lib, &mut self.amb) {
+            // the original's district ambience (ambaudio.rs) at the listener; the port's rain bed stays until the
+            // original's rain sounds are decoded
+            amb.update(lib, cam_pos, night, game.mode == Mode::Garage, dt);
+            let rain_bed = (rain > 0.5 && game.mode != Mode::Garage).then(|| self.beds.as_ref().and_then(|m| m.get("RAIN_EXT_01")).cloned()).flatten();
+            a.set_bed(rain_bed.as_deref(), if in_menu { 0.25 } else { 0.4 });
+        } else {
+            let bed = self.beds.as_ref().and_then(|m| m.get(base)).cloned();
+            a.set_bed(bed.as_deref(), if in_menu { 0.25 } else { 0.4 });
+        }
 
         a.update_music(driving || game.mode == Mode::Paused);
+        self.finish(a, dt);
+    }
+
+    /// The sound objects drive their voices, then every voice not driven this frame fades.
+    fn finish(&mut self, a: &mut Audio, dt: f32) {
+        if let Some(lib) = &mut self.lib {
+            lib.update(dt, a);
+        }
         a.end_frame();
     }
 

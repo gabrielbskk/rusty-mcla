@@ -80,7 +80,7 @@ pub enum Surface {
 
 impl Surface {
     pub const COUNT: usize = 63;
-    const ALL: [Surface; Surface::COUNT] = [
+    pub const ALL: [Surface; Surface::COUNT] = [
         Surface::Road, Surface::Grass, Surface::Gravel, Surface::Sand, Surface::River, Surface::Sidewalk, Surface::Dirt, Surface::Alley, Surface::Wood, Surface::Brick, Surface::Water,
         Surface::WaterDeep, Surface::Railroad, Surface::Freeway, Surface::Interior, Surface::Exterior, Surface::Tunnel, Surface::Stairs, Surface::Metal, Surface::Cobblestone, Surface::Mall, Surface::Wall,
         Surface::CarRoof, Surface::CarSide, Surface::CarUndercarriage, Surface::CarWheel, Surface::Death, Surface::Default, Surface::ExteriorSmall, Surface::Ice, Surface::InteriorGrass,

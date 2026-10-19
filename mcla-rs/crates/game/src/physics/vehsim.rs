@@ -5365,6 +5365,7 @@ fn physics_frame(st: &mut CarState, vs: &mut VehState, p: &CarParams, vt: &VehTu
             // MCLA_DBG_RA4: any impulse of the island, as before.)
             let mut answered = loose_answered && dbg_flag("MCLA_DBG_RA4");
             let mut walls = 0u32;
+            st.touch_calls += 1;
             for m in vs.manifolds.iter_mut() {
                 for slot in m.slots.iter_mut() {
                     if !slot.enabled {
@@ -5372,6 +5373,16 @@ fn physics_frame(st: &mut CarState, vs: &mut VehState, p: &CarParams, vt: &VehTu
                     }
                     let c = contacts[k];
                     k += 1;
+                    // (the collision audio's view of it: sub_82381FB0 reads every enabled contact)
+                    st.touches.push(super::car::AudioTouch {
+                        call: st.touch_calls,
+                        pos: c.on_body,
+                        normal: -c.normal,
+                        vel: v_in + w_in.cross(c.on_body - at1),
+                        own: if slot.part != 0 { super::collision::Surface::CarWheel } else { p.hull.as_ref().map_or(super::collision::Surface::CarSide, |h| h.surface_of(slot.element)) },
+                        other: slot.surface,
+                        vehicle: false,
+                    });
                     slot.c.kept = c.kept;
                     slot.c.pushed = c.pushed;
                     slot.c.impulse = c.impulse;

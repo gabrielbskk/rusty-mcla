@@ -16,10 +16,32 @@ use std::time::Duration;
 const RATE: u32 = 44100;
 const TAB: char = '\u{9}';
 
-/// Decoded mono PCM.
+/// Decoded PCM: mono, or interleaved stereo (folded streams).
 pub struct Clip {
     pub data: Vec<f32>,
     pub rate: u32,
+    /// 1 or 2
+    pub channels: usize,
+    /// the frame a looping wave returns to (the wave info's loop start; 0 for the old loops)
+    pub loop_start: usize,
+}
+
+impl Clip {
+    pub fn mono(data: Vec<f32>, rate: u32) -> Clip {
+        Clip { data, rate, channels: 1, loop_start: 0 }
+    }
+    /// Frames (samples per channel).
+    pub fn frames(&self) -> usize {
+        self.data.len() / self.channels.max(1)
+    }
+    /// The sample of channel `c` at frame `i` (a mono clip gives the same to both).
+    fn at(&self, i: usize, c: usize) -> f32 {
+        self.data[i * self.channels + c.min(self.channels - 1)]
+    }
+}
+
+pub fn load_wav_clip(p: &Path) -> Option<Clip> {
+    load_wav(p)
 }
 
 fn load_wav(p: &Path) -> Option<Clip> {
@@ -40,7 +62,7 @@ fn load_wav(p: &Path) -> Option<Clip> {
         } else if id == b"data" {
             let end = (body + n).min(d.len());
             let data: Vec<f32> = d[body..end].chunks_exact(2 * ch).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0).collect();
-            return Some(Clip { data, rate });
+            return Some(Clip::mono(data, rate));
         }
         o = body + n + (n & 1);
     }
@@ -115,9 +137,9 @@ impl MixSource {
         // (step 23b: the slow-down state on the player's vehicle - the engine's slot 0)
         let slow = m.slow.map(|r| r.now()).unwrap_or(SLOWDOWN_OFF);
         for v in m.voices.iter_mut() {
-            let mine = v.id >= 0x1000_0000 && v.id < 0x1000_0040;
+            let mine = (v.id >= 0x1000_0000 && v.id < 0x1000_0040) || v.id & crate::sndobj::SLOWED != 0;
             let (cat_gain, cat_pitch) = if mine { (slow[0], slow[1]) } else { (1.0, 1.0) };
-            let n = v.clip.data.len();
+            let n = v.clip.frames();
             if n < 2 {
                 v.tl = 0.0;
                 v.tr = 0.0;
@@ -132,7 +154,8 @@ impl MixSource {
                 let mut p = v.pos;
                 if p >= (n - 1) as f64 {
                     if v.looping {
-                        p %= (n - 1) as f64;
+                        let ls = v.clip.loop_start.min(n - 2) as f64;
+                        p = ls + (p - (n - 1) as f64) % ((n - 1) as f64 - ls).max(1.0);
                         v.pos = p;
                     } else {
                         break;
@@ -140,15 +163,16 @@ impl MixSource {
                 }
                 let i0 = p as usize;
                 let f = (p - i0 as f64) as f32;
-                let s = v.clip.data[i0] * (1.0 - f) + v.clip.data[i0 + 1] * f;
-                self.buf[i * 2] += s * v.gl * master * cat_gain;
-                self.buf[i * 2 + 1] += s * v.gr * master * cat_gain;
+                let sl = v.clip.at(i0, 0) * (1.0 - f) + v.clip.at(i0 + 1, 0) * f;
+                let sr = v.clip.at(i0, 1) * (1.0 - f) + v.clip.at(i0 + 1, 1) * f;
+                self.buf[i * 2] += sl * v.gl * master * cat_gain;
+                self.buf[i * 2 + 1] += sr * v.gr * master * cat_gain;
                 v.pos += step;
             }
         }
         // drop finished one-shots and faded-out loops
         m.voices.retain(|v| {
-            let n = v.clip.data.len();
+            let n = v.clip.frames();
             let ended = !v.looping && v.pos >= n.saturating_sub(1) as f64;
             let silent = v.id != 0 && v.tl == 0.0 && v.tr == 0.0 && v.gl.abs() < 1e-4 && v.gr.abs() < 1e-4;
             !(ended || silent)
@@ -201,6 +225,8 @@ pub struct Audio {
     offline: Option<(MixSource, Vec<f32>)>,
     mixer: Arc<Mutex<Mixer>>,
     root: PathBuf,
+    /// the original's audio metadata (`audio/X360/config` of the extracted data: sounds.dat, curves.dat ...)
+    pub cfg: PathBuf,
     clips: HashMap<String, Option<Arc<Clip>>>,
     engines: HashMap<String, Option<Arc<EngineBank>>>,
     /// wave names per bank folder (from `_index.tsv`)
@@ -212,6 +238,8 @@ pub struct Audio {
     music_next: usize,
     pub music_on: bool,
     pub music_volume: f32,
+    /// the playing song's own level (its headroom)
+    music_gain: f32,
     pub now_playing: String,
     /// per music file: the song's title and genre (0 eclectic .. 6 west coast rap) from the
     /// game's string table; None for what is not one of its songs
@@ -285,6 +313,7 @@ impl Audio {
             offline: off,
             mixer,
             root,
+            cfg: Path::new(data_dir).join("audio").join("X360").join("config"),
             clips: HashMap::new(),
             engines: HashMap::new(),
             index: HashMap::new(),
@@ -293,6 +322,7 @@ impl Audio {
             music_files,
             music_on: true,
             music_volume: 0.35,
+            music_gain: 1.0,
             now_playing: String::new(),
             music_meta: Vec::new(),
             playlist: None,
@@ -482,8 +512,26 @@ impl Audio {
             return;
         }
         // start at a random phase so identical loops do not comb
-        let start = (id.wrapping_mul(2654435761) % clip.data.len().max(1) as u64) as f64;
+        let start = (id.wrapping_mul(2654435761) % clip.frames().max(1) as u64) as f64;
         m.voices.push(Voice { id, clip, pos: start, speed, gl: 0.0, gr: 0.0, tl: gains.0, tr: gains.1, looping: true, fresh: true });
+    }
+
+    /// Create or update a voice that lives while it is driven every frame (the sound objects' waves): `start` is the
+    /// frame a new voice starts at; a one-shot voice ends at its last frame.
+    pub fn drive(&mut self, id: u64, clip: &Arc<Clip>, gains: (f32, f32), speed: f32, looping: bool, start: f64) {
+        let Ok(mut m) = self.mixer.lock() else { return };
+        if let Some(v) = m.voices.iter_mut().find(|v| v.id == id) {
+            v.tl = gains.0;
+            v.tr = gains.1;
+            v.speed = speed;
+            v.fresh = true;
+            return;
+        }
+        // a one-shot the mixer has just finished is not started again from its last frames
+        if m.voices.len() >= 96 || (!looping && start > 0.0 && start + clip.rate as f64 * 0.05 >= clip.frames() as f64) {
+            return;
+        }
+        m.voices.push(Voice { id, clip: clip.clone(), pos: start, speed, gl: gains.0, gr: gains.1, tl: gains.0, tr: gains.1, looping, fresh: true });
     }
 
     pub fn gains_at(&self, pos: Vec3, vol: f32, ref_dist: f32) -> (f32, f32) {
@@ -638,7 +686,7 @@ impl Audio {
             return;
         }
         if let Some(s) = self.music.as_ref() {
-            s.set_volume(self.music_volume);
+            s.set_volume(self.music_volume * self.music_gain);
             if s.is_paused() {
                 s.play();
             }
@@ -647,6 +695,14 @@ impl Audio {
             }
         }
         self.next_track();
+    }
+
+    /// A converted stream's level: the original subtracts each channel's headroom (wave info +26); the converter
+    /// folds the channels relative to the lowest one, which is subtracted here.
+    fn stream_gain(p: &Path) -> f32 {
+        let txt = std::fs::read_to_string(format!("{}.txt", p.display())).unwrap_or_default();
+        let h0 = txt.lines().filter_map(|l| l.split(TAB).nth(5)?.trim().parse::<i32>().ok()).min().unwrap_or(0);
+        mcla_formats::audcfg::db2lin(-(h0 as f32) * 0.01)
     }
 
     /// Title of a track from the converter's channel list ("ARTIST_SONG_LEFT").
@@ -777,7 +833,8 @@ impl Audio {
         }
         let Some(handle) = self.handle.as_ref() else { return };
         if let Ok(s) = Sink::try_new(handle) {
-            s.set_volume(self.music_volume);
+            self.music_gain = Self::stream_gain(&p);
+            s.set_volume(self.music_volume * self.music_gain);
             s.append(dec);
             s.play();
             self.now_playing = match self.music_meta.get(self.music_next).cloned().flatten() {

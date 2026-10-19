@@ -126,6 +126,10 @@ pub struct Wave {
     pub rate: u16,
     pub samples: u32,
     pub flags: u32,
+    /// Loop start sample (-1 = one-shot).
+    pub loop_start: i32,
+    /// Headroom in 0.01 dB: subtracted from the volume when the wave plays.
+    pub headroom: i16,
 }
 
 pub fn parse_bank(d: &[u8]) -> std::result::Result<Vec<Wave>, String> {
@@ -143,9 +147,11 @@ pub fn parse_bank(d: &[u8]) -> std::result::Result<Vec<Wave>, String> {
         let doff = r.u64(o)?;
         let size = r.u32(o + 12)? as u64;
         let ns = r.u32(o + 16)?;
+        let loop_start = r.u32(o + 20)? as i32;
         let rate = r.u16(o + 24)?;
+        let headroom = r.u16(o + 26)? as i16;
         let flags = r.u32(o + 48)?;
-        out.push(Wave { hash: h, data: r.slice(ds.wrapping_add(doff), size).to_vec(), rate, samples: ns, flags });
+        out.push(Wave { hash: h, data: r.slice(ds.wrapping_add(doff), size).to_vec(), rate, samples: ns, flags, loop_start, headroom });
     }
     Ok(out)
 }
@@ -154,6 +160,8 @@ pub struct Channel {
     pub hash: u32,
     pub rate: u16,
     pub samples: u32,
+    /// Headroom in 0.01 dB (as a wave's).
+    pub headroom: i16,
     pub data: Vec<u8>,
 }
 
@@ -178,7 +186,8 @@ pub fn parse_stream(d: &[u8]) -> std::result::Result<Vec<Channel>, String> {
         let size = r.u32(o + 12)? as usize;
         let ns = r.u32(o + 16)?;
         let rate = r.u16(o + 24)?;
-        chans.push(Channel { hash: h, rate, samples: ns, data: Vec::new() });
+        let headroom = r.u16(o + 26)? as i16;
+        chans.push(Channel { hash: h, rate, samples: ns, headroom, data: Vec::new() });
         sizes.push(size);
     }
     for b in 0..nblocks {
@@ -349,7 +358,8 @@ fn convert_bank(ff: &Path, data: &[u8], out_dir: &Path, names: &NameMap, problem
     for (nm, w, good) in &entries {
         if *good {
             ok += 1;
-            lines.push(format!("{}\t{:08x}\t{}\t{}\t{:x}", nm, w.hash, w.samples, w.rate, w.flags));
+            // + loop start (-1 = one-shot) and headroom (0.01 dB) of the wave info
+            lines.push(format!("{}\t{:08x}\t{}\t{}\t{:x}\t{}\t{}", nm, w.hash, w.samples, w.rate, w.flags, w.loop_start, w.headroom));
         }
     }
     let idx = out_dir.join("_index.tsv");
@@ -382,15 +392,17 @@ fn convert_stream(ff: &Path, data: &[u8], base_name: &str, out_path: &Path, name
     }
     // Channels are stored in hash order: find out which speaker each one is from its name
     // ("<STREAM>.L", "..._LS", "..._RIGHT"); the names hash from the stream's own name.
-    fn weights(r: &str) -> (f32, f32) {
+    // stereo fold of the speaker masks (the original's speaker-mask panning in stereo: front to its side, centre and
+    // surround add 0.7071, LFE is not heard)
+    fn weights(r: &str) -> (f64, f64) {
         match r {
             "L" => (1.0, 0.0),
             "R" => (0.0, 1.0),
-            "C" => (0.707, 0.707),
-            "LS" => (0.6, 0.0),
-            "RS" => (0.0, 0.6),
-            "LFE" => (0.3, 0.3),
-            _ => (0.707, 0.707), // "M"
+            "C" => (0.7071, 0.7071),
+            "LS" => (0.7071, 0.0),
+            "RS" => (0.0, 0.7071),
+            "LFE" => (0.0, 0.0),
+            _ => (0.7071, 0.7071), // "M"
         }
     }
     let role = |c: &Channel| -> &'static str {
@@ -443,8 +455,11 @@ fn convert_stream(ff: &Path, data: &[u8], base_name: &str, out_path: &Path, name
         args.push(out_path.into());
     } else {
         // one mono stream per channel -> stereo, every speaker folded to its side
-        let side = |pick: fn((f32, f32)) -> f32| -> String {
-            let parts: Vec<String> = rl.iter().enumerate().filter(|(_, r)| pick(weights(r)) > 0.0).map(|(i, r)| format!("{:.3}*c{}", pick(weights(r)), i)).collect();
+        // each channel's own headroom, relative to the stream's lowest (the rest is applied by the game, from the .txt)
+        let h0 = chans.iter().map(|c| c.headroom).min().unwrap_or(0);
+        let g: Vec<f64> = chans.iter().map(|c| 10f64.powf(-((c.headroom as i32 - h0 as i32) as f64) / 2000.0)).collect();
+        let side = |pick: fn((f64, f64)) -> f64| -> String {
+            let parts: Vec<String> = rl.iter().enumerate().filter(|(_, r)| pick(weights(r)) > 0.0).map(|(i, r)| format!("{:.4}*c{}", pick(weights(r)) * g[i], i)).collect();
             if parts.is_empty() {
                 "0*c0".to_string()
             } else {
@@ -472,7 +487,7 @@ fn convert_stream(ff: &Path, data: &[u8], base_name: &str, out_path: &Path, name
         problems.lock().unwrap_or_else(|p| p.into_inner()).push(format!("{label}: ffmpeg failed: {err}"));
         return Ok((0, 1));
     }
-    let lines: Vec<String> = chans.iter().enumerate().map(|(i, c)| format!("{}\t{:08x}\t{}\t{}\t{}", i, c.hash, names.get(&c.hash).map(|s| s.as_str()).unwrap_or("?"), c.samples, c.rate)).collect();
+    let lines: Vec<String> = chans.iter().enumerate().map(|(i, c)| format!("{}\t{:08x}\t{}\t{}\t{}\t{}", i, c.hash, names.get(&c.hash).map(|s| s.as_str()).unwrap_or("?"), c.samples, c.rate, c.headroom)).collect();
     std::fs::write(&txt, crlf(&lines)).ctx(txt.display())?;
     Ok((1, 1))
 }

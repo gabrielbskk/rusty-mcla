@@ -2069,6 +2069,9 @@ if keep || c.state.pos.distance(center) < 450.0 {
     /// Physics + AI for every car.
     pub fn update(&mut self, world: &World, player_input: CarInput, dt: f32) {
         self.clock += dt;
+        for c in self.cars.iter_mut() {
+            c.state.touches.clear();
+        }
         // (test hook: MCLA_WINDOW_TEST=1 rolls the player's side windows down)
         static WINDOW_TEST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let window_test = *WINDOW_TEST.get_or_init(|| std::env::var("MCLA_WINDOW_TEST").is_ok_and(|v| v == "1"));
@@ -2576,6 +2579,19 @@ if keep || c.state.pos.distance(center) < 450.0 {
                     self.cars[j].state.correct_position(nrm * push);
                     let vi = self.cars[i].state.vel.dot(nrm);
                     let vj = self.cars[j].state.vel.dot(nrm);
+                    // (the collision audio's view of the touch, for each car)
+                    let at = (self.cars[i].state.pos + self.cars[j].state.pos) * 0.5 + Vec3::Y * 0.5;
+                    let rel = self.cars[i].state.vel - self.cars[j].state.vel;
+                    // (a computer car's side makes no sound for a touch with the player's car: 0x82382174)
+                    for (k, o, n, v) in [(i, j, nrm, rel), (j, i, -nrm, -rel)] {
+                        if self.cars[o].is_player {
+                            continue;
+                        }
+                        let st = &mut self.cars[k].state;
+                        st.touch_calls += 1;
+                        let side = crate::physics::collision::Surface::CarSide;
+                        st.touches.push(crate::physics::car::AudioTouch { call: st.touch_calls, pos: at, normal: n, vel: v, own: side, other: side, vehicle: true });
+                    }
                     if vi - vj > 0.0 {
                         let imp = (vi - vj) * 0.5;
                         self.cars[i].state.vel -= nrm * imp;

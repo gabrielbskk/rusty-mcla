@@ -86,9 +86,9 @@ def parse_bank(d):
         off, h, _sz = struct.unpack(">QII", d[tab + i * 16:tab + i * 16 + 16])
         o = info0 + off
         doff, _h2, size, ns = struct.unpack(">QIII", d[o:o + 20])
-        rate, = struct.unpack(">H", d[o + 24:o + 26])
+        loop, rate, headroom = struct.unpack(">iHh", d[o + 20:o + 28])
         flags, = struct.unpack(">I", d[o + 48:o + 52])
-        out.append(dict(hash=h, data=d[ds + doff:ds + doff + size], rate=rate, samples=ns, flags=flags))
+        out.append(dict(hash=h, data=d[ds + doff:ds + doff + size], rate=rate, samples=ns, flags=flags, loop=loop, headroom=headroom))
     return out
 
 
@@ -104,8 +104,8 @@ def parse_stream(d):
         off, h, _sz = struct.unpack(">QII", d[ctab + c * 16:ctab + c * 16 + 16])
         o = info0 + off
         _z, _h2, size, ns = struct.unpack(">QIII", d[o:o + 20])
-        rate, = struct.unpack(">H", d[o + 24:o + 26])
-        chans.append(dict(hash=h, rate=rate, samples=ns, size=size, data=bytearray()))
+        rate, headroom = struct.unpack(">Hh", d[o + 24:o + 28])
+        chans.append(dict(hash=h, rate=rate, samples=ns, size=size, headroom=headroom, data=bytearray()))
     for b in range(nblocks):
         bo = hdr + b * bsize
         choff, = struct.unpack(">Q", d[bo:bo + 8])
@@ -161,7 +161,8 @@ def convert_bank(ff, src, out_dir, names):
                 print("  FAILED", src, nm, err)
                 continue
         ok += 1
-        lines.append("%s\t%08x\t%d\t%d\t%x" % (nm, w["hash"], w["samples"], w["rate"], w["flags"]))
+        # + loop start (-1 = one-shot) and headroom (0.01 dB, subtracted from the volume when played) of the wave info
+        lines.append("%s\t%08x\t%d\t%d\t%x\t%d\t%d" % (nm, w["hash"], w["samples"], w["rate"], w["flags"], w["loop"], w["headroom"]))
     open(os.path.join(out_dir, "_index.tsv"), "w").write("\n".join(lines) + "\n")
     return ok, len(waves)
 
@@ -175,7 +176,9 @@ def convert_stream(ff, src, out_path, names):
     # Channels are stored in hash order: find out which speaker each one is from its name
     # ("<STREAM>.L", "..._LS", "..._RIGHT"); the names hash from the stream's own name.
     base = os.path.basename(src)
-    roles = {"L": (1.0, 0.0), "R": (0.0, 1.0), "C": (0.707, 0.707), "LS": (0.6, 0.0), "RS": (0.0, 0.6), "LFE": (0.3, 0.3), "M": (0.707, 0.707)}
+    # stereo fold of the speaker masks (the original's speaker-mask panning in stereo: front to its side, centre and
+    # surround add 0.7071, LFE is not heard)
+    roles = {"L": (1.0, 0.0), "R": (0.0, 1.0), "C": (0.7071, 0.7071), "LS": (0.7071, 0.0), "RS": (0.0, 0.7071), "LFE": (0.0, 0.0), "M": (0.7071, 0.7071)}
     def role(c):
         n = names.get(c["hash"], "").upper()
         if not n or n == "?":
@@ -210,8 +213,11 @@ def convert_stream(ff, src, out_path, names):
         cmd += enc + [out_path]
     else:
         # one mono stream per channel -> stereo, every speaker folded to its side
-        left = "+".join("%.3f*c%d" % (roles[r][0], i) for i, r in enumerate(rl) if roles[r][0] > 0) or "0*c0"
-        right = "+".join("%.3f*c%d" % (roles[r][1], i) for i, r in enumerate(rl) if roles[r][1] > 0) or "0*c0"
+        # each channel's own headroom, relative to the stream's lowest (the rest is applied by the game, from the .txt)
+        h0 = min(c["headroom"] for c in chans)
+        g = [10 ** (-(c["headroom"] - h0) / 2000.0) for c in chans]
+        left = "+".join("%.4f*c%d" % (roles[r][0] * g[i], i) for i, r in enumerate(rl) if roles[r][0] > 0) or "0*c0"
+        right = "+".join("%.4f*c%d" % (roles[r][1] * g[i], i) for i, r in enumerate(rl) if roles[r][1] > 0) or "0*c0"
         cmd += ["-filter_complex", "".join("[%d:a]" % i for i in range(n)) + "amerge=inputs=%d,pan=stereo|c0=%s|c1=%s[a]" % (n, left, right), "-map", "[a]"] + enc + [out_path]
     good, err = run(cmd)
     for t in tmps:
@@ -219,7 +225,7 @@ def convert_stream(ff, src, out_path, names):
     if not good:
         print("  FAILED", src, err)
         return 0, 1
-    open(out_path + ".txt", "w").write("\n".join("%d\t%08x\t%s\t%d\t%d" % (i, c["hash"], names.get(c["hash"], "?"), c["samples"], c["rate"]) for i, c in enumerate(chans)) + "\n")
+    open(out_path + ".txt", "w").write("\n".join("%d\t%08x\t%s\t%d\t%d\t%d" % (i, c["hash"], names.get(c["hash"], "?"), c["samples"], c["rate"], c["headroom"]) for i, c in enumerate(chans)) + "\n")
     return 1, 1
 
 

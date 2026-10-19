@@ -6,6 +6,7 @@
 //! * [`hash`] – Jenkins one-at-a-time string hashing used for file names
 //! * [`names`] – hash → name dictionary
 
+pub mod audcfg;
 pub mod avm1;
 pub mod crypto;
 pub mod dds;
