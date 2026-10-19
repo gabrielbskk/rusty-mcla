@@ -2674,6 +2674,7 @@ impl App {
             }
         }
         let sim_dt = if self.game.mode == Mode::Paused || self.cuts.playing.is_some() || self.game.movie.is_some() || self.game.show_map || self.game.tutorial_hold() || self.photo.is_some() { 0.0 } else { dt * self.wipe_scale * self.ability.time_scale() * self.game.mc4_time_scale() };
+        self.game.race_slow_tick(dt);
         self.vehicles.rescue_fallen(&world, focus);
         // (VEHICLE SELECT: the car stands still, its wheels on the ground)
         if self.game.starter_pick.is_some() {
@@ -4281,23 +4282,11 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                             }
                         }
                     }
-                    // the winner's scene plays behind the results
-                    if place == 1 && self.cine.playing.is_none() && std::env::var("MCLA_NO_CINE").is_err() {
-                        let scenes = self.cine.scenes("cut_reward_gen_");
-                        let car = self.vehicles.player().map(|c| glam::Mat4::from_rotation_translation(c.state.rot, c.state.pos));
-                        if let (Some(car), false) = (car, scenes.is_empty()) {
-                            if self.cine.start_bound(&mut gpu, &scenes[self.tick_no as usize % scenes.len()], car) {
-                                self.cine_free = true;
-                                self.cine_results = true;
-                                // the beaten rival pulls up beside the winner and drives off
-                                if let Some(i) = self.game.race.as_ref().and_then(|r| r.participants.get(1).copied()) {
-                                    if let Some(c) = self.vehicles.cars.get_mut(i) {
-                                        c.driver = "cine:hookman".to_string();
-                                        c.ai = None;
-                                    }
-                                }
-                            }
-                        }
+                    // (no scene after a race: the original's reward scenes - cut_reward_gen_01,
+                    // _marcel, _nikolai - are played by three story scripts for their own
+                    // missions only. The race ends in slow motion: `race_slow_tick`)
+                    if std::env::var("MCLA_NO_RACE_SLOW").is_err() {
+                        self.game.race_slow_wait = Some(0.2);
                     }
                     let district = self.game.current_race.and_then(|i| self.game.race_defs.get(i)).map(|d| d.district.clone()).unwrap_or_default();
                     let class = self.vehicles.player().and_then(|c| self.game.catalog.get(&c.model.name)).map(|c| c.class.clone()).unwrap_or_default();

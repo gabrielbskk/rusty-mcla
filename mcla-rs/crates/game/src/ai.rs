@@ -77,6 +77,9 @@ pub struct AiDriver {
     pub chase_replan: f32,
     /// forward phase of a three-point turn: no new reverse before this runs out
     pub kturn_cool: f32,
+    /// racing: over the finish line - on the brake, still steering along the line (the original's
+    /// racers stop 60 - 65 m past the line, recorded 2026-10-19: CAREER_RACES.md "Race end")
+    pub finished: bool,
 }
 
 impl AiDriver {
@@ -583,6 +586,10 @@ impl AiDriver {
             input.throttle = 0.0;
             input.brake = 1.0;
             input.steer = -steer;
+        }
+        if self.finished {
+            input.throttle = 0.0;
+            input.brake = 1.0;
         }
         input
     }

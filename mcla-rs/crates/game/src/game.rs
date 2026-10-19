@@ -546,6 +546,10 @@ pub struct Game {
     /// MISSION RESULTS after an event: the missions it finished (title, objectives)
     /// (title, objectives, done: false for a mission the event did not finish - stamped FAIL)
     pub mission_results: Vec<(String, Vec<String>, bool)>,
+    /// the race's end in slow motion (EndOfRaceSequence of RaceOver.sch: PerspectiveForm_SetSlowMotion
+    /// on form 60, 0.2 s of real time after the end-of-race speech) and the wait before it
+    pub race_slow: crate::mc4::SlowMo,
+    pub race_slow_wait: Option<f32>,
     /// the results on show are a career race's (panels, then the cruise - no menu)
     pub career_over: bool,
     /// a new career's save boxes: 0 not shown yet, 1 the ALERT is up, 2 done; and the
@@ -1085,6 +1089,8 @@ impl Game {
             mission_results: Vec::new(),
             career_over: false,
             save_box: 0,
+            race_slow: crate::mc4::SlowMo::default(),
+            race_slow_wait: None,
             box_sel: 0,
             tutorial_box: None,
             fresh_game: false,
@@ -3171,6 +3177,14 @@ impl Game {
         if std::env::var("MCLA_RACE_DUMP").map_or(false, |v| (race.time % v.parse::<f32>().ok().filter(|x| *x > 0.5).unwrap_or(10.0)) < dt) {
             for (i, c) in vehicles.cars.iter().enumerate().filter(|(i, _)| race.participants.contains(i)) {
                 let k = race.next.get(i).copied().unwrap_or(0);
+        // (a computer racer over the line brakes to a stop)
+        for (i, c) in vehicles.cars.iter_mut().enumerate() {
+            if !c.is_player && race.finish_time.get(i).map_or(false, |t| t.is_some()) {
+                if let Some(ai) = c.ai.as_mut() {
+                    ai.finished = true;
+                }
+            }
+        }
                 if k < n {
                     let cp = race.checkpoints[k];
                     log::info!("race dump t {:.0}: car {} {} at ({:.0},{:.0},{:.0}) next {} dist {:.0} dy {:.1} speed {:.0} ai path_i {:?}", race.time, i, c.model.name, c.state.pos.x, c.state.pos.y, c.state.pos.z, k, Vec3::new(c.state.pos.x - cp.x, 0.0, c.state.pos.z - cp.z).length(), c.state.pos.y - cp.y, c.state.speed(), c.ai.as_ref().map(|a| a.path_i));

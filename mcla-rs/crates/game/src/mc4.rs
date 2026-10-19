@@ -11264,7 +11264,32 @@ impl Game {
 
     /// The global time scale (0x827E1C34): what the simulation's time is multiplied by.
     pub fn mc4_time_scale(&self) -> f32 {
-        self.opt_x.s23.slow.global.clamp(0.0, 1.0)
+        // (the race's end: the main loop never lets the scale under 0.1 - sub_822C1FA8)
+        self.opt_x.s23.slow.global.clamp(0.0, 1.0).min(self.race_slow.global.clamp(0.1, 1.0))
+    }
+
+    /// The race's end in slow motion, once a frame (`dt` real time). EndOfRaceSequence
+    /// (RaceOver.sch, every race type's script): the end-of-race speech, WAITUNWARPED(200),
+    /// `raceEnding`, form 60 shown, then - when race +3120 is 0 - PerspectiveForm_SetSlowMotion(form 60,
+    /// 0, 1 / 0.5, 0, 1, 0.4): to a standstill in half a second, eased out with power 0.4, held at
+    /// the main loop's floor of 0.1 until the race is left.
+    pub fn race_slow_tick(&mut self, dt: f32) {
+        let finished = self.race.as_ref().map_or(false, |r| r.finish_time.first().map_or(false, |t| t.is_some()));
+        if !matches!(self.mode, crate::game::Mode::Race | crate::game::Mode::Results) || (self.mode == crate::game::Mode::Race && !finished) {
+            if self.race_slow_wait.is_some() || self.race_slow.global != 1.0 {
+                self.race_slow = SlowMo::default();
+                self.race_slow_wait = None;
+            }
+            return;
+        }
+        if let Some(w) = self.race_slow_wait.as_mut() {
+            *w -= dt;
+            if *w <= 0.0 {
+                self.race_slow_wait = None;
+                self.race_slow.set(0.0, 1.0 / 0.5, false, true, 0.4);
+            }
+        }
+        self.race_slow.update(dt);
     }
 
     fn mc4_tut_tick(&mut self, dt: f32) {
@@ -16168,6 +16193,29 @@ mod tests {
             }
             assert_eq!(found.len(), 6);
         }
+    }
+
+    /// The race's end in slow motion (EndOfRaceSequence): 0.2 s of real time, then to a
+    /// standstill in 0.5 s with sin(t pi / 2) ^ 0.4, the simulation held at the floor of 0.1.
+    #[test]
+    fn race_end_slow_motion() {
+        let mut g = crate::game::Game::new(Vec::new(), 0);
+        g.mode = crate::game::Mode::Results;
+        g.race_slow_wait = Some(0.2);
+        g.race_slow_tick(0.1);
+        assert_eq!(g.mc4_time_scale(), 1.0);
+        g.race_slow_tick(0.1);
+        g.race_slow_tick(0.15);
+        let e = (0.5f32 * std::f32::consts::FRAC_PI_2).sin().powf(0.4);
+        assert!((g.mc4_time_scale() - (1.0 - e)).abs() < 1e-5, "{}", g.mc4_time_scale());
+        g.race_slow_tick(0.25);
+        assert_eq!(g.mc4_time_scale(), 0.1);
+        g.race_slow_tick(5.0);
+        assert_eq!(g.mc4_time_scale(), 0.1);
+        // (leaving the race: back to 1)
+        g.mode = crate::game::Mode::FreeRoam;
+        g.race_slow_tick(0.016);
+        assert_eq!(g.mc4_time_scale(), 1.0);
     }
 
     /// Step 23: the tutorial flags - shown once, the form in the slow motion, CONTINUE; the
