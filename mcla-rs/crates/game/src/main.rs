@@ -66,6 +66,7 @@ mod racemark;
 mod mapmesh;
 mod hudmap;
 mod hudmap_gpu;
+mod hookicons;
 mod ground_sheet;
 mod fillmap;
 
@@ -232,11 +233,11 @@ struct App {
     /// the garage camera's move between views: where it came from, where it goes, the
     /// seconds gone and the up vector of this frame
     garage_tr: Option<(garagecam::CamState, garagecam::CamState, f32)>,
-    /// the parts the car in the garage was last built with: a change shows at once
     /// the race's end: the standings form's pause camera (picked when it comes up) and the
     /// view held once the game is paused
     race_end_cam: Option<menu3d::PauseCam>,
     race_end_hold: Option<(Vec3, Vec3, f32)>,
+    /// the parts the car in the garage was last built with: a change shows at once
     garage_built: Option<(usize, vehicle_model::CarConfig, u8)>,
     garage_up: Vec3,
     garage_spots: hashbrown::HashMap<usize, Option<(Vec3, f32)>>,
@@ -590,9 +591,9 @@ impl App {
             garage_views: None,
             garage_cam: None,
             garage_tr: None,
-            garage_built: None,
             race_end_cam: None,
             race_end_hold: None,
+            garage_built: None,
             garage_up: Vec3::Y,
             garage_spots: Default::default(),
             garage_poses: None,
@@ -2703,7 +2704,6 @@ impl App {
                     self.game.shot_now = true;
                 }
             }
-            // (test hook MCLA_SHOT_AFTER_GO=s: the screenshot once the race clock passes s seconds)
             // (test hook MCLA_RACE_END_SHOTS=<dir>;t1,t2,...: pictures t seconds after the line,
             // the camera logged in the car's frame - x right, y up, z rear)
             if let (Ok(v), Some(t)) = (std::env::var("MCLA_RACE_END_SHOTS"), self.game.race_end_t) {
@@ -2723,6 +2723,7 @@ impl App {
                     }
                 }
             }
+            // (test hook MCLA_SHOT_AFTER_GO=s: the screenshot once the race clock passes s seconds)
             if let (Some(s), Some(r)) = (std::env::var("MCLA_SHOT_AFTER_GO").ok().and_then(|v| v.parse::<f32>().ok()), self.game.race.as_ref()) {
                 if r.countdown <= 0.0 && r.time >= s && !std::mem::replace(&mut self.shot_at_go, true) {
                     log::info!("shot at race clock {:.2} s", r.time);
@@ -2744,8 +2745,8 @@ impl App {
                 log::debug!("cutscene t {:.1}: {:?}", p.t, self.game.cine);
             }
         }
-        let sim_dt = if self.game.mode == Mode::Paused || self.cuts.playing.is_some() || self.game.movie.is_some() || self.game.show_map || self.game.tutorial_hold() || self.photo.is_some() { 0.0 } else { dt * self.wipe_scale * self.ability.time_scale() * self.game.mc4_time_scale() };
         self.game.race_slow_tick(dt);
+        let sim_dt = if self.game.mode == Mode::Paused || self.cuts.playing.is_some() || self.game.movie.is_some() || self.game.show_map || self.game.tutorial_hold() || self.photo.is_some() { 0.0 } else { dt * self.wipe_scale * self.ability.time_scale() * self.game.mc4_time_scale() };
         self.vehicles.rescue_fallen(&world, focus);
         // (VEHICLE SELECT: the car stands still, its wheels on the ground)
         if self.game.starter_pick.is_some() {
@@ -4842,13 +4843,13 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                 let render_state = car.render_state(self.vehicles.render_alpha);
                 // the garage's own cameras: the view that goes with the highlighted row
                 let mut own_view = false;
-                if self.game.mode == Mode::Garage && self.cuts.playing.is_none() && std::env::var("MCLA_NO_GARAGE_CAM").is_err() {
                 // (the race's end before its menu: the driving camera, swung to the standings form's)
                 let race_end_swing = self.game.mode == Mode::Results && self.game.replay.is_none() && self.cuts.playing.is_none() && self.game.race_end_t.map_or(false, |t| t < game::Game::RACE_END_MENU);
                 if !race_end_swing {
                     self.race_end_cam = None;
                     self.race_end_hold = None;
                 }
+                if self.game.mode == Mode::Garage && self.cuts.playing.is_none() && std::env::var("MCLA_NO_GARAGE_CAM").is_err() {
                     if self.garage_views.as_ref().map_or(true, |v| v.0 != car.model.name) {
                         let v = garagecam::Views::load(&self.opt.data_dir, &car.model.name);
                         log::info!("garage: {} camera views for {}", v.as_ref().map_or(0, |v| v.len()), car.model.name);
@@ -5300,7 +5301,6 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                     self.chase.pos = render_state.pos + Vec3::Y * 62.0 - render_state.forward() * 1.5;
                     self.chase.look = render_state.pos + render_state.forward() * 6.0;
                 }
-                self.cam.pos = self.chase.pos;
                 // the race's end: forms 54 and 60 come up 0.2 s after the line and the pause movie
                 // takes the camera over from the driving one - the standings form's CameraIndex 2,
                 // PauseCamera3, or its mirror PauseCamera13 when a line from it to its look-at point
@@ -5348,6 +5348,7 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                         }
                     }
                 }
+                self.cam.pos = self.chase.pos;
             }
         }
         // diagnostics: look at the nearest parked ("parked") or moving ("traffic") ambient car

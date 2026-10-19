@@ -222,6 +222,26 @@ impl FlashMovie {
         self.paint_list(ctx, painter, &list);
     }
 
+    /// The stage drawn into a `w` x `h` picture over transparent black: a movie the game renders
+    /// into its own target (`3dicons`, 256x256, the texture of its `player0mesh`). Pictures are
+    /// kept in `cache`.
+    pub fn raster(&self, w: u32, h: u32, cache: &mut HashMap<TexRef, Option<Arc<mcla_flash::raster::TexImage>>>) -> Vec<u8> {
+        let list = mcla_flash::draw::build(&self.player);
+        for it in &list.items {
+            if let Item::Triangles { tex, .. } = it {
+                if *tex != TexRef::None && !matches!(tex, TexRef::Swap(_)) && !cache.contains_key(tex) {
+                    let t = mcla_flash::textures::resolve(&self.player.movie, *tex, &self.shared);
+                    cache.insert(*tex, t.map(|t| Arc::new(mcla_flash::raster::TexImage { w: t.width, h: t.height, rgba: t.to_rgba8() })));
+                }
+            }
+        }
+        let st = self.player.movie.stage;
+        let k = w as f32 / (st[1] - st[0]).max(1.0);
+        let mut c = mcla_flash::raster::Canvas::new(w, h, [0, 0, 0, 0]);
+        c.draw(&list, k, [-st[0] * k, -st[2] * k], &|t| cache.get(&t).cloned().flatten());
+        c.rgba
+    }
+
     /// The rectangle a sprite covers, in stage pixels.
     ///
     /// The garage movie places its menu box by moving sprites rather than by a

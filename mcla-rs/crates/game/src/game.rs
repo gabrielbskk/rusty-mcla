@@ -577,6 +577,8 @@ pub struct Game {
     pub scene_hud_off: bool,
     /// the race markers' tune (`mcUIClass`, loaded on first use)
     pub mark_tune: Option<crate::racemark::MarkTune>,
+    /// the free-roam icons' three `3dicons` movies (hookicons.rs, loaded on first use)
+    pub hook_icons: Option<crate::hookicons::HookIcons>,
     /// the pause menu's NEXT RACE started this race: not a "first race" for the start-scene picker (the
     /// original drew from the grid list both times: work/career2/cap/README.md n1, n3)
     pub next_race_start: bool,
@@ -1089,8 +1091,6 @@ impl Game {
             place_splash: None,
             place_tied: false,
             mission_results: Vec::new(),
-            career_over: false,
-            save_box: 0,
             race_slow: crate::mc4::SlowMo::default(),
             race_slow_wait: None,
             race_end_t: None,
@@ -1105,6 +1105,7 @@ impl Game {
             ui_sim_dt: 0.0,
             scene_hud_off: false,
             mark_tune: None,
+            hook_icons: None,
             next_race_start: false,
             hangout_key: None,
             hangout_diff: 0,
@@ -7638,6 +7639,7 @@ impl Game {
                     self.city_map(ctx, vehicles, world, hud);
                     self.mission_log_ui(ctx, [up, down, left, right, enter], tab_prev, tab_next, hud.map_vp, hud.player_pos);
                 } else {
+                    self.hook_icons(ctx, vehicles, &hud);
                     self.race_markers(ctx, vehicles, &hud);
                     // (the first target set brings the MINI MAP box - `ng_tut_minimap`: "GPS Targets
                     // will appear highlighted in the Mini Map...", CONTINUE (A))
@@ -7915,39 +7917,8 @@ impl Game {
         let overlay = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("hud_art")));
         let art = self.art.as_ref();
 
-        // ---- the garage's marker in the world (`ref/idle_garage_marker.png`): the wrench in a
-        // white frame over the door, a pointer under it. approx.: its height over the door and
-        // its size on the screen (some ninety pixels across at 720p from forty metres, never under fifty) ----
-        if let (Some(vp), true, true) = (info.cam_vp, self.mode == Mode::FreeRoam && self.race.is_none() && self.flash_hud.is_some(), !self.career.loaded() || self.career.reached("GARAGE_HOLLYWOOD")) {
-            let screen = ctx.screen_rect();
-            let k = screen.height() / 720.0;
-            let world_marks = ctx.layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::new("world marks")));
-            // (and the delivery's: the envelope on a round plate with its pointer -
-            // `ref/dl_marker_world.png`)
-            let marks: Vec<(Vec3, &str)> = self.garage_doors.iter().map(|d| (*d, "icon_garage")).chain(self.delivery_spots.iter().map(|d| (*d, "icon_delivery"))).collect();
-            for (d, icon) in &marks {
-                let at = *d + Vec3::Y * if *icon == "icon_delivery" { 3.4 } else { 5.2 };
-                let c = vp * at.extend(1.0);
-                if c.w < 1.0 || c.w > 220.0 {
-                    continue;
-                }
-                let q = egui::pos2(screen.left() + (c.x / c.w * 0.5 + 0.5) * screen.width(), screen.top() + (0.5 - c.y / c.w * 0.5) * screen.height());
-                if !screen.expand(60.0).contains(q) {
-                    continue;
-                }
-                let h = (2.8 / c.w * screen.height() * 1.3).clamp(26.0 * k, 46.0 * k);
-                let r = egui::Rect::from_center_size(q, egui::vec2(2.0 * h, 2.0 * h));
-                world_marks.rect_filled(r, h * 0.18, egui::Color32::from_rgba_unmultiplied(12, 12, 12, 230));
-                let (l, w) = (h * 0.62, h * 0.2);
-                for (cx, cy, sx, sy) in [(r.left(), r.top(), 1.0, 1.0), (r.right(), r.top(), -1.0, 1.0), (r.left(), r.bottom(), 1.0, -1.0), (r.right(), r.bottom(), -1.0, -1.0)] {
-                    world_marks.line_segment([egui::pos2(cx, cy), egui::pos2(cx + sx * l, cy)], egui::Stroke::new(w, egui::Color32::WHITE));
-                    world_marks.line_segment([egui::pos2(cx, cy), egui::pos2(cx, cy + sy * l)], egui::Stroke::new(w, egui::Color32::WHITE));
-                }
-                self.map_icon(&world_marks, icon, q, h * 1.7, egui::Color32::WHITE);
-                // (the pointer under the plate)
-                world_marks.add(egui::Shape::convex_polygon(vec![egui::pos2(q.x - h * 0.3, q.y + h * 1.12), egui::pos2(q.x + h * 0.3, q.y + h * 1.12), egui::pos2(q.x, q.y + h * 1.85)], egui::Color32::from_rgba_unmultiplied(235, 235, 235, 235), egui::Stroke::NONE));
-            }
-        }
+        // (the garage's and the deliveries' markers in the world are the free-roam icons now: the
+        // original's `3dicons` movie - hookicons.rs, `Game::hook_icons`)
 
         // ---- rain: drops in the air around the camera, as the game's rain tuning describes
         // them (raintuning.xml: the box they fall in, their fall speeds and the wind, how long
@@ -8830,6 +8801,45 @@ impl Game {
     /// `[0x8286D80C]+456` vfunc 23 is taken for "HUD shown")*; every racer of the race but the
     /// player whose car is in the world and whose icon is not hidden by its script (the payback
     /// client: type 10 cruising, 18 chased, hidden once the clock has run out).
+    /// The free-roam icons over the three nearest hookmen / garages / hangouts / service stations
+    /// (hookicons.rs; drawn with the race markers in the icon manager's queue, after them in the
+    /// port - the queue is sorted far first and the two seldom meet).
+    fn hook_icons(&mut self, ctx: &egui::Context, vehicles: &Vehicles, hud: &HudInfo) {
+        if std::env::var("MCLA_NO_HOOK_ICONS").is_ok() || self.flag.is_some() || self.replay.is_some() || self.editor.is_some() || !matches!(self.mode, Mode::FreeRoam | Mode::Race) {
+            return;
+        }
+        let Some(vp) = hud.cam_vp else { return };
+        if self.hm.is_none() || self.ui_shared.is_none() {
+            return;
+        }
+        let tune = self.mark_tune.get_or_insert_with(|| crate::racemark::MarkTune::load(&self.data_dir)).clone();
+        let els = crate::hudmap::elements(self, vehicles, hud.heat >= 2);
+        // (a police pursuit is a race to the icon manager: `[0x8286EBF8]`)
+        let racing = self.race.is_some() || hud.heat >= 2;
+        let checkpoints = self.race.as_ref().map_or(false, |r| !r.checkpoints.is_empty());
+        let dt = ctx.input(|i| i.stable_dt).min(0.1);
+        if self.hook_icons.is_none() {
+            self.hook_icons = crate::hookicons::HookIcons::new(&self.data_dir, self.ui_shared.as_ref().unwrap());
+            if self.hook_icons.is_none() {
+                log::warn!("hook icons: the 3dicons movie did not load");
+                self.mark_tune = Some(tune);
+                return;
+            }
+        }
+        let hm = self.hm.as_mut().unwrap();
+        let garage = hm.tune.c("GarageColor", [1.0; 4]);
+        let gas = hm.tune.c("GasStationColor", [0.501961, 0.501961, 0.501961, 1.0]);
+        let ripple = crate::hudmap::Ripple::new(&hm.tune, hm.t, 0.0);
+        let hi = self.hook_icons.as_mut().unwrap();
+        hi.update(&tune, &els, garage, gas, hud.cam_pos, hud.cam_look - hud.cam_pos, racing, checkpoints, dt);
+        let draws = hi.draws();
+        if draws.is_empty() {
+            return;
+        }
+        let layer = egui::LayerId::new(egui::Order::Background, egui::Id::new("hook_icons"));
+        ctx.layer_painter(layer).add(crate::hudmap_gpu::hook_icons(ctx.screen_rect(), &mut hm.assets, draws, vp, Some(ripple)));
+    }
+
     fn race_markers(&mut self, ctx: &egui::Context, vehicles: &Vehicles, hud: &HudInfo) {
         if std::env::var("MCLA_NO_RACE_MARKERS").is_ok() || self.flag.is_some() || self.replay.is_some() {
             return;
@@ -11337,6 +11347,10 @@ impl Game {
         if self.ui_meshes.is_none() {
             return false;
         }
+        // (the race's end: nothing over the picture until WAITUNWARPED(200) is over)
+        if self.race_end_t.map_or(false, |t| t < Self::RACE_END_PANEL) && self.replay.is_none() {
+            return true;
+        }
         // (step 19d: form 56's banner, after the place's splash - `mc4_banner_page`)
         let s19d_banner = if self.place_splash.filter(|_| self.replay.is_none()).is_none() { self.mc4_banner_page(ctx.input(|i| i.stable_dt).min(0.1)) } else { None };
         let st = |k: &str, d: &str| self.career.strings.get(k).map(|v| v.to_uppercase()).filter(|v| !v.contains('<')).unwrap_or_else(|| d.to_string());
@@ -11347,10 +11361,6 @@ impl Game {
             // (the movie's own rule: TIED stands over the place; DNF is the name itself, larger)
             MenuPage { layout: MenuLayout::Position { suffix: if look == 2 { String::new() } else { st(suffix, &suffix.to_uppercase()) }, look }, title: if look == 2 { st("RACE_RESULT_DNF", "DNF") } else { place.to_string() }, select: usize::MAX, ..MenuPage::default() }
         } else if let Some(page) = s19d_banner {
-        // (the race's end: nothing over the picture until WAITUNWARPED(200) is over)
-        if self.race_end_t.map_or(false, |t| t < Self::RACE_END_PANEL) && self.replay.is_none() {
-            return true;
-        }
             // (step 19d: a time trial's event results banner - form 56 - before its panel)
             page
         } else if let Some(cur) = self.replay.as_ref().and_then(|p| p.menu) {

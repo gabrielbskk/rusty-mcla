@@ -161,6 +161,8 @@ struct Slot {
 /// The pipeline and the GPU copies of the meshes and pictures (egui's callback resources).
 pub struct XrayRes {
     pipeline: wgpu::RenderPipeline,
+    /// the same, both sides drawn (the free-roam icons' meshes - hookicons.rs)
+    pipeline_both: wgpu::RenderPipeline,
     g_layout: wgpu::BindGroupLayout,
     t_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
@@ -170,8 +172,10 @@ pub struct XrayRes {
     roads: Option<Vec<(wgpu::Buffer, u32)>>,
     /// the 3D frame's depth buffer (set by the render loop each frame)
     pub depth: Option<wgpu::TextureView>,
-    /// 0 = the road overlay, 1 = the icons, 2 = the race markers
-    slots: [Slot; 3],
+    /// the pictures written every frame (the free-roam icons' movies): texture and binding
+    dyn_textures: HashMap<String, (wgpu::Texture, wgpu::BindGroup)>,
+    /// 0 = the road overlay, 1 = the icons, 2 = the race markers, 3 = the free-roam icons
+    slots: [Slot; 4],
 }
 
 impl XrayRes {
@@ -195,7 +199,7 @@ impl XrayRes {
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("hudmap xray"), bind_group_layouts: &[&g_layout, &t_layout], push_constant_ranges: &[] });
         let blend = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::SrcAlpha, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add };
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let make = |cull: Option<wgpu::Face>| device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("hudmap xray"),
             layout: Some(&layout),
             vertex: wgpu::VertexState {
@@ -214,7 +218,7 @@ impl XrayRes {
             // counter-clockwise on the port's screen - with clockwise every one was culled; MCLA_XRAY_CULL=0: both sides)
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: if std::env::var("MCLA_XRAY_CULL").map_or(true, |v| v.trim() != "0") { Some(wgpu::Face::Back) } else { None },
+                cull_mode: cull,
                 front_face: wgpu::FrontFace::Ccw,
                 ..Default::default()
             },
@@ -224,6 +228,8 @@ impl XrayRes {
             multiview: None,
             cache: None,
         });
+        let pipeline = make(if std::env::var("MCLA_XRAY_CULL").map_or(true, |v| v.trim() != "0") { Some(wgpu::Face::Back) } else { None });
+        let pipeline_both = make(None);
         // (DiffuseSampler's fetch constant: wrap, trilinear)
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("hudmap xray"),
@@ -235,7 +241,7 @@ impl XrayRes {
             ..Default::default()
         });
         let white = texture_bg_q(device, queue, &t_layout, &sampler, &[(1, 1, vec![255u8; 4])]);
-        XrayRes { pipeline, g_layout, t_layout, sampler, white, textures: HashMap::new(), meshes: HashMap::new(), roads: None, depth: None, slots: Default::default() }
+        XrayRes { pipeline, pipeline_both, g_layout, t_layout, sampler, white, textures: HashMap::new(), dyn_textures: HashMap::new(), meshes: HashMap::new(), roads: None, depth: None, slots: Default::default() }
     }
 
     /// Fill a slot: globals, the draw records, the depth binding.
@@ -297,6 +303,34 @@ impl XrayRes {
         let levels = mips(w, h, rgba8);
         let bg = texture_bg_q(device, queue, &self.t_layout, &self.sampler, &levels);
         self.textures.insert(key.to_string(), bg);
+    }
+
+    /// A picture rewritten every frame (one level: a render target has no mips).
+    fn dyn_texture(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, key: &str, w: u32, h: u32, rgba8: &[u8]) {
+        if w == 0 || h == 0 || rgba8.len() < (w * h * 4) as usize {
+            return;
+        }
+        if self.dyn_textures.get(key).map_or(true, |(t, _)| t.width() != w || t.height() != h) {
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("hudmap xray movie"),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let bg = bind(device, &self.t_layout, &self.sampler, &tex);
+            self.dyn_textures.insert(key.to_string(), (tex, bg));
+        }
+        let (tex, _) = &self.dyn_textures[key];
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            &rgba8[..(w * h * 4) as usize],
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(h) },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
     }
 }
 
@@ -364,14 +398,14 @@ fn paint_slot(res: &XrayRes, slot: usize, pass: &mut wgpu::RenderPass<'static>) 
     if s.cmds.is_empty() {
         return;
     }
-    pass.set_pipeline(&res.pipeline);
+    pass.set_pipeline(if slot == 3 { &res.pipeline_both } else { &res.pipeline });
     pass.set_bind_group(0, bg, &[]);
     for c in &s.cmds {
         match c {
             Cmd::Mesh { mesh, part, tex, inst } => {
                 let Some(m) = res.meshes.get(mesh) else { continue };
                 let Some(&(first, count, base)) = m.parts.get(*part) else { continue };
-                let t = tex.as_ref().and_then(|k| res.textures.get(k)).unwrap_or(&res.white);
+                let t = tex.as_ref().and_then(|k| res.textures.get(k).or_else(|| res.dyn_textures.get(k).map(|d| &d.1))).unwrap_or(&res.white);
                 pass.set_bind_group(1, t, &[]);
                 pass.set_vertex_buffer(0, m.vb.slice(..));
                 pass.set_index_buffer(m.ib.slice(..), wgpu::IndexFormat::Uint32);
@@ -481,6 +515,89 @@ impl egui_wgpu::CallbackTrait for Marks {
     fn paint(&self, _info: egui::PaintCallbackInfo, pass: &mut wgpu::RenderPass<'static>, res: &egui_wgpu::CallbackResources) {
         if let Some(r) = res.get::<XrayRes>() {
             paint_slot(r, 2, pass);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The free-roam icons (hookicons.rs)
+
+/// One mesh of a free-roam icon's movie: its mesh, world matrix (the icon's frame times the
+/// mesh's own), colour (the mesh's `color`, its `_alpha`), and the movie's stage as its texture
+/// (`player0mesh`: slot, pixels) or the mesh's own pictures; `ripple`: the rings of RippleCustomDepth.
+pub struct HookDraw {
+    pub mesh: &'static str,
+    pub world: Mat4,
+    pub colour: [f32; 4],
+    pub movie: Option<(usize, Arc<Vec<u8>>)>,
+    pub ripple: bool,
+}
+
+pub struct HookIcons {
+    g: Globals,
+    meshes: Vec<(&'static str, Arc<IconMesh>)>,
+    draws: Vec<HookDraw>,
+}
+
+/// The free-roam icons in the game camera's 3D frame (`sub_82225170` kind 1 -> `sub_82721258(movie,
+/// 6)`: UnlitCustomDepth / RippleCustomDepth with no depth map - the hardware depth test).
+/// *(approx.)* The hardware test is the shader's behind test with gXrayTerm 0 (bias 7.5e-6); both
+/// sides are drawn (the cull state of the movies' 3D pass is not read); the rings take the GPS
+/// map's Ripple tune (where RippleCustomDepth's parameters are set is not read).
+pub fn hook_icons(screen: egui::Rect, assets: &mut Assets, draws: Vec<HookDraw>, vp: Mat4, ripple: Option<Ripple>) -> egui::Shape {
+    let n = port_near(&vp);
+    let f = 4000.0;
+    let r = ripple.unwrap_or(Ripple { t: 0.0, freq: 0.0, speed: 0.0, falloff: 1.0, amplitude: 0.0 });
+    // (MCLA_HOOK_XRAY=<0..1>: the pixels behind the scene drawn at that alpha - to see the test work)
+    let x = std::env::var("MCLA_HOOK_XRAY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0.0);
+    let g = Globals { vp: vp.to_cols_array_2d(), xray: [x, f / (f - n), n, n], ripple: [r.t, r.freq, r.speed, r.falloff], ripple2: [r.amplitude, 0.0, 0.0, 0.0] };
+    let mut meshes: Vec<(&'static str, Arc<IconMesh>)> = Vec::new();
+    for d in &draws {
+        if !meshes.iter().any(|m| m.0 == d.mesh) {
+            if let Some(m) = assets.mesh(d.mesh) {
+                meshes.push((d.mesh, m));
+            }
+        }
+    }
+    egui::Shape::Callback(egui_wgpu::Callback::new_paint_callback(screen, HookIcons { g, meshes, draws }))
+}
+
+impl egui_wgpu::CallbackTrait for HookIcons {
+    fn prepare(&self, device: &wgpu::Device, queue: &wgpu::Queue, _sd: &egui_wgpu::ScreenDescriptor, _enc: &mut wgpu::CommandEncoder, res: &mut egui_wgpu::CallbackResources) -> Vec<wgpu::CommandBuffer> {
+        let Some(r) = res.get_mut::<XrayRes>() else { return Vec::new() };
+        let (mut recs, mut cmds) = (Vec::new(), Vec::new());
+        let mut written = [false; 3];
+        for d in &self.draws {
+            let Some((name, m)) = self.meshes.iter().find(|m| m.0 == d.mesh) else { continue };
+            r.mesh(device, name, m);
+            for (k, part) in m.parts.iter().enumerate() {
+                let tex = if d.ripple {
+                    None
+                } else if let Some((slot, rgba)) = d.movie.as_ref() {
+                    let key = format!("3dicons#{slot}");
+                    if !written[*slot % 3] {
+                        written[*slot % 3] = true;
+                        r.dyn_texture(device, queue, &key, crate::hookicons::RT, crate::hookicons::RT, rgba);
+                    }
+                    Some(key)
+                } else {
+                    let Some(img) = part.tex.as_ref() else { continue };
+                    let key = format!("{name}#{k}");
+                    r.texture(device, queue, &key, img.w, img.h, &img.rgba8);
+                    Some(key)
+                };
+                let inst = recs.len() as u32;
+                recs.push(DrawRec { world: d.world.to_cols_array_2d(), colour: d.colour, mode: [if d.ripple { 1 } else { 0 }, 0, 0, 0] });
+                cmds.push(Cmd::Mesh { mesh: name, part: k, tex, inst });
+            }
+        }
+        r.fill(device, queue, 3, &self.g, &recs, cmds);
+        Vec::new()
+    }
+
+    fn paint(&self, _info: egui::PaintCallbackInfo, pass: &mut wgpu::RenderPass<'static>, res: &egui_wgpu::CallbackResources) {
+        if let Some(r) = res.get::<XrayRes>() {
+            paint_slot(r, 3, pass);
         }
     }
 }

@@ -27,6 +27,12 @@ pub struct MarkTune {
     /// RacerMarkerFadeInBegin / Span, FadeOutBegin / Span (m from the camera)
     pub fade_in: (f32, f32),
     pub fade_out: (f32, f32),
+    /// The free-roam 3D icons (hookicons.rs): HookmanIconScale (1.4, the icon frame's scale),
+    /// HookmanIconTranslatePivot ((0, 1.07, -0.2), along the frame's axes), IconFadeoutDist
+    /// (400 m: no icon beyond)
+    pub icon_scale: f32,
+    pub icon_pivot: Vec3,
+    pub icon_fadeout: f32,
 }
 
 impl Default for MarkTune {
@@ -41,6 +47,9 @@ impl Default for MarkTune {
             payback_buddy: [1.0, 0.0, 0.0, 1.0],
             fade_in: (20.0, 45.0),
             fade_out: (175.0, 40.0),
+            icon_scale: 1.4,
+            icon_pivot: Vec3::new(0.0, 1.07, -0.2),
+            icon_fadeout: 400.0,
         }
     }
 }
@@ -76,6 +85,9 @@ impl MarkTune {
             payback_buddy: c("PaybackBuddyColor", d.payback_buddy),
             fade_in: (f("RacerMarkerFadeInBegin", d.fade_in.0), f("RacerMarkerFadeInSpan", d.fade_in.1)),
             fade_out: (f("RacerMarkerFadeOutBegin", d.fade_out.0), f("RacerMarkerFadeOutSpan", d.fade_out.1)),
+            icon_scale: f("HookmanIconScale", d.icon_scale),
+            icon_pivot: m.get("HookmanIconTranslatePivot").filter(|v| v.len() >= 3).map_or(d.icon_pivot, |v| Vec3::new(v[0], v[1], v[2])),
+            icon_fadeout: f("IconFadeoutDist", d.icon_fadeout),
         }
     }
 

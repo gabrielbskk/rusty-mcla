@@ -382,11 +382,14 @@ pub struct Element {
     pub flags: u8,
     /// racers: `icon_ingame<N>` (`Racer_SetIconType`)
     pub icon: u8,
+    /// `+32` the id (location UID, `vehicle+140`); the port's own numbers for the hookmen.
+    /// The 3D icons (hookicons.rs) keep their slots by it.
+    pub uid: u32,
 }
 
 impl Element {
     pub fn at(kind: Kind, pos: Vec3) -> Element {
-        Element { kind, pos, back: Vec3::Z, colour: [1.0; 4], selected: false, mission: false, flags: 0, icon: 1 }
+        Element { kind, pos, back: Vec3::Z, colour: [1.0; 4], selected: false, mission: false, flags: 0, icon: 1, uid: 0 }
     }
 }
 
@@ -421,9 +424,11 @@ pub const PLACES: [(u32, Kind, [f32; 3]); 18] = [
     (521, Kind::Wager, [684.169, 77.288, -1507.205]),
     (531, Kind::Wager, [1847.427, -8.991, 606.823]),
     (541, Kind::Wager, [1386.6, -9.5, 1219.1]),
-    (504, Kind::Delivery, [844.728, 18.28, -819.383]),
-    (542, Kind::Delivery, [-51.7, -16.8, 1330.0]),
-    (513, Kind::Payback, [-3095.061, -22.84, 165.897]),
+    // (the delivery and payback elements follow the car their core parks beside the garage -
+    // SetRacerElement; where the running original has them, 100 % save, 2026-10-19)
+    (504, Kind::Delivery, [834.47, 18.06, -843.32]),
+    (542, Kind::Delivery, [-37.61, -19.67, 1316.65]),
+    (513, Kind::Payback, [-3067.87, -24.82, 189.82]),
 ];
 
 /// The port's state as the map's element lists, layer by layer (each list in the order its
@@ -439,8 +444,10 @@ pub fn elements(game: &crate::game::Game, vehicles: &crate::vehicles::Vehicles, 
     let player = vehicles.cars.iter().find(|c| c.is_player);
     let racing = game.race.is_some();
     // service stations: always listed
-    for g in GAS_STATIONS {
-        push(Element::at(Kind::Gas, Vec3::from(g)));
+    for (i, g) in GAS_STATIONS.iter().enumerate() {
+        let mut e = Element::at(Kind::Gas, Vec3::from(*g));
+        e.uid = 700 + i as u32;
+        push(e);
     }
     // (Script_SuspendAllOpponents: missions and races take the places and the hookmen off the
     // map; a new career shows them once the garage is reached - approx., the state scripts'
@@ -449,8 +456,9 @@ pub fn elements(game: &crate::game::Game, vehicles: &crate::vehicles::Vehicles, 
     let places = !racing && (!career || game.career.reached("GARAGE_HOLLYWOOD"));
     let pick = game.gps_pick;
     if places {
-        for (_, kind, p) in PLACES.iter().filter(|x| !matches!(x.1, Kind::Delivery | Kind::Payback)) {
+        for (uid, kind, p) in PLACES.iter().filter(|x| !matches!(x.1, Kind::Delivery | Kind::Payback)) {
             let mut e = Element::at(*kind, Vec3::from(*p));
+            e.uid = *uid;
             if matches!(kind, Kind::Series) {
                 e.colour = [1.0, 1.0, 0.0, 1.0];
             }
@@ -465,21 +473,23 @@ pub fn elements(game: &crate::game::Game, vehicles: &crate::vehicles::Vehicles, 
         let man = game.rival_mark.as_ref().map(|m| m.0);
         // (the slot men come with `map_men` when it is filled; `cruiser_marks` otherwise)
         let have_men = game.map_men.iter().any(|m| m.2 == 3);
-        for (p, f, d) in game.cruiser_marks.iter().filter(|_| !have_men) {
+        for (i, (p, f, d)) in game.cruiser_marks.iter().enumerate().filter(|_| !have_men) {
             if man.map_or(false, |m| m.distance(*p) < 60.0) {
                 continue;
             }
             let mut e = Element::at(Kind::Racer(3), *p);
+            e.uid = 3000 + i as u32;
             e.back = -*f;
             e.colour = DIFFICULTY[(*d).min(3)];
             e.icon = 4;
             push(e);
         }
-        for (p, f, sub, icon, d, mission) in &game.map_men {
+        for (i, (p, f, sub, icon, d, mission)) in game.map_men.iter().enumerate() {
             if man.map_or(false, |m| m.distance(*p) < 60.0) {
                 continue;
             }
             let mut e = Element::at(Kind::Racer(*sub), *p);
+            e.uid = 2000 + i as u32;
             e.back = -*f;
             e.colour = DIFFICULTY[(*d).min(3)];
             e.icon = *icon;
@@ -488,8 +498,9 @@ pub fn elements(game: &crate::game::Game, vehicles: &crate::vehicles::Vehicles, 
         }
         // the red-light racer waiting at a light (redlight.rs; the original's red-light hookmen,
         // subtype 1, icon 3 - `<district>_redlight_hk1` scripts)
-        for c in vehicles.cars.iter().filter(|c| c.driver == "redlight") {
+        for (i, c) in vehicles.cars.iter().enumerate().filter(|(_, c)| c.driver == "redlight") {
             let mut e = Element::at(Kind::Racer(1), c.state.pos);
+            e.uid = 4000 + i as u32;
             e.back = -c.state.forward();
             e.colour = DIFFICULTY[game.difficulty_of(&c.model.name).clamp(0, 3) as usize];
             e.icon = 3;
@@ -498,6 +509,7 @@ pub fn elements(game: &crate::game::Game, vehicles: &crate::vehicles::Vehicles, 
         if let Some((p, _, _)) = game.rival_mark.as_ref() {
             let car = vehicles.cars.iter().filter(|c| c.racer).min_by(|a, b| a.state.pos.distance(*p).total_cmp(&b.state.pos.distance(*p)));
             let mut e = Element::at(Kind::Racer(2), *p);
+            e.uid = 4999;
             if let Some(c) = car.filter(|c| c.state.pos.distance(*p) < 60.0) {
                 e.pos = c.state.pos;
                 e.back = -c.state.forward();
@@ -560,8 +572,10 @@ pub fn elements(game: &crate::game::Game, vehicles: &crate::vehicles::Vehicles, 
     }
     // deliveries and paybacks wait at their garages (layer 4)
     if places {
-        for (_, kind, p) in PLACES.iter().filter(|x| matches!(x.1, Kind::Delivery | Kind::Payback)) {
-            push(Element::at(*kind, Vec3::from(*p)));
+        for (uid, kind, p) in PLACES.iter().filter(|x| matches!(x.1, Kind::Delivery | Kind::Payback)) {
+            let mut e = Element::at(*kind, Vec3::from(*p));
+            e.uid = *uid;
+            push(e);
         }
     }
     if let Some(c) = player {
