@@ -99,13 +99,23 @@ struct Globals {
     ripple2: [f32; 4],
 }
 
+/// gXrayTerm as the GPS map last set it (0x8282DED0: 0.25 at boot and on entering the map, then the
+/// map camera's every frame); the race markers are drawn with whatever it holds.
+static LAST_XRAY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x3e80_0000);
+
+pub fn last_xray() -> f32 {
+    f32::from_bits(LAST_XRAY.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 impl Globals {
     fn new(vp: Mat4, cam: Vec3, ripple: Option<Ripple>) -> Globals {
         let (n, f) = orig_planes(cam.y);
         let r = ripple.unwrap_or(Ripple { t: 0.0, freq: 0.0, speed: 0.0, falloff: 1.0, amplitude: 0.0 });
+        let x = xray_term(cam.y);
+        LAST_XRAY.store(x.to_bits(), std::sync::atomic::Ordering::Relaxed);
         Globals {
             vp: vp.to_cols_array_2d(),
-            xray: [xray_term(cam.y), f / (f - n), n, port_near(&vp)],
+            xray: [x, f / (f - n), n, port_near(&vp)],
             ripple: [r.t, r.freq, r.speed, r.falloff],
             ripple2: [r.amplitude, 0.0, 0.0, 0.0],
         }
@@ -160,8 +170,8 @@ pub struct XrayRes {
     roads: Option<Vec<(wgpu::Buffer, u32)>>,
     /// the 3D frame's depth buffer (set by the render loop each frame)
     pub depth: Option<wgpu::TextureView>,
-    /// 0 = the road overlay, 1 = the icons
-    slots: [Slot; 2],
+    /// 0 = the road overlay, 1 = the icons, 2 = the race markers
+    slots: [Slot; 3],
 }
 
 impl XrayRes {
@@ -421,6 +431,56 @@ impl egui_wgpu::CallbackTrait for Icons {
     fn paint(&self, _info: egui::PaintCallbackInfo, pass: &mut wgpu::RenderPass<'static>, res: &egui_wgpu::CallbackResources) {
         if let Some(r) = res.get::<XrayRes>() {
             paint_slot(r, 1, pass);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The race markers (racemark.rs)
+
+/// The race markers over the computer racers, in the 3D frame of the game camera `vp` at `cam`
+/// (`sub_82225170` -> `sub_82723940` with the scene's DepthMap: the same technique as the GPS
+/// map's icons, gXrayTerm as the map left it). *(approx.)* the original game camera's near and
+/// far planes are not read: the port's near and a far of 4000 m stand in (they only move the
+/// 7.5e-6 bias of the behind test).
+pub struct Marks {
+    g: Globals,
+    mesh: Option<Arc<IconMesh>>,
+    draws: Vec<(Mat4, [f32; 4])>,
+}
+
+pub fn race_marks(screen: egui::Rect, assets: &mut Assets, marks: &[crate::racemark::Mark], vp: Mat4, depth_test: bool) -> egui::Shape {
+    let n = port_near(&vp);
+    let f = 4000.0;
+    let g = Globals { vp: vp.to_cols_array_2d(), xray: [if depth_test { last_xray() } else { 1.0 }, f / (f - n), n, n], ripple: [0.0, 0.0, 0.0, 1.0], ripple2: [0.0; 4] };
+    let draws = marks.iter().map(|m| (m.m, m.colour)).collect();
+    egui::Shape::Callback(egui_wgpu::Callback::new_paint_callback(screen, Marks { g, mesh: assets.mesh("icon_racer"), draws }))
+}
+
+impl egui_wgpu::CallbackTrait for Marks {
+    fn prepare(&self, device: &wgpu::Device, queue: &wgpu::Queue, _sd: &egui_wgpu::ScreenDescriptor, _enc: &mut wgpu::CommandEncoder, res: &mut egui_wgpu::CallbackResources) -> Vec<wgpu::CommandBuffer> {
+        let Some(r) = res.get_mut::<XrayRes>() else { return Vec::new() };
+        let (mut recs, mut cmds) = (Vec::new(), Vec::new());
+        if let Some(m) = self.mesh.as_ref() {
+            r.mesh(device, "icon_racer", m);
+            for (world, colour) in &self.draws {
+                for (k, part) in m.parts.iter().enumerate() {
+                    let Some(img) = part.tex.as_ref() else { continue };
+                    let key = format!("icon_racer#{k}");
+                    r.texture(device, queue, &key, img.w, img.h, &img.rgba8);
+                    let inst = recs.len() as u32;
+                    recs.push(DrawRec { world: world.to_cols_array_2d(), colour: *colour, mode: [0; 4] });
+                    cmds.push(Cmd::Mesh { mesh: "icon_racer", part: k, tex: Some(key), inst });
+                }
+            }
+        }
+        r.fill(device, queue, 2, &self.g, &recs, cmds);
+        Vec::new()
+    }
+
+    fn paint(&self, _info: egui::PaintCallbackInfo, pass: &mut wgpu::RenderPass<'static>, res: &egui_wgpu::CallbackResources) {
+        if let Some(r) = res.get::<XrayRes>() {
+            paint_slot(r, 2, pass);
         }
     }
 }

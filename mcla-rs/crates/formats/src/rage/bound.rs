@@ -125,6 +125,14 @@ pub struct Hull {
     pub cg: [f32; 3],
     /// bound +186: how many of the corners the detector's scan takes
     pub scan: u16,
+    /// its own box, +0x10 max / +0x20 min (the margin included)
+    pub bbox: ([f32; 3], [f32; 3]),
+    /// the box (max, min) of the composite bound (type 12) that holds this hull as a part, as
+    /// the file has it (the running game moves the wheel parts to the wheels and the box with them)
+    pub composite: Option<([f32; 3], [f32; 3])>,
+    /// the places of that composite's other parts (the wheels: type 5) in the car, from the
+    /// part matrices (+0x84, 64 bytes, translation at +48)
+    pub wheel_parts: Vec<[f32; 3]>,
 }
 
 pub const HULL_CLASS: u32 = 0x0059_b464;
@@ -135,6 +143,32 @@ pub const AMBIENT_HULL_CLASS: u32 = 0x0051_05ec;
 /// The one hull among a fragment file's objects.
 pub fn find_hull(res: &Resource) -> Option<Hull> {
     find_hull_of(res, HULL_CLASS)
+}
+
+/// The box (max, min) of the composite bound (type byte 12; +0x80 -> parts, +0x90 u16 count)
+/// that has the bound at `part` among its parts.
+fn composite_box_of(rd: &Rd, size: usize, part: usize) -> Option<(([f32; 3], [f32; 3]), Vec<[f32; 3]>)> {
+    let mut o = 0;
+    while o + 0xa0 <= size {
+        if rd.u8(o + 4) == 12 {
+            let n = rd.u16(o + 0x90) as usize;
+            if let Some(parts) = rd.ptr(o + 0x80).filter(|&p| n > 0 && n < 256 && rd.has(p, n * 4)) {
+                if (0..n).any(|i| rd.ptr(parts + i * 4) == Some(part)) {
+                    let v = |a: usize| [rd.f32(a), rd.f32(a + 4), rd.f32(a + 8)];
+                    let mats = rd.ptr(o + 0x84).filter(|&m| rd.has(m, n * 64));
+                    let wheels = (0..n)
+                        .filter_map(|i| {
+                            let b = rd.ptr(parts + i * 4)?;
+                            (b != part && rd.u8(b + 4) == 5).then(|| mats.map(|m| v(m + i * 64 + 48))).flatten()
+                        })
+                        .collect();
+                    return Some(((v(o + 0x10), v(o + 0x20)), wheels));
+                }
+            }
+        }
+        o += 16;
+    }
+    None
 }
 
 /// The one polyhedron bound of class word `class` among a file's objects (stage R: the traffic
@@ -163,6 +197,11 @@ pub fn find_hull_of(res: &Resource, class: u32) -> Option<Hull> {
                         let number = numbers.map_or(0, |n| rd.u8(n + t) as usize);
                         hull.material.push(ids.filter(|_| number < nm).map_or(0, |i| rd.u32(i + number * 4)));
                     }
+                    if let Some((b, w)) = composite_box_of(&rd, res.virtual_size, o) {
+                        hull.composite = Some(b);
+                        hull.wheel_parts = w;
+                    }
+                    hull.bbox = ([rd.f32(o + 0x10), rd.f32(o + 0x14), rd.f32(o + 0x18)], [rd.f32(o + 0x20), rd.f32(o + 0x24), rd.f32(o + 0x28)]);
                     return Some(hull);
                 }
             }
@@ -170,4 +209,56 @@ pub fn find_hull_of(res: &Resource, class: u32) -> Option<Hull> {
         o += 16;
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    /// Every car's hull sits in a composite bound with the wheels as its other parts
+    /// (`MCLA_BOX_LOG=1 MCLA_BOX_PARTS=1` prints them).
+    #[test]
+    fn car_composite_boxes() {
+        let root = std::env::var("MCLA_DATA_DIR").unwrap_or_else(|_| "D:/MCLA/extracted/cache".into());
+        let Ok(dirs) = std::fs::read_dir(std::path::Path::new(&root).join("resources/vehicle")) else { return };
+        let mut seen = 0;
+        for d in dirs.flatten().filter(|d| d.file_name().to_string_lossy().starts_with("vp")) {
+            let Ok(files) = std::fs::read_dir(d.path()) else { continue };
+            for f in files.flatten().filter(|f| f.path().extension().map_or(false, |e| e == "r83")) {
+                let Ok(b) = std::fs::read(f.path()) else { continue };
+                let u = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+                let data = b[16..].to_vec();
+                let vs = (u(12) as usize).min(data.len());
+                let res = crate::rsc::Resource { rtype: u(4), flags: u(8), virtual_size: vs, physical_size: data.len() - vs, data };
+                let Some(h) = super::find_hull(&res) else { continue };
+                let (lo, hi) = h.verts.iter().fold(([f32::MAX; 3], [f32::MIN; 3]), |(lo, hi), v| ([lo[0].min(v[0]), lo[1].min(v[1]), lo[2].min(v[2])], [hi[0].max(v[0]), hi[1].max(v[1]), hi[2].max(v[2])]));
+                if std::env::var("MCLA_BOX_LOG").is_ok() {
+                    println!("{} hull y {:.3}..{:.3} margin {:.3} composite {:?}", d.file_name().to_string_lossy(), lo[1], hi[1], h.margin, h.composite);
+                    if std::env::var("MCLA_BOX_PARTS").is_ok() {
+                        let rd = super::Rd::new(&res);
+                        let mut o = 0;
+                        while o + 0xa0 <= res.virtual_size {
+                            if rd.u8(o + 4) == 12 {
+                                let n = rd.u16(o + 0x90) as usize;
+                                if let (Some(parts), Some(mats)) = (rd.ptr(o + 0x80), rd.ptr(o + 0x84)) {
+                                    if n > 0 && n < 64 && rd.has(parts, n * 4) && rd.has(mats, n * 64) {
+                                        for i in 0..n {
+                                            let Some(b) = rd.ptr(parts + i * 4) else { continue };
+                                            let m = mats + i * 64;
+                                            println!("   part {i} type {} radius {:.3} max ({:.3} {:.3} {:.3}) min ({:.3} {:.3} {:.3}) margin {:.3} at ({:.3} {:.3} {:.3})", rd.u8(b + 4), rd.f32(b + 8), rd.f32(b + 0x10), rd.f32(b + 0x14), rd.f32(b + 0x18), rd.f32(b + 0x20), rd.f32(b + 0x24), rd.f32(b + 0x28), rd.f32(b + 0x70), rd.f32(m + 48), rd.f32(m + 52), rd.f32(m + 56));
+                                        }
+                                    }
+                                }
+                            }
+                            o += 16;
+                        }
+                    }
+                }
+                assert!(h.composite.is_some(), "{:?}", f.path());
+                seen += 1;
+                break;
+            }
+        }
+        if seen > 0 {
+            println!("{seen} cars");
+        }
+    }
 }

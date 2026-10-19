@@ -38,6 +38,10 @@ pub struct HullShape {
     pub cg: Vec3,
     /// how many of the corners the detector's scan takes (bound +186; 0: by the older rule - all but the last of 18)
     pub scan: usize,
+    /// the file hull's own box (max, min; +0x10 / +0x20, the margin included)
+    pub bbox: Option<(Vec3, Vec3)>,
+    /// the file composite's wheel parts' places in the car (the model's hubs)
+    pub wheel_parts: Vec<Vec3>,
 }
 
 impl HullShape {
@@ -76,7 +80,7 @@ impl HullShape {
                 }
             }
         }
-        HullShape { verts, edge_dirs, face_normals, min, max, centre, tris: tris.to_vec(), mats: Vec::new(), cg: Vec3::ZERO, scan: 0 }
+        HullShape { verts, edge_dirs, face_normals, min, max, centre, tris: tris.to_vec(), mats: Vec::new(), cg: Vec3::ZERO, scan: 0, bbox: None, wheel_parts: Vec::new() }
     }
 
     /// The hull's reach along an axis: (least, most).
@@ -207,6 +211,8 @@ pub fn shaped(file: &mcla_formats::rage::bound::Hull, t: &mcla_formats::rage::si
     let mut shape = HullShape::new(v, &file.tris);
     shape.mats = file.material.clone();
     shape.cg = Vec3::from(file.cg);
+    shape.bbox = Some((Vec3::from(file.bbox.0), Vec3::from(file.bbox.1)));
+    shape.wheel_parts = file.wheel_parts.iter().map(|p| Vec3::from(*p)).collect();
     shape.scan = if std::env::var_os("MCLA_DBG_OLDSCAN").is_some() { 0 } else { (file.scan as usize).min(shape.verts.len()) };
     shape
 }

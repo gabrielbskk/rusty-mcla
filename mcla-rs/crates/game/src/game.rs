@@ -569,6 +569,8 @@ pub struct Game {
     /// a start scene before its countdown event: no HUD (the original brings the HUD - map and 3-2-1 - up
     /// with the countdown, over the scene's camera: work/career2/cap/d1_10.png)
     pub scene_hud_off: bool,
+    /// the race markers' tune (`mcUIClass`, loaded on first use)
+    pub mark_tune: Option<crate::racemark::MarkTune>,
     /// the pause menu's NEXT RACE started this race: not a "first race" for the start-scene picker (the
     /// original drew from the grid list both times: work/career2/cap/README.md n1, n3)
     pub next_race_start: bool,
@@ -1091,6 +1093,7 @@ impl Game {
             dive_k: 0.0,
             ui_sim_dt: 0.0,
             scene_hud_off: false,
+            mark_tune: None,
             next_race_start: false,
             hangout_key: None,
             hangout_diff: 0,
@@ -7616,6 +7619,7 @@ impl Game {
                     self.city_map(ctx, vehicles, world, hud);
                     self.mission_log_ui(ctx, [up, down, left, right, enter], tab_prev, tab_next, hud.map_vp, hud.player_pos);
                 } else {
+                    self.race_markers(ctx, vehicles, &hud);
                     // (the first target set brings the MINI MAP box - `ng_tut_minimap`: "GPS Targets
                     // will appear highlighted in the Mini Map...", CONTINUE (A))
                     if self.tutorial_box.is_none() && self.mode == Mode::FreeRoam && self.career.stats.contains_key("tut:target_set") && !self.career.stats.contains_key("tut:target") {
@@ -8802,6 +8806,59 @@ impl Game {
         }
     }
 
+    /// The race markers over the computer racers (racemark.rs; `sub_822272C8`): in a race with
+    /// checkpoints, no flag game, not in a replay, while the HUD is up *(I: the gate
+    /// `[0x8286D80C]+456` vfunc 23 is taken for "HUD shown")*; every racer of the race but the
+    /// player whose car is in the world and whose icon is not hidden by its script (the payback
+    /// client: type 10 cruising, 18 chased, hidden once the clock has run out).
+    fn race_markers(&mut self, ctx: &egui::Context, vehicles: &Vehicles, hud: &HudInfo) {
+        if std::env::var("MCLA_NO_RACE_MARKERS").is_ok() || self.flag.is_some() || self.replay.is_some() {
+            return;
+        }
+        let (Some(race), Some(vp)) = (self.race.as_ref(), hud.cam_vp) else { return };
+        if race.checkpoints.is_empty() {
+            return;
+        }
+        let tune = self.mark_tune.get_or_insert_with(|| crate::racemark::MarkTune::load(&self.data_dir)).clone();
+        let pb_phase = self.opt_x.arcade.pb.as_ref().map_or(0, |l| l.phase);
+        let alpha = vehicles.render_alpha;
+        let mut racers = Vec::new();
+        for &ci in &race.participants {
+            let Some(c) = vehicles.cars.get(ci) else { continue };
+            if c.is_player || !c.placed {
+                continue;
+            }
+            let icon = if race.kind == RaceKind::Payback && race.target == Some(ci) {
+                match pb_phase {
+                    0 => 10,
+                    1 => 18,
+                    _ => continue,
+                }
+            } else {
+                0
+            };
+            let height = crate::racemark::bound_height(c);
+            racers.push(crate::racemark::Racer { pos: c.render_pose(alpha).pos, height, icon });
+        }
+        if std::env::var("MCLA_MARK_LOG").is_ok() {
+            if let Some(p) = vehicles.player() {
+                crate::racemark::bound_height(p);
+            }
+        }
+        let marks = crate::racemark::marks(&tune, hud.cam_pos, hud.cam_look - hud.cam_pos, &racers);
+        if std::env::var("MCLA_MARK_LOG").is_ok() {
+            for m in &marks {
+                log::info!("race marker: {:.1} m at {:?} colour {:?}", m.dist, m.m.w_axis.truncate(), m.colour);
+            }
+        }
+        if marks.is_empty() {
+            return;
+        }
+        let Some(hm) = self.hm.as_mut() else { return };
+        let layer = egui::LayerId::new(egui::Order::Background, egui::Id::new("race_markers"));
+        ctx.layer_painter(layer).add(crate::hudmap_gpu::race_marks(ctx.screen_rect(), &mut hm.assets, &marks, vp, tune.depth_test));
+    }
+
     /// The icon of an event of this kind.
     fn event_icon(sub_type: &str) -> &'static str {
         match sub_type {
@@ -9213,6 +9270,8 @@ pub struct HudInfo {
     /// projection, place, flat heading, speed; and whether it is night
     pub cam_vp: Option<glam::Mat4>,
     pub cam_pos: Vec3,
+    /// the point the camera looks at (its forward is `cam_look - cam_pos`)
+    pub cam_look: Vec3,
     pub cam_fwd: Vec3,
     pub cam_vel: Vec3,
     pub night: bool,

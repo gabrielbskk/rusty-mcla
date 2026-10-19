@@ -61,6 +61,7 @@ mod rimshop;
 mod dimensions;
 mod menu3d;
 mod prerace;
+mod racemark;
 mod mapmesh;
 mod hudmap;
 mod hudmap_gpu;
@@ -2647,6 +2648,13 @@ impl App {
             if let (Some(s), Some(r)) = (std::env::var("MCLA_SHOT_AT_GO").ok().and_then(|v| v.parse::<f32>().ok()), self.game.race.as_ref()) {
                 if r.countdown > 0.0 && r.countdown <= s && self.game.prerace.is_none() && !std::mem::replace(&mut self.shot_at_go, true) {
                     log::info!("shot at {:.2} s to GO (scene {:?})", r.countdown, self.cine.playing.as_ref().map(|sc| (sc.name.clone(), sc.t)));
+                    self.game.shot_now = true;
+                }
+            }
+            // (test hook MCLA_SHOT_AFTER_GO=s: the screenshot once the race clock passes s seconds)
+            if let (Some(s), Some(r)) = (std::env::var("MCLA_SHOT_AFTER_GO").ok().and_then(|v| v.parse::<f32>().ok()), self.game.race.as_ref()) {
+                if r.countdown <= 0.0 && r.time >= s && !std::mem::replace(&mut self.shot_at_go, true) {
+                    log::info!("shot at race clock {:.2} s", r.time);
                     self.game.shot_now = true;
                 }
             }
@@ -5924,7 +5932,7 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
             if let Some(k) = self.game.ability_pick.take() {
                 self.ability.kind = crate::ability::Kind::ALL[k.min(3)];
             }
-            let hud = self.vehicles.player().map(|c| HudInfo { speed_kmh: c.state.fwd_speed() * 3.6, gear: c.state.gear, rpm: c.state.rpm, redline: c.model.params.redline, nitro: (c.state.nitro_shots as f32 + c.state.veh.as_ref().map_or(0.0, |v| v.nitro_level)) / 4.0, damage: if self.game.race.as_ref().map_or(false, |r| r.kind == game::RaceKind::Delivery) { c.state.delivery_damage() } else { c.state.damage }, player_pos: c.state.pos, player_heading: { let f = c.state.forward(); f.x.atan2(-f.z) }, heat: std::env::var("MCLA_HUD_HEAT").ok().filter(|_| self.tick_no > 400).and_then(|v| v.parse().ok()).unwrap_or(if self.police.goons { 0 } else { self.police.heat as u8 }), fine: if self.police.goons { 0 } else { self.police.fine as i64 }, law: self.police.level(), search: self.police.search / self.police.tun.get("fSearchMaxTime", 35.0), rain: rain_now, ability: if (self.game.mc4_ability_none() || (self.game.career.loaded() && !self.game.career.reached("INSTALL_ABILITY"))) && std::env::var("MCLA_ABILITY").is_err() { "" } else { self.ability.kind.name() }, ability_meter: self.ability.meter, ability_fx: self.ability.fx(), draft: self.ability.draft, sst: self.ability.sst, sst_full: self.ability.sst_ready(), map_vp: self.map_vp, ability_tint: self.ability.tint().map(|t| (t, self.ability.blend())), cam_vp: Some(vp), cam_pos: self.chase.pos, cam_fwd: { let f = self.chase.look - self.chase.pos; Vec3::new(f.x, 0.0, f.z).normalize_or_zero() }, cam_vel: c.state.vel, night: self.time_of_day > 19.5 || self.time_of_day < 6.0, cruise: self.cruise_hold, pu_hud: self.powerups.as_ref().map_or([0.0, 0.0, 1.0], |p| p.hud(self.vehicles.cars.iter().position(|x| x.is_player).unwrap_or(0))) }).unwrap_or_default();
+            let hud = self.vehicles.player().map(|c| HudInfo { speed_kmh: c.state.fwd_speed() * 3.6, gear: c.state.gear, rpm: c.state.rpm, redline: c.model.params.redline, nitro: (c.state.nitro_shots as f32 + c.state.veh.as_ref().map_or(0.0, |v| v.nitro_level)) / 4.0, damage: if self.game.race.as_ref().map_or(false, |r| r.kind == game::RaceKind::Delivery) { c.state.delivery_damage() } else { c.state.damage }, player_pos: c.state.pos, player_heading: { let f = c.state.forward(); f.x.atan2(-f.z) }, heat: std::env::var("MCLA_HUD_HEAT").ok().filter(|_| self.tick_no > 400).and_then(|v| v.parse().ok()).unwrap_or(if self.police.goons { 0 } else { self.police.heat as u8 }), fine: if self.police.goons { 0 } else { self.police.fine as i64 }, law: self.police.level(), search: self.police.search / self.police.tun.get("fSearchMaxTime", 35.0), rain: rain_now, ability: if (self.game.mc4_ability_none() || (self.game.career.loaded() && !self.game.career.reached("INSTALL_ABILITY"))) && std::env::var("MCLA_ABILITY").is_err() { "" } else { self.ability.kind.name() }, ability_meter: self.ability.meter, ability_fx: self.ability.fx(), draft: self.ability.draft, sst: self.ability.sst, sst_full: self.ability.sst_ready(), map_vp: self.map_vp, ability_tint: self.ability.tint().map(|t| (t, self.ability.blend())), cam_vp: Some(vp), cam_pos: self.chase.pos, cam_look: self.chase.look, cam_fwd: { let f = self.chase.look - self.chase.pos; Vec3::new(f.x, 0.0, f.z).normalize_or_zero() }, cam_vel: c.state.vel, night: self.time_of_day > 19.5 || self.time_of_day < 6.0, cruise: self.cruise_hold, pu_hud: self.powerups.as_ref().map_or([0.0, 0.0, 1.0], |p| p.hud(self.vehicles.cars.iter().position(|x| x.is_player).unwrap_or(0))) }).unwrap_or_default();
             let mut action = MenuAction::None;
             let game = &mut self.game;
             let vehicles = &self.vehicles;
