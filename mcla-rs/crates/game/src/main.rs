@@ -71,8 +71,12 @@ mod ground_sheet;
 mod fillmap;
 
 /// Where the pause cameras' frame sits in the car (x right, y up, z rear from the
-/// car's origin on the ground). (approx.) Fitted to the reference capture.
-const PAUSE_FRAME: Vec3 = Vec3::new(0.0, 1.38, -0.25);
+/// car's origin). Measured in the original (CAREER_RACES.md "Race end: camera and
+/// timing", second run): the settled PauseCamera3 and PauseCamera2 both stand at their
+/// tuned place + (0, 1.42, 0.08) from the S281's instance origin, the look the tune's to
+/// 0.003. (approx.: the port's car origin taken as the original's instance origin; was
+/// (0, 1.38, -0.25), fitted by eye)
+const PAUSE_FRAME: Vec3 = Vec3::new(0.0, 1.42, 0.08);
 /// how long a race's opening shot from the air lasts (ticks)
 const DIVE_TICKS: u32 = 240;
 /// Placement on the grid -> start scene, 0.8 s (grid_hold_rule.md 1, AROUND HOLLYWOOD).
@@ -235,8 +239,9 @@ struct App {
     garage_tr: Option<(garagecam::CamState, garagecam::CamState, f32)>,
     /// the race's end: the standings form's pause camera (picked when it comes up) and the
     /// view held once the game is paused
-    race_end_cam: Option<menu3d::PauseCam>,
-    race_end_hold: Option<(Vec3, Vec3, f32)>,
+    race_end_cam: Option<(menu3d::PauseCam, menu3d::PauseCam)>,
+    race_end_from: Option<(Vec3, Vec3, f32)>,
+    race_end_way: Option<f32>,
     /// the parts the car in the garage was last built with: a change shows at once
     garage_built: Option<(usize, vehicle_model::CarConfig, u8)>,
     garage_up: Vec3,
@@ -592,7 +597,8 @@ impl App {
             garage_cam: None,
             garage_tr: None,
             race_end_cam: None,
-            race_end_hold: None,
+            race_end_from: None,
+            race_end_way: None,
             garage_built: None,
             garage_up: Vec3::Y,
             garage_spots: Default::default(),
@@ -4844,10 +4850,12 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                 // the garage's own cameras: the view that goes with the highlighted row
                 let mut own_view = false;
                 // (the race's end before its menu: the driving camera, swung to the standings form's)
-                let race_end_swing = self.game.mode == Mode::Results && self.game.replay.is_none() && self.cuts.playing.is_none() && self.game.race_end_t.map_or(false, |t| t < game::Game::RACE_END_MENU);
-                if !race_end_swing {
+                let race_end_on = self.game.mode == Mode::Results && self.game.replay.is_none() && self.cuts.playing.is_none() && self.game.race_end_t.is_some();
+                let race_end_swing = race_end_on && self.game.race_end_t.map_or(false, |t| t < game::Game::RACE_END_MENU);
+                if !race_end_on {
                     self.race_end_cam = None;
-                    self.race_end_hold = None;
+                    self.race_end_from = None;
+                    self.race_end_way = None;
                 }
                 if self.game.mode == Mode::Garage && self.cuts.playing.is_none() && std::env::var("MCLA_NO_GARAGE_CAM").is_err() {
                     if self.garage_views.as_ref().map_or(true, |v| v.0 != car.model.name) {
@@ -5302,18 +5310,35 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                     self.chase.look = render_state.pos + render_state.forward() * 6.0;
                 }
                 // the race's end: forms 54 and 60 come up 0.2 s after the line and the pause movie
-                // takes the camera over from the driving one - the standings form's CameraIndex 2,
-                // PauseCamera3, or its mirror PauseCamera13 when a line from it to its look-at point
-                // is blocked, else PauseCamera1 (sub_82654960). The movie's weight
-                // `player0_cam_ctrl` = sin(acos(1 - temp / 100)), temp += 3 a movie frame (30 a
-                // second, approx.); the two views blended as SetPolarCam's sub_82205A18 does: the
-                // angles and the length of eye - look-at, the look-at and the lens straight. A second
-                // later the game is paused and the picture stands until the menu cuts in.
-                if race_end_swing {
+                // takes the camera over (recorded twice in the original, CAREER_RACES.md "Race end:
+                // camera and timing"). The movie's camera: from `cur_camera` 0 (PauseCamera1) to the
+                // standings form's 2 (PauseCamera3; its mirror 13 when a line from it to its look-at
+                // point is blocked, else 1 - sub_82654960), `fs_LerpFactor` += (1 - it) / 10 a movie
+                // frame; the game's camera mixed into it by `player0_cam_ctrl` = sin(acos(1 - temp /
+                // 100)), temp += 3 a frame; both mixes as SetPolarCam's sub_82205A18 (the angles and
+                // length of eye - look-at, the look-at and the lens straight). Movie frames 30 a
+                // second (the settling seen in the original: 0.9 a frame at 30). The pause at 1.2 s
+                // does not stop the movie: the camera settles on. At 2.4 s the race-over panel's
+                // camera is the movie's next `cur_camera`: the same lerp from where it stands, the
+                // short way round unless that path is blocked, then the long way, else a cut
+                // (0x82205FD8 tests t = 0.25, 0.5, 0.75).
+                if race_end_on {
                     let t = self.game.race_end_t.unwrap_or(0.0);
-                    if let Some(h) = self.race_end_hold {
-                        (self.chase.pos, self.chase.look, self.cam.fov_y) = h;
-                    } else if t >= game::Game::RACE_END_PANEL {
+                    let polar = |d: Vec3| (d.x.atan2(d.z), d.y.atan2(Vec3::new(d.x, 0.0, d.z).length()), d.length());
+                    let mix = |a: (Vec3, Vec3, f32), b: (Vec3, Vec3, f32), k: f32, long: bool| -> (Vec3, Vec3, f32) {
+                        let (y0, p0, r0) = polar(a.0 - a.1);
+                        let (y1, p1, r1) = polar(b.0 - b.1);
+                        let mut dy = y1 - y0;
+                        if dy > std::f32::consts::PI { dy -= std::f32::consts::TAU; }
+                        if dy < -std::f32::consts::PI { dy += std::f32::consts::TAU; }
+                        if long {
+                            dy -= std::f32::consts::TAU.copysign(dy);
+                        }
+                        let (yaw, pitch, r) = (y0 + dy * k, p0 + (p1 - p0) * k, r0 + (r1 - r0) * k);
+                        let look = a.1.lerp(b.1, k);
+                        (look + Vec3::new(yaw.sin() * pitch.cos(), pitch.sin(), yaw.cos() * pitch.cos()) * r, look, a.2 + (b.2 - a.2) * k)
+                    };
+                    if race_end_swing && t >= game::Game::RACE_END_PANEL {
                         let fwd = render_state.forward();
                         let fwd = Vec3::new(fwd.x, 0.0, fwd.z).normalize_or(Vec3::NEG_Z);
                         let right = Vec3::new(-fwd.z, 0.0, fwd.x);
@@ -5323,28 +5348,37 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                             let logic = menu3d::UiLogic::load(&self.opt.data_dir);
                             let cam = |n: usize| logic.pause_cams.get(n - 1).copied();
                             let clear = |c: &menu3d::PauseCam| world.collider.raycast(place(c.position), (place(c.lookat) - place(c.position)).normalize_or(Vec3::Z), place(c.lookat).distance(place(c.position))).is_none();
-                            self.race_end_cam = cam(3).filter(|c| clear(c)).or_else(|| cam(13).filter(|c| clear(c))).or_else(|| cam(1));
+                            let to = cam(3).filter(|c| clear(c)).or_else(|| cam(13).filter(|c| clear(c))).or_else(|| cam(1));
+                            self.race_end_cam = to.zip(cam(1));
                         }
-                        if let Some(c) = self.race_end_cam {
-                            let frames = ((t - game::Game::RACE_END_PANEL) * 30.0).floor();
-                            let temp = (frames * 3.0).min(100.0);
-                            let k = (1.0 - temp / 100.0).clamp(-1.0, 1.0).acos().sin();
-                            let (e1, l1, f1) = (place(c.position), place(c.lookat), c.fovy.to_radians());
-                            let (e0, l0, f0) = (self.chase.pos, self.chase.look, self.cam.fov_y);
-                            let polar = |d: Vec3| (d.x.atan2(d.z), d.y.atan2(Vec3::new(d.x, 0.0, d.z).length()), d.length());
-                            let (y0, p0, r0) = polar(e0 - l0);
-                            let (y1, p1, r1) = polar(e1 - l1);
-                            let mut dy = y1 - y0;
-                            if dy > std::f32::consts::PI { dy -= std::f32::consts::TAU; }
-                            if dy < -std::f32::consts::PI { dy += std::f32::consts::TAU; }
-                            let (yaw, pitch, r) = (y0 + dy * k, p0 + (p1 - p0) * k, r0 + (r1 - r0) * k);
-                            let look = l0.lerp(l1, k);
-                            self.chase.look = look;
-                            self.chase.pos = look + Vec3::new(yaw.sin() * pitch.cos(), pitch.sin(), yaw.cos() * pitch.cos()) * r;
-                            self.cam.fov_y = f0 + (f1 - f0) * k;
+                        if let Some((to, from)) = self.race_end_cam {
+                            let n = ((t - game::Game::RACE_END_PANEL) * 30.0).floor();
+                            let f = 1.0 - 0.9f32.powf(n);
+                            let k = (1.0 - (n * 3.0).min(100.0) / 100.0).clamp(-1.0, 1.0).acos().sin();
+                            let view = |c: &menu3d::PauseCam| (place(c.position), place(c.lookat), c.fovy.to_radians());
+                            let movie = mix(view(&from), view(&to), f, false);
+                            let out = mix((self.chase.pos, self.chase.look, self.cam.fov_y), movie, k, false);
+                            (self.chase.pos, self.chase.look, self.cam.fov_y) = out;
+                            self.race_end_from = Some(out);
                         }
-                        if t >= game::Game::RACE_END_FREEZE {
-                            self.race_end_hold = Some((self.chase.pos, self.chase.look, self.cam.fov_y));
+                    } else if !race_end_swing && t < game::Game::RACE_END_MENU + 5.0 {
+                        if let Some(from) = self.race_end_from {
+                            let to = (self.chase.pos, self.chase.look, self.cam.fov_y);
+                            if self.race_end_way.is_none() {
+                                let blocked = |long: bool| {
+                                    [0.25, 0.5, 0.75].iter().any(|&k| {
+                                        let (e, l, _) = mix(from, to, k, long);
+                                        world.collider.raycast(l, (e - l).normalize_or(Vec3::Z), l.distance(e)).is_some()
+                                    })
+                                };
+                                self.race_end_way = Some(if !blocked(false) { 0.0 } else if !blocked(true) { 1.0 } else { -1.0 });
+                            }
+                            let n = ((t - game::Game::RACE_END_MENU) * 30.0).floor();
+                            let f = 1.0 - 0.9f32.powf(n);
+                            match self.race_end_way {
+                                Some(w) if w >= 0.0 => (self.chase.pos, self.chase.look, self.cam.fov_y) = mix(from, to, f, w > 0.5),
+                                _ => {}
+                            }
                         }
                     }
                 }
