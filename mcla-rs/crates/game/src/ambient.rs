@@ -16,26 +16,36 @@ pub fn xml_value(text: &str, tag: &str) -> Option<f32> {
     rest[v..v + e].trim().parse().ok()
 }
 
-/// Weight of something over the day: (start hour, end hour, weight) rows of a `TodArray`.
+/// Weight of something over the day: (start, end, weight) rows of a `TodArray`, times as
+/// written (HHMM).
 #[derive(Default, Clone, Debug)]
-pub struct Tod(Vec<(f32, f32, f32)>);
+pub struct Tod(pub(crate) Vec<(i32, i32, f32)>);
 
 impl Tod {
     pub fn parse(xml: &str) -> Tod {
         let mut v = Vec::new();
-        for item in xml.split("<Item>").skip(1) {
-            let (Some(a), Some(b), Some(w)) = (xml_value(item, "iStartTime"), xml_value(item, "iEndTime"), xml_value(item, "fWeight")) else { continue };
-            // times are written as HHMM
-            v.push((a / 100.0, if b <= a { b / 100.0 + 24.0 } else { b / 100.0 }, w));
+        // the files write the row tag both as <Item> and <item>
+        for item in xml.replace("<item>", "<Item>").split("<Item>").skip(1) {
+            let (Some(a), Some(b), Some(w)) = (xml_value(&item, "iStartTime"), xml_value(&item, "iEndTime"), xml_value(&item, "fWeight")) else { continue };
+            v.push((a as i32, b as i32, w));
         }
         Tod(v)
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The original's lookup (sub_826DA510): the clock as HHMM, the first row with
+    /// start <= t <= end (an end of 0000 is 2400), 0 when no row covers it. A table
+    /// without rows weighs 1 (the tree's starting value, sub_826DAB80).
     pub fn at(&self, hour: f32) -> f32 {
         if self.0.is_empty() {
             return 1.0;
         }
-        self.0.iter().find(|(a, b, _)| (hour >= *a && hour < *b) || (hour + 24.0 >= *a && hour + 24.0 < *b)).map(|r| r.2).unwrap_or(0.0)
+        let h = hour.rem_euclid(24.0);
+        let t = h.floor() as i32 * 100 + (h.fract() * 60.0).floor() as i32;
+        self.0.iter().find(|(a, b, _)| t >= *a && t <= if *b == 0 { 2400 } else { *b }).map(|r| r.2).unwrap_or(0.0)
     }
 }
 
@@ -45,6 +55,9 @@ pub struct Distribution {
     /// per district colour: (type name, weight over the day), ancestors' lists included
     pub types: HashMap<u8, Vec<(String, Tod)>>,
     pub density: Tod,
+    /// per district colour: its density over the day - its own `TodDensityArray`, else
+    /// the nearest ancestor's (sub_826DAB80 walks the district's nodes for the first table)
+    pub district_density: HashMap<u8, Tod>,
 }
 
 fn type_list(xml: &str) -> Vec<(String, Tod)> {
@@ -69,6 +82,12 @@ impl Distribution {
         Some(self.map[v * 256 + u])
     }
 
+    /// Density of the district at `p` at this hour (its `TodDensityArray`; the root's where
+    /// the map gives no district).
+    pub fn density_at(&self, p: Vec3, hour: f32) -> f32 {
+        self.district(p).and_then(|c| self.district_density.get(&c)).unwrap_or(&self.density).at(hour)
+    }
+
     pub fn loaded(&self) -> bool {
         !self.types.is_empty()
     }
@@ -87,34 +106,41 @@ impl Distribution {
         tops.sort();
         for top in tops {
             let Ok(root_xml) = std::fs::read_to_string(top.join("mcAmbientDistribution.xml")) else { continue };
-            // walk the tree, handing every node the lists of its ancestors
-            let mut leaves: Vec<(u8, Vec<(String, Tod)>)> = Vec::new();
-            let mut stack = vec![(top.clone(), Vec::<(String, Tod)>::new())];
-            while let Some((dir, inherited)) = stack.pop() {
+            // walk the tree, handing every node the lists (and density table) of its ancestors
+            let mut leaves: Vec<(u8, Vec<(String, Tod)>, Tod)> = Vec::new();
+            let mut stack = vec![(top.clone(), Vec::<(String, Tod)>::new(), Tod::default())];
+            while let Some((dir, inherited, mut density)) = stack.pop() {
                 let mut list = inherited;
                 if let Ok(x) = std::fs::read_to_string(dir.join("mcAmbientDistribution.xml")) {
                     list.extend(type_list(&x));
+                    if let Some(i) = x.find("<TodDensityArray>") {
+                        let own = Tod::parse(&x[i..]);
+                        if !own.is_empty() {
+                            density = own;
+                        }
+                    }
                 }
                 if let Ok(tree) = std::fs::read_to_string(dir.join("mcAmbientDistributionTreeData.xml")) {
                     if let Some(c) = xml_value(&tree, "iMapColor") {
-                        leaves.push((c as u8, list.clone()));
+                        leaves.push((c as u8, list.clone(), density.clone()));
                     }
                 }
                 if let Ok(rd) = std::fs::read_dir(&dir) {
                     for c in rd.flatten() {
                         if c.path().is_dir() {
-                            stack.push((c.path(), list.clone()));
+                            stack.push((c.path(), list.clone(), density.clone()));
                         }
                     }
                 }
             }
-            if !leaves.iter().any(|(_, l)| l.iter().any(|(n, _)| n.starts_with(prefix))) {
+            if !leaves.iter().any(|(_, l, _)| l.iter().any(|(n, _)| n.starts_with(prefix))) {
                 continue;
             }
             if let Some(i) = root_xml.find("<TodDensityArray>") {
                 d.density = Tod::parse(&root_xml[i..]);
             }
-            d.types = leaves.into_iter().collect();
+            d.district_density = leaves.iter().map(|(c, _, t)| (*c, t.clone())).collect();
+            d.types = leaves.into_iter().map(|(c, l, _)| (c, l)).collect();
             break;
         }
         d

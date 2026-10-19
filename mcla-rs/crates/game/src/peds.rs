@@ -19,7 +19,7 @@ use crate::skin::{blend_pose, Clip, SkinBuffer, SkinModel};
 use glam::{Mat4, Quat, Vec3};
 use hashbrown::{HashMap, HashSet};
 use mcla_formats::rage::anim::{find_animations, Animation};
-use mcla_formats::rage::navmesh::{NavLink, NavMesh, AI_ROAD, AI_SIDEWALK};
+use mcla_formats::rage::navmesh::{NavLink, NavMesh, NavPoly, AI_SIDEWALK};
 use mcla_formats::rage::navsys::NavSys;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -33,7 +33,13 @@ struct PedType {
     idle: Clip,
     evade: Vec<Clip>,
     angry: Vec<Clip>,
+    /// the shared Pivot clips (`Mped_turnL/R_90/180`) with the yaw their root turns
+    pivot: Vec<(Clip, f32)>,
     lod_switch: [f32; 2],
+    /// the walk clip's root speed (m/s): its distance over its duration (A36[1] / A28[1])
+    walk_speed: f32,
+    /// `fMinTurningRadius` of the set's `mcAmbientType.xml` (type +160)
+    turn_radius: f32,
 }
 
 impl PedType {
@@ -43,6 +49,7 @@ impl PedType {
             State::Idle => (&self.idle, true),
             State::Evade(k) => (&self.evade[k], false),
             State::Angry(k) => (&self.angry[k], false),
+            State::Turn(k) => (&self.pivot[k].0, false),
         }
     }
 }
@@ -53,6 +60,8 @@ enum State {
     Idle,
     Evade(usize),
     Angry(usize),
+    /// turning on the spot with a Pivot clip
+    Turn(usize),
 }
 
 struct Ped {
@@ -81,109 +90,574 @@ struct Ped {
     wait: f32,
     /// on the navigation mesh: the sidewalk polygon walked on (`NO_POLY`: kerb walker)
     poly: u32,
-    /// the polygon come from and the one behind the edge walked towards
-    prev: u32,
-    next: u32,
-    /// the stretch being walked: from here to the point on the edge into `next`
-    entry: Vec3,
-    goal: Vec3,
     /// direction of the stretch before
     travel: Vec3,
-    /// where across the pavement this one likes to walk (0 left .. 1 right)
-    side: f32,
+    /// on the navigation mesh: the points of the random path held (on the edges crossed)
+    /// with the polygon behind each; empty once given up
+    path: Vec<(Vec3, u32)>,
+    /// 30 Hz frames since the last path request
+    since_plan: u32,
+    /// seconds still standing after appearing (the original's spawning state, flags 0x49)
+    hold: f32,
+    /// the sidewalk behaviour (mcAmbientBehaviorSidewalk, vtable 0x820da7f4):
+    /// walking speed factor 0.85 .. 1.15 (beh +1336) and the speed now (ped +412)
+    scale: f32,
+    speed: f32,
+    /// the rail's end point; `true` for a rail around something in the way
+    rail: Option<(Vec3, bool)>,
+    /// stop timer and the stops in a row (behaviour +500, +532 >> 3)
+    stop: f32,
+    stops: u32,
+    /// sidestep or dodge: from, to, seconds into it, length
+    slide: Option<(Vec3, Vec3, f32, f32)>,
+    /// centres of the awareness spheres around the walker (+2176) and ahead of it (+3392) as
+    /// placed at the last query, and seconds to the next query
+    aware: Vec3,
+    ahead: Vec3,
+    aware_age: f32,
+    /// the last path was requested facing backwards: turn round to walk it
+    turn_round: bool,
+    /// yaw still to turn after the Pivot clip, and what follows the turn (angry after a dodge)
+    turn_rest: f32,
+    then_angry: bool,
+    /// the car dodged last
+    dodged: Option<Vec3>,
 }
 
 const NO_POLY: u32 = u32::MAX;
-/// Width of pavement one "metre of street" of the density tuning stands for (the tuning
-/// counts pedestrians per metre; the mesh gives areas). Invented.
-const PAVEMENT_WIDTH: f32 = 4.0;
+/// The original's frame: path requests are let through once per 30 Hz frame; spawning and
+/// unspawning run on every other one (sub_826F79F0 alternates by frame parity).
+const FRAME: f32 = 1.0 / 30.0;
+/// The spawner's occlusion test (sub_826F0628): a sphere of 2 m, 1.5 m above the spawn
+/// point, against the volumes seen from 1.75 m above the player (view 2, sub_822C1FA8).
+const OCC_LIFT: f32 = 1.5;
+const OCC_RADIUS: f32 = 2.0;
+const OCC_EYE: f32 = 1.75;
+/// The occluder range scale the city sets up (sub_822C2EA8 writes 10 to 0x827D2958).
+const OCC_RANGE_SCALE: f32 = 10.0;
 
 fn flat(v: Vec3) -> Vec3 {
     Vec3::new(v.x, 0.0, v.z)
 }
 
-/// Point on a shared edge to walk through, `side` of the way from its left end to its right
-/// end as seen from `from`, at least 0.6 m from the ends where the edge is wide enough.
-fn portal_point(l: &NavLink, from: Vec3, side: f32) -> Vec3 {
-    let mid = (l.a + l.b) * 0.5;
-    let d = mid - from;
-    let right = Vec3::new(-d.z, 0.0, d.x);
-    let (lft, rgt) = if (l.a - mid).dot(right) > 0.0 { (l.b, l.a) } else { (l.a, l.b) };
-    let len = l.a.distance(l.b);
-    let m = if len > 1.6 { 0.6 / len } else { 0.5 };
-    lft.lerp(rgt, m + (1.0 - 2.0 * m) * side)
-}
-
-/// Where to go from polygon `cur`, entered from `from`: one of its other sidewalk
-/// neighbours, the ones straight on preferred; `(polygon, point on the edge, false)`.
-/// At a dead end `(cur, centre of cur, true)`: walk up to the middle, then choose again
-/// with nothing excluded - which leads back.
-fn mesh_next(mesh: &NavMesh, cur: u32, from: u32, pos: Vec3, heading: Vec3, side: f32, r: f32) -> (u32, Vec3, bool) {
-    let mut cands: Vec<(f32, u32, Vec3)> = Vec::new();
-    let mut total = 0.0;
-    for l in mesh.links_of(cur) {
-        if l.poly == from || l.poly == cur || !mesh.polys[l.poly as usize].sidewalk() {
-            continue;
+/// The original's random walk over the sidewalk polygons (`navQueryPathRandom`, search
+/// sub_827691B0, set up by sub_8276AB10). Up to 32 hops; at each hop every sidewalk
+/// neighbour of the polygon weighs `L * max(((1 + cos) / 2)^2, 0.01)` - L the length of the
+/// shared edge, cos between the heading and the way to the edge's middle - or 0.001 when it
+/// is one of the last four polygons entered. The walk moves to the chosen edge's middle and
+/// turns the heading half way towards that step. Returns per hop the shared edge (a, b) and
+/// the polygon entered; on the 32nd hop the entry is that polygon's centre (a = b).
+pub(crate) fn random_path(mesh: &NavMesh, start: u32, pos: Vec3, heading: Vec3, rand: &mut dyn FnMut() -> f32) -> Vec<(Vec3, Vec3, u32)> {
+    let mut out = Vec::new();
+    let mut ring = [NO_POLY; 4];
+    let mut ring_i = 0;
+    let mut cur = start;
+    let mut p = pos;
+    let mut h = flat(heading).normalize_or_zero();
+    let mut cands: Vec<(f32, &NavLink)> = Vec::new();
+    // starting off the pavement the filter is only a weight (x 1e-6 outside it), so the walk
+    // finds its way back (sub_826FC258)
+    let soft = !mesh.polys[start as usize].sidewalk();
+    for hop in 0..32 {
+        cands.clear();
+        let mut total = 0.0;
+        for l in mesh.links_of(cur) {
+            let outside = !mesh.polys[l.poly as usize].sidewalk();
+            if l.poly == cur || (outside && !soft) {
+                continue;
+            }
+            let w = if ring.contains(&l.poly) {
+                0.001
+            } else {
+                let len = l.a.distance(l.b);
+                let len = if len > 0.0 { len } else { 0.1 };
+                let d = flat((l.a + l.b) * 0.5 - p);
+                if h == Vec3::ZERO {
+                    len
+                } else if d.length() <= 0.0 {
+                    len * 0.01
+                } else {
+                    let c = (d.normalize().dot(h) + 1.0) * 0.5;
+                    len * (c * c).max(0.01)
+                }
+            } * if outside { 1e-6 } else { 1.0 };
+            total += w;
+            cands.push((w, l));
         }
-        let g = portal_point(l, pos, side);
-        let w = 0.15 + flat(g - pos).normalize_or_zero().dot(heading).max(0.0);
-        total += w;
-        cands.push((w, l.poly, g));
-    }
-    let mut pick = r * total;
-    for (k, c) in cands.iter().enumerate() {
-        pick -= c.0;
-        if pick <= 0.0 || k + 1 == cands.len() {
-            return (c.1, c.2, false);
+        if cands.is_empty() {
+            break;
         }
-    }
-    (cur, mesh.polys[cur as usize].center, true)
-}
-
-/// A way over the street from `pos` on polygon `cur`: the nearest pavement of another
-/// island (7 .. 34 m away, as the kerb walkers cross) that lies across the direction of
-/// travel or straight on, with nothing but road and pavement on the line to it.
-/// `(point over there, its polygon, straight on)`.
-fn mesh_crossing(mesh: &NavMesh, island: &[u32], cur: u32, pos: Vec3, travel: Vec3) -> Option<(Vec3, u32, bool)> {
-    let my = island[cur as usize];
-    let mut cands: Vec<(f32, Vec3, u32, bool)> = Vec::new();
-    mesh.near(pos, 34.0, |i, q| {
-        if !q.sidewalk() || island[i as usize] == my {
-            return;
-        }
-        // nearest point of its outline, then a metre in
-        let pts = q.points();
-        let mut c = (f32::MAX, q.center);
-        for k in 0..pts.len() {
-            let (a, b) = (pts[k], pts[(k + 1) % pts.len()]);
-            let ab = b - a;
-            let t = (flat(pos - a).dot(flat(ab)) / flat(ab).length_squared().max(1e-6)).clamp(0.0, 1.0);
-            let e = a + ab * t;
-            let d = flat(e - pos).length_squared();
-            if d < c.0 {
-                c = (d, e);
+        let mut x = rand() * total;
+        let mut pick = cands[cands.len() - 1].1;
+        for (w, l) in &cands {
+            x -= w;
+            if x < 0.0 {
+                pick = l;
+                break;
             }
         }
-        let c = c.1 + (q.center - c.1).clamp_length_max(1.0);
-        let rel = flat(c - pos);
-        let d = rel.length();
-        if d < 7.0 || d > 34.0 || (c.y - pos.y).abs() > 2.0 {
-            return;
+        // the shared edge in the corner order of the polygon left (the link records store
+        // its ends either way round)
+        let (mut ea, mut eb) = (pick.a, pick.b);
+        let pts = mesh.polys[cur as usize].points();
+        let at = |v: Vec3| pts.iter().position(|q| q.distance_squared(v) < 1e-4);
+        if let (Some(ia), Some(ib)) = (at(ea), at(eb)) {
+            if (ib + 1) % pts.len() == ia {
+                std::mem::swap(&mut ea, &mut eb);
+            }
         }
-        let along = rel.dot(travel);
-        let straight = along > d * 0.8;
-        if straight || along.abs() < d * 0.45 {
-            cands.push((d, c, i, straight));
+        let mid = (pick.a + pick.b) * 0.5;
+        let step = flat(mid - p).normalize_or_zero();
+        if step != Vec3::ZERO {
+            h = (h + (step - h) * 0.5).normalize_or_zero();
         }
-    });
-    cands.sort_by(|a, b| a.0.total_cmp(&b.0));
-    for (d, c, i, straight) in cands.into_iter().take(4) {
-        let n = d.ceil().max(2.0) as usize;
-        if (1..n).all(|k| mesh.find(pos.lerp(c, k as f32 / n as f32), AI_SIDEWALK | AI_ROAD, 2.5).is_some()) {
-            return Some((c, i, straight));
+        p = mid;
+        cur = pick.poly;
+        ring[ring_i] = cur;
+        ring_i = (ring_i + 1) % 4;
+        if hop == 31 {
+            let c = mesh.polys[cur as usize].center;
+            out.push((c, c, cur));
+        } else {
+            out.push((ea, eb, cur));
+        }
+    }
+    out
+}
+
+/// The pedestrian's own radius (ped +492, 0.3 on every ped live).
+const PED_RADIUS: f32 = 0.3;
+/// The awareness spheres (ped +2176 around the ped, +3392 ahead of it): radius 0.667.
+const AWARE_RADIUS: f32 = 0.667;
+/// The sphere ahead sits 0 .. 2.5 m in front, drawn anew for every test.
+const AHEAD_MAX: f32 = 2.5;
+/// Refresh of the sphere around the ped (median 11 - 16 frames live; the scheduling is not
+/// decoded).
+const AWARE_REFRESH: f32 = 13.0 / 30.0;
+/// Sidestep: 0.25 s, the push tried straight and 45 degrees either way (table 0x820da334).
+const SLIDE_TIME: f32 = 0.25;
+/// Clip blends are 8 frames (0x82830878).
+const BLEND_S: f32 = 8.0 / 30.0;
+/// Turning on the spot: at most pi/4 per 8 frames (sub_827B8678).
+const TURN_RATE: f32 = 2.94524;
+/// Rails: the first of the segments i, i+1, i+2, i-1, i-2 whose middle is more than 0.5 m
+/// away and at most 72 degrees round; else segment i with up to 216 (sub_827983B8).
+const RAIL_TURN: f32 = 1.25664;
+const RAIL_TURN_LAST: f32 = 3.76991;
+const RAIL_MIN: f32 = 0.5;
+/// A rail around something in the way: at most 130 degrees round, 0.6 m clear
+/// (sub_827A14C0, clearance 0.3 + ped radius).
+const AVOID_TURN: f32 = 2.26893;
+const AVOID_CLEAR: f32 = 0.3 + PED_RADIUS;
+/// Speed follows the wanted speed with a 0.1 s lag (sub_8279EF40, sub_827966C0).
+const SPEED_LAG: f32 = 0.1;
+
+fn rotate_y(v: Vec3, a: f32) -> Vec3 {
+    let (s, c) = a.sin_cos();
+    Vec3::new(v.x * c + v.z * s, v.y, -v.x * s + v.z * c)
+}
+
+/// Signed yaw from direction `a` to direction `b` (both flat), in the port's yaw sense.
+fn yaw_between(a: Vec3, b: Vec3) -> f32 {
+    wrap_angle((-b.x).atan2(-b.z) - (-a.x).atan2(-a.z))
+}
+
+/// Street furniture as the walkers see it: footprint box (centre, its flat x axis, half
+/// sizes along x and z). A walker counts as a box of its radius.
+pub type Obst = (Vec3, Vec3, glam::Vec2);
+
+/// Distance in the ground plane from `q` to the box (0 inside).
+fn box_dist(o: &Obst, q: Vec3) -> f32 {
+    let d = flat(q - o.0);
+    let z = Vec3::new(-o.1.z, 0.0, o.1.x);
+    let (lx, lz) = ((d.dot(o.1).abs() - o.2.x).max(0.0), (d.dot(z).abs() - o.2.y).max(0.0));
+    (lx * lx + lz * lz).sqrt()
+}
+
+fn box_corners(o: &Obst) -> [Vec3; 4] {
+    let z = Vec3::new(-o.1.z, 0.0, o.1.x);
+    let (x, z) = (o.1 * o.2.x, z * o.2.y);
+    [o.0 + x + z, o.0 + x - z, o.0 - x - z, o.0 - x + z]
+}
+
+fn ped_box(q: Vec3) -> Obst {
+    (q, Vec3::X, glam::Vec2::splat(PED_RADIUS))
+}
+
+/// What a sphere touches: other walkers and street furniture, the nearest first; (its box,
+/// walker index or `usize::MAX`).
+fn sphere_hit(c: Vec3, r: f32, me: usize, peds: &[Vec3], props: &[Obst], skip_peds: bool) -> Option<(Obst, usize)> {
+    let mut best: Option<(f32, Obst, usize)> = None;
+    if !skip_peds {
+        for (k, q) in peds.iter().enumerate() {
+            let d = box_dist(&ped_box(*q), c);
+            if k != me && (q.y - c.y).abs() < 2.0 && d < r && best.map_or(true, |b| d < b.0) {
+                best = Some((d, ped_box(*q), k));
+            }
+        }
+    }
+    for o in props {
+        let d = box_dist(o, c);
+        if d < r && best.map_or(true, |b| d < b.0) {
+            best = Some((d, *o, usize::MAX));
+        }
+    }
+    best.map(|b| (b.1, b.2))
+}
+
+/// Is the way from `a` to `b` clear by `clear` metres (peds unless `skip_peds`, furniture;
+/// the walker `ignore` and the box centred at `ignore_box` - what is being passed - are left
+/// out)? Something the way leads away from does not count (the probe
+/// starts touching what the walker is pushed out of).
+#[allow(clippy::too_many_arguments)]
+fn way_clear(a: Vec3, b: Vec3, clear: f32, me: usize, ignore: usize, ignore_box: Option<Vec3>, peds: &[Vec3], props: &[Obst], skip_peds: bool) -> bool {
+    let n = (flat(b - a).length() / 0.2).ceil().max(1.0) as usize;
+    let seg = |o: &Obst| {
+        if box_dist(o, b) >= box_dist(o, a) {
+            return f32::MAX;
+        }
+        (0..=n).map(|k| box_dist(o, a.lerp(b, k as f32 / n as f32))).fold(f32::MAX, f32::min)
+    };
+    if !skip_peds && peds.iter().enumerate().any(|(k, q)| k != me && k != ignore && (q.y - a.y).abs() < 2.0 && seg(&ped_box(*q)) < clear) {
+        return false;
+    }
+    !props.iter().any(|o| Some(o.0) != ignore_box && seg(o) < clear)
+}
+
+/// The next rail along the path from `pos` facing `fwd` (sub_827983B8): to the middle of
+/// the path segment nearest to the walker, or of one of its neighbours.
+fn next_rail(path: &[(Vec3, u32)], pos: Vec3, fwd: Vec3) -> Option<Vec3> {
+    if path.len() < 2 {
+        return None;
+    }
+    let n = path.len() - 1;
+    let mut i = 0;
+    let mut best = f32::MAX;
+    for k in 0..n {
+        let (a, b) = (path[k].0, path[k + 1].0);
+        let ab = flat(b - a);
+        let t = (flat(pos - a).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
+        let d = flat(pos - (a + ab * t)).length_squared();
+        if d < best {
+            best = d;
+            i = k;
+        }
+    }
+    let try_seg = |k: isize, max_turn: f32| -> Option<Vec3> {
+        if k < 0 || k as usize >= n {
+            return None;
+        }
+        let m = (path[k as usize].0 + path[k as usize + 1].0) * 0.5;
+        let d = flat(m - pos);
+        (d.length() > RAIL_MIN && yaw_between(fwd, d.normalize()).abs() <= max_turn).then_some(m)
+    };
+    let i = i as isize;
+    [i, i + 1, i + 2, i - 1, i - 2].into_iter().find_map(|k| try_seg(k, RAIL_TURN)).or_else(|| try_seg(i, RAIL_TURN_LAST))
+}
+
+/// The wait timer (sub_8279A8C8) from the idle clip's length `v`.
+fn stop_time(v: f32, rand: &mut dyn FnMut() -> f32) -> f32 {
+    if v <= 0.0 {
+        2.0 + 2.0 * rand()
+    } else if v < 5.0 {
+        ((rand() * 3.0) as u32 % 3 + 1) as f32 * v - BLEND_S
+    } else {
+        v - BLEND_S
+    }
+}
+
+/// A car about to run the walker over (sub_8279B538): its path over the next second in
+/// four steps of 0.25 s passing within its half width and the walker's radius. Returns the
+/// car's position and the way out (away from the nearest point of its path).
+fn car_threat(pos: Vec3, threats: &[Threat]) -> Option<(Vec3, Vec3, f32)> {
+    for t in threats {
+        if (t.pos.y - pos.y).abs() > 5.0 || t.vel.length_squared() < 1e-4 {
+            continue;
+        }
+        // half width of a car side on (the original picks the half extent of the side it
+        // comes at; not decoded - the half width of an average car)
+        let reach = 1.0 + PED_RADIUS;
+        for k in 1..=4 {
+            let (a, b) = (t.pos + t.vel * (0.25 * (k - 1) as f32), t.pos + t.vel * (0.25 * k as f32));
+            let ab = flat(b - a);
+            let s = flat(pos - a).dot(ab) / ab.length_squared().max(1e-6);
+            if s <= 0.0 || s >= 1.0 {
+                continue;
+            }
+            let near = a + ab * s;
+            let off = flat(pos - near);
+            if off.length() < reach {
+                let away = if off.length() > 1e-3 { off.normalize() } else { Vec3::new(-t.vel.z, 0.0, t.vel.x).normalize_or_zero() };
+                return Some((t.pos, away, t.vel.length()));
+            }
         }
     }
     None
+}
+
+/// One frame of a walker on the navigation mesh in the original's sidewalk behaviour
+/// (mcAmbientBehaviorSidewalk::Update sub_8279F198): stops (sub_8279A8C8 / 8279AA18),
+/// sidesteps (sub_8279C038), rails round things in the way (sub_82799538), the path's
+/// rails (sub_827983B8, sub_82798F18), car dodges (sub_8279B538) and the turn round of a
+/// reversed path (sub_8279C198). Moves `p` and sets its state; returns the walk clip's
+/// playback rate.
+#[allow(clippy::too_many_arguments)]
+fn sidewalk_step(p: &mut Ped, ty: &PedType, me: usize, peds: &[Vec3], props: &[Obst], threats: &[Threat], dt: f32, rand: &mut dyn FnMut() -> f32, evades: &mut u32, speech: &mut Vec<Speech>) -> f32 {
+    let fwd = flat(p.rot * -Vec3::Z).normalize_or(Vec3::Z);
+    let set_state = |p: &mut Ped, s: State| {
+        if p.state != s {
+            p.from = p.cur.clone();
+            p.blend = 0.25;
+            p.time = 0.0;
+            p.state = s;
+        }
+    };
+    p.hold = (p.hold - dt).max(0.0);
+    // clips playing (dodge, angry, turn): the caller moves the walker by their root
+    if matches!(p.state, State::Evade(_) | State::Angry(_) | State::Turn(_)) {
+        return 1.0;
+    }
+    // a car coming: dodge out of its way with an evade clip
+    if p.calm <= 0.0 && !ty.evade.is_empty() && p.hold <= 0.0 {
+        if let Some((car, away, speed)) = car_threat(p.pos, threats) {
+            let from_front = fwd.dot(flat(car - p.pos).normalize_or_zero()) > 0.4;
+            let mut best = (f32::MIN, 0usize);
+            for (k, c) in ty.evade.iter().enumerate() {
+                if c.front && !from_front {
+                    continue;
+                }
+                let s = (p.rot * c.travel.normalize_or_zero()).dot(away) + rand() * 0.5;
+                if s > best.0 {
+                    best = (s, k);
+                }
+            }
+            p.from = p.cur.clone();
+            p.blend = 0.15;
+            p.state = State::Evade(best.1);
+            p.time = 0.0;
+            p.slide = None;
+            p.rail = None;
+            p.path.clear();
+            p.dodged = Some(car);
+            *evades += 1;
+            speech.push(Speech { pos: p.pos, voice: ty.voice.clone(), female: ty.female, fast: ty.evade[best.1].fast || speed * speed > 244.77 });
+            return 1.0;
+        }
+    }
+    if p.hold > 0.0 {
+        set_state(p, State::Idle);
+        p.speed = 0.0;
+        return 1.0;
+    }
+    // the awareness spheres are queried now and then; what they hit is acted on when the
+    // results come in, at the next query (live: every 11 - 16 frames, the hit slots emptied
+    // as soon as they are read; the spheres' centres measured 0.5 m behind the walker
+    // around it, -1.7 .. +1.9 m along its way ahead of it)
+    p.aware_age -= dt;
+    let query = p.aware_age <= 0.0;
+    let (aware, ahead) = (p.aware, p.ahead);
+    if query {
+        p.aware = p.pos;
+        p.ahead = p.pos + fwd * (AHEAD_MAX * rand());
+        p.aware_age += AWARE_REFRESH;
+        if p.aware_age <= 0.0 {
+            p.aware_age = AWARE_REFRESH;
+        }
+    }
+    // sliding aside
+    if let Some((a, b, t, len)) = p.slide {
+        let t = t + dt;
+        p.pos = a.lerp(b, (t / len).min(1.0));
+        p.speed = a.distance(b) / len;
+        p.slide = if t >= len { None } else { Some((a, b, t, len)) };
+        set_state(p, State::Walk);
+        return p.speed / ty.walk_speed.max(0.1);
+    }
+    // a reversed path: turn round as it is taken (sub_8279F260; a Pivot clip beyond
+    // 45 degrees), which ends the wait
+    if p.turn_round {
+        p.turn_round = false;
+        let want = yaw_between(fwd, -fwd);
+        if want.abs() > std::f32::consts::FRAC_PI_4 && !ty.pivot.is_empty() {
+            let k = (0..ty.pivot.len()).min_by(|&a, &b| wrap_angle(want - ty.pivot[a].1).abs().total_cmp(&wrap_angle(want - ty.pivot[b].1).abs())).unwrap();
+            p.turn_rest = wrap_angle(want - ty.pivot[k].1);
+            p.then_angry = false;
+            p.stop = 0.0;
+            p.speed = 0.0;
+            set_state(p, State::Turn(k));
+            return 1.0;
+        }
+    }
+    // stopped: wait; when the time is up, still in the way -> stop again, two or more stops in
+    // a row -> give up the path (the next one may be asked for backwards)
+    let mut expired = false;
+    if p.stop > 0.0 {
+        p.stop -= dt;
+        if p.stop > 0.0 {
+            set_state(p, State::Idle);
+            p.speed = 0.0;
+            return 1.0;
+        }
+        expired = true;
+    }
+    // something touching the walker: sidestep, which also drops the path
+    if let Some((o, who)) = sphere_hit(aware, AWARE_RADIUS, me, peds, props, false).filter(|_| query) {
+        let rel = flat(aware - o.0);
+        let dist = box_dist(&o, aware);
+        if std::env::var("MCLA_PED_DUMP").is_ok() {
+            log::info!("ped touch {} {} depth {:.2}", p.key.1, if who == usize::MAX { "prop" } else { "ped" }, AWARE_RADIUS - dist);
+        }
+        let (n, depth) = if rel.length() > 1e-3 && dist > 1e-3 { (rel.normalize(), AWARE_RADIUS - dist) } else { (fwd, PED_RADIUS) };
+        for a in [0.0f32, -std::f32::consts::FRAC_PI_4, std::f32::consts::FRAC_PI_4] {
+            let d = rotate_y(n, a);
+            let off = d * (depth + 0.05) / a.cos();
+            if way_clear(p.pos, p.pos + off, PED_RADIUS, me, usize::MAX, None, peds, props, true) {
+                // (the heading stays: the recorded walks keep their line through sidesteps)
+                p.slide = Some((p.pos, p.pos + off, 0.0, SLIDE_TIME));
+                p.rail = None;
+                p.path.clear();
+                p.aware = p.pos + off;
+                p.ahead = p.pos + off;
+                p.aware_age = AWARE_REFRESH;
+                return 1.0;
+            }
+        }
+    }
+    // something ahead: a rail round it, or stop
+    if query && !matches!(p.rail, Some((_, true))) {
+        if let Some((o, who)) = sphere_hit(ahead, AWARE_RADIUS, me, peds, props, false) {
+            // the box's corners furthest round to either side as seen from the walker, pushed
+            // out sideways by half the walker's own width and 0.25 (vfunc 16 of its obstacle
+            // object, mcAmbientObstaclePed: the x extent of its bound, 0.6)
+            let corners = box_corners(&o);
+            let yaw = |v: Vec3| yaw_between(fwd, flat(v - p.pos).normalize_or(fwd));
+            let left = corners.iter().copied().max_by(|a, b| yaw(*a).total_cmp(&yaw(*b))).unwrap();
+            let right = corners.iter().copied().min_by(|a, b| yaw(*a).total_cmp(&yaw(*b))).unwrap();
+            let push = 0.5 * (2.0 * PED_RADIUS) + 0.25;
+            let mut pass: Option<(f32, Vec3)> = None;
+            let mut why = String::new();
+            for (corner, sgn) in [(left, 1.0f32), (right, -1.0)] {
+                let sight = flat(corner - p.pos).normalize_or(fwd);
+                let pp = corner + rotate_y(sight, sgn * std::f32::consts::FRAC_PI_2) * push;
+                let d = flat(pp - p.pos);
+                if d.length() < 1e-3 || yaw_between(fwd, d.normalize()).abs() > AVOID_TURN {
+                    why.push('T');
+                    continue;
+                }
+                if way_clear(p.pos, pp, AVOID_CLEAR, me, who, (who == usize::MAX).then_some(o.0), peds, props, false) && pass.map_or(true, |b| d.length() < b.0) {
+                    pass = Some((d.length(), pp));
+                    why.push('+');
+                } else {
+                    why.push('C');
+                }
+            }
+            if std::env::var("MCLA_PED_DUMP").is_ok() {
+                log::info!("ped avoid {} {} {} ahead {:.2}", p.key.1, if who == usize::MAX { "prop" } else { "ped" }, why, flat(o.0 - p.pos).dot(fwd));
+            }
+            match pass {
+                Some((_, pp)) => p.rail = Some((pp, true)),
+                None => {
+                    if std::env::var("MCLA_PED_DUMP").is_ok() {
+                        log::info!("ped stop {} by {} at {:.1} m, half {:.2} {:.2} centre {:.1} {:.1}", p.key.1, if who == usize::MAX { "prop" } else { "ped" }, box_dist(&o, p.pos), o.2.x, o.2.y, o.0.x, o.0.z);
+                    }
+                    p.stop = stop_time(ty.idle.anim.duration, rand);
+                    p.stops += 1;
+                    if expired && p.stops > 1 {
+                        p.rail = None;
+                        p.path.clear();
+                    }
+                    set_state(p, State::Idle);
+                    p.speed = 0.0;
+                    return 1.0;
+                }
+            }
+        } else if expired {
+            p.stops = 0;
+        }
+    } else if expired {
+        // nothing in the slot when the time is up: the stops in a row start again
+        p.stops = 0;
+    }
+    // along the rails
+    let mut step = {
+        let want = ty.walk_speed * p.scale;
+        p.speed += (want - p.speed) * (dt / SPEED_LAG).min(1.0);
+        p.speed * dt
+    };
+    let mut heading = fwd;
+    for _ in 0..3 {
+        if p.rail.is_none() {
+            p.rail = next_rail(&p.path, p.pos, heading).map(|m| (m, false));
+            if p.rail.is_none() {
+                // the path is used up: drop it and stand until the next one
+                p.path.clear();
+                break;
+            }
+        }
+        let (target, _) = p.rail.unwrap();
+        let to = flat(target - p.pos);
+        let dist = to.length();
+        // an arc of the turning radius, then straight on
+        let turn = yaw_between(heading, to.normalize_or(heading));
+        let a = turn.clamp(-step / ty.turn_radius.max(0.01), step / ty.turn_radius.max(0.01));
+        heading = rotate_y(heading, a);
+        if dist <= step && turn.abs() < 0.2 {
+            p.pos = Vec3::new(target.x, p.pos.y, target.z);
+            step -= dist;
+            p.rail = None;
+            continue;
+        }
+        p.pos += heading * step;
+        break;
+    }
+    if p.rail.is_none() && p.path.is_empty() {
+        set_state(p, State::Idle);
+        p.speed = 0.0;
+        return 1.0;
+    }
+    p.rot = Quat::from_rotation_y((-heading.x).atan2(-heading.z));
+    set_state(p, State::Walk);
+    p.speed / ty.walk_speed.max(0.1)
+}
+
+/// The pedestrian spawn candidates around `focus` (sub_826F05C8 -> sub_826F97F8): the
+/// sidewalk polygons a sphere of radius `r` touches, the first 128 in the order of the
+/// level's chunks and their quadtrees, sorted (`NavMesh::sphere_query`), with their areas.
+pub(crate) fn spawn_candidates(mesh: &NavMesh, focus: Vec3, r: f32) -> Vec<(u32, f32)> {
+    let found = mesh.sphere_query(focus, r, 128, |_, q| q.sidewalk() && q.nv >= 3 && q.closest(focus.x, focus.z).distance(focus) <= r);
+    found.into_iter().map(|i| (i, mesh.polys[i as usize].area)).collect()
+}
+
+/// A random point of a polygon as the original picks it (sub_826F9A10): a triangle of the
+/// fan from the first corner, chosen by area with `r1`, the rest of `r1` across it and
+/// sqrt(`r2`) from the first corner towards the far edge.
+pub(crate) fn random_point(q: &NavPoly, r1: f32, r2: f32) -> Vec3 {
+    let v = q.points();
+    if v.len() < 3 {
+        return q.center;
+    }
+    let n = v.len() - 2;
+    let mut w = [0.0f32; 2];
+    for k in 0..n {
+        w[k] = (v[k + 1] - v[0]).cross(v[k + 2] - v[0]).length();
+    }
+    let total: f32 = w[..n].iter().sum();
+    if total <= 0.0 {
+        return q.center;
+    }
+    let mut acc = 0.0;
+    let mut k = 0;
+    while k < n {
+        acc += w[k] / total;
+        if acc >= r1 {
+            break;
+        }
+        k += 1;
+    }
+    let k = k.min(n - 1);
+    let t = ((r1 - (acc - w[k] / total)) / (w[k] / total)).clamp(0.0, 1.0);
+    let s = r2.sqrt();
+    v[0] * (1.0 - s) + v[k + 1] * (s * (1.0 - t)) + v[k + 2] * (s * t)
 }
 
 #[derive(Clone, Copy)]
@@ -192,9 +666,6 @@ enum Plan {
     Straight(usize, f32),
     /// over to the opposite pavement of the own street
     Cross(Vec3, usize, f32),
-    /// on the navigation mesh: over the street to a point on that polygon (true: straight
-    /// on, over the side street)
-    Mesh(Vec3, u32, bool),
 }
 
 /// A moving car the pedestrians have to watch out for.
@@ -211,12 +682,23 @@ pub struct Speech {
     pub fast: bool,
 }
 
+/// `tune/ambients/density_tuning.xml` (the original's density manager, vtable 0x820c39c4).
 struct Tuning {
+    /// within this a spawn point must not be in view (sub_826F0628)
     spawn_inner: f32,
+    /// radius of the sphere whose sidewalk polygons are spawn candidates
     spawn_outer: f32,
+    /// unspawned further than this ahead, half of it behind (sub_826F49B8)
     unspawn: f32,
+    /// pedestrians per square metre of candidate sidewalk
     density: f32,
+    /// width of the band along the view direction peds live in
+    box_width: f32,
+    ped_spacing: f32,
     type_spacing: f32,
+    /// view cone half angle (degrees) by speed (mph)
+    fov_mph: [f32; 2],
+    fov_deg: [f32; 2],
 }
 
 pub struct Peds {
@@ -246,6 +728,21 @@ pub struct Peds {
     mesh: Option<NavMesh>,
     /// connected piece of pavement of every mesh polygon
     island: Vec<u32>,
+    /// the player's car: flattened forward direction and speed (mph)
+    view_dir: Vec3,
+    speed_mph: f32,
+    /// time not yet run in 30 Hz frames, and the frames run (their parity)
+    step: f32,
+    frame_no: u32,
+    data_dir: String,
+    /// next pedestrian to be offered the frame's path request
+    plan_cursor: usize,
+    /// this frame's spawn candidates (polygon, area) and the wanted count (diagnostics)
+    cands: Vec<(u32, f32)>,
+    pub target: f32,
+    next_id: u32,
+    /// MCLA_PED_TRACE: rows of every pedestrian twice a second
+    trace: Option<(std::io::BufWriter<std::fs::File>, f32, f32)>,
 }
 
 fn hash(a: u32, b: u32) -> u32 {
@@ -279,7 +776,7 @@ impl Peds {
             list: Vec::new(),
             active: HashSet::new(),
             curb: HashMap::new(),
-            tune: Tuning { spawn_inner: 95.0, spawn_outer: 140.0, unspawn: 150.0, density: 0.011, type_spacing: 20.0 },
+            tune: Tuning { spawn_inner: 95.0, spawn_outer: 140.0, unspawn: 150.0, density: 0.011, box_width: 100.0, ped_spacing: 1.0, type_spacing: 20.0, fov_mph: [25.0, 45.0], fov_deg: [89.9, 45.0] },
             timer: 0.0,
             filled: false,
             rng: 0x1234_5678,
@@ -292,7 +789,26 @@ impl Peds {
             enabled: true,
             mesh: None,
             island: Vec::new(),
+            view_dir: -Vec3::Z,
+            speed_mph: 0.0,
+            step: 0.0,
+            frame_no: 0,
+            data_dir: String::new(),
+            plan_cursor: 0,
+            cands: Vec::new(),
+            target: 0.0,
+            next_id: 0,
+            trace: std::env::var("MCLA_PED_TRACE").ok().and_then(|f| std::fs::File::create(f).ok()).map(|f| (std::io::BufWriter::new(f), 0.0, 0.0)),
         }
+    }
+
+    /// The player's view the spawner works with: the car's forward direction and speed.
+    pub fn set_view(&mut self, forward: Vec3, speed_mph: f32) {
+        let f = flat(forward).normalize_or_zero();
+        if f != Vec3::ZERO {
+            self.view_dir = f;
+        }
+        self.speed_mph = speed_mph;
     }
 
     fn rand(&mut self) -> f32 {
@@ -304,6 +820,7 @@ impl Peds {
     pub fn load(&mut self, data_dir: &str) {
         let root = Path::new(data_dir);
         self.tune_dir = root.join("tune/ambients/peds");
+        self.data_dir = data_dir.to_string();
         if let Ok(t) = std::fs::read_to_string(root.join("tune/ambients/density_tuning.xml")) {
             let g = |tag: &str, d: f32| xml_value(&t, tag).unwrap_or(d);
             self.tune = Tuning {
@@ -311,7 +828,11 @@ impl Peds {
                 spawn_outer: g("fPedSpawnOuterRadius", 140.0),
                 unspawn: g("fPedUnspawnOuterRadius", 150.0),
                 density: g("fPedDensity", 0.011),
+                box_width: g("fPedBoxWidth", 100.0),
+                ped_spacing: g("fMinSpawnPedSpacing", 1.0),
                 type_spacing: g("fMinSpawnPedTypeSpacing", 20.0),
+                fov_mph: [g("fFOVDegreesLowMPH", 25.0), g("fFOVDegreesHighMPH", 45.0)],
+                fov_deg: [g("fFOVDegreesAtLowSpeed", 89.9), g("fFOVDegreesAtHighSpeed", 45.0)],
             };
         }
         let first = |dir: &Path, ext: &str| -> Option<PathBuf> {
@@ -342,6 +863,7 @@ impl Peds {
                 let kind = match field("AvoidType").as_str() {
                     "AvoidMale" | "AvoidFemale" => 0,
                     "AngryMale" | "AngryFemale" => 1,
+                    "Pivot" => 3,
                     _ => 2,
                 };
                 class.insert(name, (field("AudioType") == "Fast", field("ApproachDir") == "Front", kind));
@@ -382,7 +904,16 @@ impl Peds {
         let gender = if female { "fped" } else { "mped" };
         let mut evade = Vec::new();
         let mut angry = Vec::new();
+        // Pivot clips are chosen without regard to sex (sub_826F7FA8)
+        let mut pivot = Vec::new();
         for (a, fast, front, kind) in &self.avoid {
+            if *kind == 3 {
+                let c = Clip::bind(a, &model.ids, *fast, *front);
+                let q = c.mover(c.last_frame()).1 * c.mover(0.0).1.inverse();
+                let yaw = wrap_angle(2.0 * q.y.atan2(q.w));
+                pivot.push((c, yaw));
+                continue;
+            }
             if !a.short().starts_with(gender) {
                 continue;
             }
@@ -397,7 +928,9 @@ impl Peds {
             let s = xml_value(&t, "fLodSwitchScale").unwrap_or(1.0);
             lod_switch = [xml_value(&t, "fHighToMedSwitch").unwrap_or(40.0) * s, xml_value(&t, "fMedToLowSwitch").unwrap_or(80.0) * s];
         }
-        Some(PedType { female, voice: core, model, walk, idle, evade, angry, lod_switch })
+        let walk_speed = walk.travel.length() / walk.anim.duration.max(1e-3);
+        let turn_radius = std::fs::read_to_string(self.tune_dir.join(name).join("mcAmbientType.xml")).ok().and_then(|t| xml_value(&t, "fMinTurningRadius")).unwrap_or(0.1);
+        Some(PedType { female, voice: core, model, walk, idle, evade, angry, pivot, lod_switch, walk_speed, turn_radius })
     }
 
     fn load_type(&mut self, gpu: &mut Gpu, ti: usize) -> bool {
@@ -508,125 +1041,226 @@ impl Peds {
         self.list.iter().filter(|p| p.plan.is_some()).count()
     }
 
-    /// Pedestrians on the sidewalk polygons of the navigation mesh inside the spawn ring.
-    fn populate_mesh(&mut self, gpu: &mut Gpu, mesh: &NavMesh, col: &WorldCollider, center: Vec3) {
-        let unspawn = self.tune.unspawn;
-        let active = &mut self.active;
-        self.list.retain(|p| {
-            let keep = p.pos.distance_squared(center) < unspawn * unspawn;
-            if !keep {
-                active.remove(&p.key);
+    /// Within the view cone near the player (sub_826F0628, pedestrian branch): closer than
+    /// the inner spawn radius and at an angle to the view line (either way along it) below
+    /// the cone's half angle, which narrows with speed.
+    fn in_view(&self, v: Vec3) -> bool {
+        if flat(v).length() > self.tune.spawn_inner {
+            return false;
+        }
+        let t = ((self.speed_mph - self.tune.fov_mph[0]) / (self.tune.fov_mph[1] - self.tune.fov_mph[0])).clamp(0.0, 1.0);
+        let fov = (self.tune.fov_deg[0] + (self.tune.fov_deg[1] - self.tune.fov_deg[0]) * t).to_radians();
+        let c = self.view_dir.dot(v.normalize_or_zero()).abs().min(1.0);
+        c.acos() < fov
+    }
+
+    /// Outside the band the pedestrians live in (sub_826F49B8): more than half the box width
+    /// to the side of the view line, or further than the unspawn radius ahead (half of it
+    /// behind).
+    fn out_of_range(&self, focus: Vec3, pos: Vec3) -> bool {
+        let v = pos - focus;
+        let dir = self.view_dir;
+        let lateral = (v.z * dir.x - v.x * dir.z).abs();
+        let lim = if v.dot(dir) < 0.0 { self.tune.unspawn * 0.5 } else { self.tune.unspawn };
+        lateral > self.tune.box_width * 0.5 || flat(v).length() > lim
+    }
+
+    /// One run of the original's pedestrian spawner (sub_826F3038) and unspawner
+    /// (sub_826F49B8, from sub_826F6130) on the navigation mesh: every other 30 Hz frame.
+    fn spawn_frame(&mut self, gpu: &mut Gpu, mesh: &NavMesh, col: &WorldCollider, focus: Vec3) {
+        // unspawn: 30 random checks a frame
+        for _ in 0..30 {
+            if self.list.is_empty() {
+                break;
             }
-            keep
-        });
-        // the first time everything around is filled in, afterwards only the far ring
-        let inner = if self.filled { self.tune.spawn_inner } else { 5.0 };
-        let outer = self.tune.spawn_outer;
-        let per_m2 = self.tune.density * self.districts.density.at(self.hour) / PAVEMENT_WIDTH;
-        let mut polys: Vec<u32> = Vec::new();
-        mesh.near(center, outer, |i, p| {
-            if p.sidewalk() && (p.center.y - center.y).abs() <= 25.0 {
-                polys.push(i);
-            }
-        });
-        let mut any_ground = false;
-        let before = self.list.len();
-        for pi in polys {
-            let q = &mesh.polys[pi as usize];
-            let want = q.area * per_m2;
-            let n = want.floor() as u32 + if ((hash(pi, 77) & 0xffff) as f32 / 65536.0) < want.fract() { 1 } else { 0 };
-            // collision not streamed in yet: later
-            if n == 0 || col.ground(q.center, 1.0, 2.5).is_none() {
-                continue;
-            }
-            any_ground = true;
-            for s in 0..n {
-                let key = (pi as usize, s);
-                if self.active.contains(&key) {
-                    continue;
+            let i = (self.rand() * self.list.len() as f32) as usize % self.list.len();
+            if self.out_of_range(focus, self.list[i].pos) {
+                let p = self.list.swap_remove(i);
+                if std::env::var("MCLA_PED_DUMP").is_ok() {
+                    let v = p.pos - focus;
+                    log::info!("ped unspawn {} dist {:.1} ahead {:.1} lateral {:.1}", p.key.1, flat(v).length(), v.dot(self.view_dir), (v.z * self.view_dir.x - v.x * self.view_dir.z).abs());
                 }
-                let h = hash(pi, s + 1);
-                let mut pos = q.point(0.15 + 0.7 * (h & 0xffff) as f32 / 65536.0, 0.15 + 0.7 * ((h >> 16) & 0xff) as f32 / 255.0);
-                pos.y = q.height(pos.x, pos.z);
-                let d = pos.distance(center);
-                if d < inner || d > outer {
-                    continue;
-                }
-                if let Some(g) = col.ground(pos, 1.0, 1.5) {
-                    if (g.point.y - pos.y).abs() < 0.5 {
-                        pos.y = g.point.y;
-                    }
-                }
-                // a type that is not already walking nearby
-                let sp = self.tune.type_spacing;
-                let mut ti = usize::MAX;
-                for attempt in 0..4 {
-                    let Some(c) = self.pick_type(pos, hash(h, 9 + attempt)) else { break };
-                    ti = c;
-                    if !self.list.iter().any(|p| p.ty == c && p.pos.distance_squared(pos) < sp * sp) {
-                        break;
-                    }
-                }
-                if ti == usize::MAX {
-                    continue;
-                }
-                if !self.load_type(gpu, ti) {
-                    continue;
-                }
-                let side = 0.1 + 0.8 * ((hash(h, 5) & 0xffff) as f32 / 65536.0);
-                let (next, goal, dead) = mesh_next(mesh, pi, NO_POLY, pos, Vec3::ZERO, side, (hash(h, 6) & 0xffff) as f32 / 65536.0);
-                // nowhere to go from a lone polygon: stand around
-                let loiter = dead || (h >> 25) % 5 == 0;
-                let face = if loiter {
-                    let a = (hash(h, 7) & 0xffff) as f32 / 65536.0 * std::f32::consts::TAU;
-                    Vec3::new(a.sin(), 0.0, a.cos())
-                } else {
-                    flat(goal - pos).normalize_or(Vec3::Z)
-                };
-                self.active.insert(key);
-                self.list.push(Ped {
-                    ty: ti,
-                    key,
-                    pos,
-                    rot: Quat::from_rotation_y((-face.x).atan2(-face.z)),
-                    link: 0,
-                    fwd: true,
-                    lat: 0.0,
-                    state: if loiter { State::Idle } else { State::Walk },
-                    time: ((h >> 8) & 0xff) as f32 / 40.0,
-                    from: Vec::new(),
-                    blend: 0.0,
-                    cur: Vec::new(),
-                    loiter,
-                    calm: 0.0,
-                    seed: h,
-                    plan: None,
-                    cross: None,
-                    wait: 0.0,
-                    poly: pi,
-                    prev: NO_POLY,
-                    next,
-                    entry: pos,
-                    goal,
-                    travel: face,
-                    side,
-                });
             }
         }
-        if any_ground {
-            if !self.filled {
-                log::info!("peds: {} placed on the navigation mesh around {:.0},{:.0},{:.0}", self.list.len() - before, center.x, center.y, center.z);
+        // candidates: the sidewalk polygons touching the sphere of the outer spawn radius,
+        // the first 128 (sub_826F05C8)
+        self.cands = spawn_candidates(mesh, focus, self.tune.spawn_outer);
+        let total: f32 = self.cands.iter().map(|c| c.1).sum();
+        // area times the density, times the focus district's density at this hour
+        self.target = total * self.tune.density * self.districts.density_at(focus, self.hour);
+        if self.list.len() as f32 >= self.target || self.cands.is_empty() {
+            return;
+        }
+        // one type per frame, from the focus district's list
+        let r0 = self.rand();
+        let Some(ti) = self.pick_type(focus, (r0 * 16777216.0) as u32) else { return };
+        if !self.load_type(gpu, ti) {
+            return;
+        }
+        // polygons ahead weigh ten times their area
+        let dir = self.view_dir;
+        let weights: Vec<f32> = self.cands.iter().map(|&(i, a)| if (mesh.polys[i as usize].center - focus).dot(dir) > 0.0 { a * 10.0 } else { a }).collect();
+        let wsum: f32 = weights.iter().sum();
+        let mut spawned = 0;
+        let mut occ: Option<Option<crate::occluder::Selected>> = None;
+        for _ in 0..60 {
+            if spawned >= 3 || self.list.len() as f32 >= self.target {
+                break;
             }
-            self.filled = true;
+            let mut x = self.rand() * wsum;
+            let mut k = weights.len() - 1;
+            for (j, w) in weights.iter().enumerate() {
+                x -= w;
+                if x < 0.0 {
+                    k = j;
+                    break;
+                }
+            }
+            let pi = self.cands[k].0;
+            let q = &mesh.polys[pi as usize];
+            let (r1, r2) = (self.rand(), self.rand());
+            let mut pos = random_point(q, r1, r2);
+            let v = pos - focus;
+            if (v.z * dir.x - v.x * dir.z).abs() > self.tune.box_width * 0.5 {
+                continue;
+            }
+            // in view, unless an occluder hides it from just above the player
+            if self.in_view(v) {
+                if occ.is_none() {
+                    occ = Some(crate::occluder::city(&self.data_dir).map(|c| c.select_around(focus + Vec3::Y * OCC_EYE, crate::occluder::RANGE * OCC_RANGE_SCALE)));
+                }
+                if !occ.as_ref().and_then(|o| o.as_ref()).map_or(false, |o| o.hides_sphere(pos + Vec3::Y * OCC_LIFT, OCC_RADIUS)) {
+                    continue;
+                }
+            }
+            let (s1, s2) = (self.tune.ped_spacing, self.tune.type_spacing);
+            if self.list.iter().any(|p| {
+                let d = p.pos.distance_squared(pos);
+                d < s1 * s1 || (p.ty == ti && d < s2 * s2)
+            }) {
+                continue;
+            }
+            // the collision's floor where it agrees with the mesh
+            if let Some(g) = col.ground(pos, 1.0, 1.5) {
+                if (g.point.y - pos.y).abs() < 0.5 {
+                    pos.y = g.point.y;
+                }
+            }
+            let a = self.rand() * std::f32::consts::TAU;
+            let face = Vec3::new(a.sin(), 0.0, a.cos());
+            // the walking speed factor, drawn once (sub_82797CC8)
+            let scale = 0.85 + 0.3 * self.rand();
+            let id = self.next_id;
+            self.next_id = self.next_id.wrapping_add(1);
+            let seed = hash(id, pi);
+            if std::env::var("MCLA_PED_DUMP").is_ok() {
+                log::info!("ped spawn {} dist {:.1} ahead {:.1} lateral {:.1} target {:.2}", id, flat(v).length(), v.dot(dir), (v.z * dir.x - v.x * dir.z).abs(), self.target);
+            }
+            self.list.push(Ped {
+                ty: ti,
+                key: (usize::MAX, id),
+                pos,
+                rot: Quat::from_rotation_y((-face.x).atan2(-face.z)),
+                link: 0,
+                fwd: true,
+                lat: 0.0,
+                state: State::Idle,
+                time: ((seed >> 8) & 0xff) as f32 / 40.0,
+                from: Vec::new(),
+                blend: 0.0,
+                cur: Vec::new(),
+                loiter: false,
+                calm: 0.0,
+                seed,
+                plan: None,
+                cross: None,
+                wait: 0.0,
+                poly: pi,
+                travel: face,
+                path: Vec::new(),
+                since_plan: 0,
+                scale,
+                speed: 0.0,
+                rail: None,
+                stop: 0.0,
+                stops: 0,
+                slide: None,
+                aware: pos,
+                ahead: pos,
+                aware_age: 0.0,
+                turn_round: false,
+                turn_rest: 0.0,
+                then_angry: false,
+                dodged: None,
+                hold: 0.5,
+            });
+            spawned += 1;
         }
     }
 
-    fn populate(&mut self, gpu: &mut Gpu, nav: &NavSys, col: &WorldCollider, center: Vec3) {
-        if let Some(mesh) = self.mesh.take() {
-            self.populate_mesh(gpu, &mesh, col, center);
-            self.mesh = Some(mesh);
+    /// The frame's one path request (sub_82797B20 lets one through per frame, to a walker
+    /// without a path - it keeps one until it is cancelled - whose last request is at least
+    /// 16 frames old): a random walk from where it stands, the way it faces (backwards after
+    /// an even number of stops in a row, more than one), with the points on the edges `frac`
+    /// (0.3 .. 0.7, per path) along them (sub_827979A8).
+    fn plan_frame(&mut self, mesh: &NavMesh) {
+        for p in self.list.iter_mut() {
+            p.since_plan = p.since_plan.saturating_add(1);
+        }
+        let n = self.list.len();
+        for k in 0..n {
+            let i = (self.plan_cursor + k) % n;
+            let p = &self.list[i];
+            if p.poly == NO_POLY || p.hold > 0.0 || p.since_plan < 16 || !p.path.is_empty() || !matches!(p.state, State::Walk | State::Idle) {
+                continue;
+            }
+            let start = if mesh.polys[p.poly as usize].contains(p.pos.x, p.pos.z) { p.poly } else { mesh.find(p.pos, AI_SIDEWALK, 2.0).unwrap_or(p.poly) };
+            let rev = p.stops > 1 && p.stops % 2 == 0;
+            let (pos, heading) = (p.pos, p.rot * -Vec3::Z * if rev { -1.0 } else { 1.0 });
+            let mut rng = self.rng;
+            let mut rand = || {
+                rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+                (rng >> 8) as f32 / 16777216.0
+            };
+            let hops = random_path(mesh, start, pos, heading, &mut rand);
+            let frac = 0.3 + 0.4 * rand();
+            self.rng = rng;
+            let p = &mut self.list[i];
+            p.poly = start;
+            p.path = hops.into_iter().map(|(a, b, q)| (a + (b - a) * frac, q)).collect();
+            p.since_plan = 0;
+            p.rail = None;
+            p.turn_round = rev && !p.path.is_empty();
+            self.plan_cursor = (i + 1) % n;
+            break;
+        }
+    }
+
+    /// MCLA_PED_TRACE=file: the focus (F) and every pedestrian (P) ten times a second, as
+    /// the recordings of the original are written (work/people2/re/peds_rec2.py).
+    fn write_trace(&mut self, focus: Vec3, dt: f32) {
+        use std::io::Write;
+        let Some((w, t, next)) = self.trace.as_mut() else { return };
+        *t += dt;
+        if *t < *next {
             return;
         }
+        *next = *t + 0.1;
+        let _ = writeln!(w, "{:.2}	F	{:.2}	{:.2}	{:.2}	{:.3}	{:.3}	{:.2}	{}	{}	{:.2}	{:?}", t, focus.x, focus.y, focus.z, self.view_dir.x, self.view_dir.z, self.target, self.list.len(), self.cands.len(), self.hour, self.districts.district(focus));
+        for p in &self.list {
+            let st = match p.state {
+                State::Walk => "walk",
+                State::Idle => "idle",
+                State::Evade(_) => "evade",
+                State::Angry(_) => "angry",
+                State::Turn(_) => "turn",
+            };
+            let _ = writeln!(w, "{:.2}	P	{}	{:.2}	{:.2}	{:.2}	{}	{}	{:.2}	{}	{}	{}	{}", t, p.key.1, p.pos.x, p.pos.y, p.pos.z, (p.state == State::Walk) as u8, st, p.stop, p.stops, p.path.len(), p.rail.map_or(0, |r| 1 + r.1 as u8), p.slide.is_some() as u8);
+        }
+        let _ = w.flush();
+    }
+
+    fn populate(&mut self, gpu: &mut Gpu, nav: &NavSys, col: &WorldCollider, center: Vec3) {
         let unspawn = self.tune.unspawn;
         let active = &mut self.active;
         self.list.retain(|p| {
@@ -709,12 +1343,23 @@ impl Peds {
                     cross: None,
                     wait: 0.0,
                     poly: NO_POLY,
-                    prev: NO_POLY,
-                    next: NO_POLY,
-                    entry: g.point,
-                    goal: g.point,
                     travel: face,
-                    side: 0.5,
+                    path: Vec::new(),
+                    since_plan: 0,
+                    scale: 1.0,
+                    speed: 0.0,
+                    rail: None,
+                    stop: 0.0,
+                    stops: 0,
+                    slide: None,
+                    aware: g.point,
+                    ahead: g.point,
+                    aware_age: 0.0,
+                    turn_round: false,
+                    turn_rest: 0.0,
+                    then_angry: false,
+                    dodged: None,
+                    hold: 0.0,
                 });
             }
         }
@@ -723,15 +1368,30 @@ impl Peds {
         }
     }
 
-    pub fn update(&mut self, gpu: &mut Gpu, nav: &NavSys, col: &WorldCollider, obstacles: &dyn Fn(Vec3, f32, &mut Vec<(Vec3, f32)>), center: Vec3, threats: &[Threat], signals: Option<(&crate::signals::Signals, f32)>, hour: f32, dt: f32) {
+    pub fn update(&mut self, gpu: &mut Gpu, nav: &NavSys, col: &WorldCollider, obstacles: &dyn Fn(Vec3, f32, &mut Vec<Obst>), center: Vec3, threats: &[Threat], signals: Option<(&crate::signals::Signals, f32)>, hour: f32, dt: f32) {
         self.hour = hour;
         if !self.enabled || self.dirs.is_empty() {
             return;
         }
-        self.timer -= dt;
-        if self.timer <= 0.0 {
-            self.timer = 0.4;
-            self.populate(gpu, nav, col, center);
+        if let Some(mesh) = self.mesh.take() {
+            // the original's 30 Hz frames
+            self.step = (self.step + dt).min(FRAME * 4.0);
+            while self.step >= FRAME {
+                self.step -= FRAME;
+                self.frame_no = self.frame_no.wrapping_add(1);
+                if self.frame_no % 2 == 0 {
+                    self.spawn_frame(gpu, &mesh, col, center);
+                }
+                self.plan_frame(&mesh);
+            }
+            self.mesh = Some(mesh);
+            self.write_trace(center, dt);
+        } else {
+            self.timer -= dt;
+            if self.timer <= 0.0 {
+                self.timer = 0.4;
+                self.populate(gpu, nav, col, center);
+            }
         }
         let mut rng = self.rng;
         let mut rand = move || {
@@ -739,13 +1399,24 @@ impl Peds {
             (rng >> 8) as f32 / 16777216.0
         };
         let mut near: Vec<(Vec3, f32)> = Vec::new();
+        let mut boxes: Vec<Obst> = Vec::new();
+        let peds_pos: Vec<Vec3> = self.list.iter().map(|p| p.pos).collect();
+        let has_mesh = self.mesh.is_some();
         for i in 0..self.list.len() {
             let Some(Some(ty)) = self.types.get(&self.list[i].ty) else { continue };
             let p = &mut self.list[i];
             p.calm = (p.calm - dt).max(0.0);
             p.blend = (p.blend - dt).max(0.0);
+            let on_mesh = has_mesh && p.poly != NO_POLY;
+            // on the mesh: the original's sidewalk behaviour
+            let mut rate = 1.0;
+            if on_mesh {
+                boxes.clear();
+                obstacles(p.pos, 4.0, &mut boxes);
+                rate = sidewalk_step(p, ty, i, &peds_pos, &boxes, threats, dt, &mut rand, &mut self.evades, &mut self.speech);
+            }
             // a car about to pass too close?
-            if matches!(p.state, State::Walk | State::Idle) && p.calm <= 0.0 && !ty.evade.is_empty() {
+            if !on_mesh && matches!(p.state, State::Walk | State::Idle) && p.calm <= 0.0 && !ty.evade.is_empty() {
                 for t in threats {
                     let speed = t.vel.length();
                     if speed < 3.0 {
@@ -784,9 +1455,13 @@ impl Peds {
                 }
             }
             let (clip, looped) = ty.clip(p.state);
-            // advance, carrying the animation's own root motion into the world
+            // advance, carrying the animation's own root motion into the world (walkers on the
+            // mesh move along their rails instead; the walk clip plays at their speed)
             let t0 = p.time;
-            p.time += dt;
+            p.time += dt * rate;
+            if on_mesh && looped {
+                // root motion off
+            } else {
             let last = clip.last_frame();
             let apply = |p: &mut Ped, f0: f32, f1: f32| {
                 let (a, ar) = clip.mover(f0);
@@ -804,53 +1479,67 @@ impl Peds {
                 }
             } else {
                 apply(p, clip.frame(t0, false), clip.frame(p.time, false));
-                if p.time >= clip.anim.duration.max(0.05) {
+                if let State::Turn(_) = p.state {
+                    // what the clip does not turn, at most pi/4 per 8 frames
+                    let a = p.turn_rest.clamp(-TURN_RATE * dt, TURN_RATE * dt);
+                    p.rot = (p.rot * Quat::from_rotation_y(a)).normalize();
+                    p.turn_rest -= a;
+                }
+                // a Pivot clip ends 8 frames early (blended into the next)
+                let end = if matches!(p.state, State::Turn(_)) { (clip.anim.duration - BLEND_S).max(0.05) } else { clip.anim.duration.max(0.05) };
+                if p.time >= end {
                     p.from = p.cur.clone();
                     p.blend = 0.25;
                     p.time = 0.0;
                     p.calm = 1.5;
-                    p.state = match p.state {
-                        State::Evade(_) if !ty.angry.is_empty() && rand() < 0.45 => State::Angry((rand() * ty.angry.len() as f32) as usize % ty.angry.len()),
-                        _ if p.loiter => State::Idle,
-                        _ => State::Walk,
+                    let angry = |r: f32| State::Angry((r * ty.angry.len() as f32) as usize % ty.angry.len());
+                    p.state = if on_mesh {
+                        // after a dodge: face the car (a Pivot clip beyond 45 degrees), then
+                        // the angry clip, else wait (sub_8279B468)
+                        let f = flat(p.rot * -Vec3::Z).normalize_or(Vec3::Z);
+                        match p.state {
+                            State::Evade(_) => {
+                                let want = p.dodged.map_or(0.0, |c| yaw_between(f, flat(c - p.pos).normalize_or(f)));
+                                if want.abs() > std::f32::consts::FRAC_PI_4 && !ty.pivot.is_empty() {
+                                    let k = (0..ty.pivot.len()).min_by(|&a, &b| wrap_angle(want - ty.pivot[a].1).abs().total_cmp(&wrap_angle(want - ty.pivot[b].1).abs())).unwrap();
+                                    p.turn_rest = wrap_angle(want - ty.pivot[k].1);
+                                    p.then_angry = true;
+                                    State::Turn(k)
+                                } else if !ty.angry.is_empty() {
+                                    angry(rand())
+                                } else {
+                                    p.stop = stop_time(ty.idle.anim.duration, &mut rand);
+                                    p.stops += 1;
+                                    State::Idle
+                                }
+                            }
+                            State::Turn(_) if p.then_angry => {
+                                p.then_angry = false;
+                                if !ty.angry.is_empty() {
+                                    angry(rand())
+                                } else {
+                                    p.stop = stop_time(ty.idle.anim.duration, &mut rand);
+                                    p.stops += 1;
+                                    State::Idle
+                                }
+                            }
+                            _ => State::Idle,
+                        }
+                    } else {
+                        match p.state {
+                            State::Evade(_) if !ty.angry.is_empty() && rand() < 0.45 => angry(rand()),
+                            _ if p.loiter => State::Idle,
+                            _ => State::Walk,
+                        }
                     };
                 }
+            }
             }
             // stay upright; walkers steer along the pavement
             let f = p.rot * -Vec3::Z;
             let mut yaw = (-f.x).atan2(-f.z);
             let mesh = self.mesh.as_ref().filter(|_| p.poly != NO_POLY);
-            if let (Some(mesh), true) = (mesh, p.state == State::Walk && p.cross.is_none() && p.plan.is_none()) {
-                // the end of the stretch: on into the polygon behind the edge, and choose the
-                // next edge from there
-                let d = flat(p.goal - p.entry);
-                let len = d.length();
-                let dir = if len > 0.05 { d / len } else { p.travel };
-                if flat(p.pos - p.entry).dot(dir) >= len - 0.05 {
-                    let at_end = p.next == p.poly;
-                    p.prev = if at_end { NO_POLY } else { p.poly };
-                    p.poly = p.next;
-                    let (next, goal, dead) = mesh_next(mesh, p.poly, p.prev, p.pos, dir, p.side, rand());
-                    p.next = next;
-                    p.entry = p.pos;
-                    p.goal = goal;
-                    p.travel = dir;
-                    if dead && at_end {
-                        // a lone polygon: stay
-                        p.loiter = true;
-                        p.from = p.cur.clone();
-                        p.blend = 0.25;
-                        p.time = 0.0;
-                        p.state = State::Idle;
-                    } else if at_end || (flat(goal - p.pos).normalize_or_zero().dot(dir) < 0.77 && rand() < 0.35) {
-                        // where the pavement ends or turns the corner: perhaps over the street
-                        if let Some((q, n, straight)) = mesh_crossing(mesh, &self.island, p.poly, p.pos, dir) {
-                            p.plan = Some(Plan::Mesh(q, n, straight));
-                            p.wait = 0.0;
-                        }
-                    }
-                }
-            } else if mesh.is_none() && p.state == State::Walk && p.cross.is_none() && p.plan.is_none() {
+            if mesh.is_none() && p.state == State::Walk && p.cross.is_none() && p.plan.is_none() {
                 let l = &nav.links[p.link];
                 let s = (p.pos - l.a).dot(l.dir());
                 // end of the block: carry on along the next link if it has a pavement, cross
@@ -904,7 +1593,7 @@ impl Peds {
                 let sig = signals.and_then(|(sg, t)| sg.ahead(p.pos, travel, t)).filter(|a| a.1 < 30.0).map(|a| a.2);
                 let (line, reach) = match plan {
                     Plan::Straight(..) => (travel, 26.0),
-                    Plan::Cross(q, ..) | Plan::Mesh(q, ..) => ((q - p.pos).normalize_or_zero(), q.distance(p.pos) + 4.0),
+                    Plan::Cross(q, ..) => ((q - p.pos).normalize_or_zero(), q.distance(p.pos) + 4.0),
                 };
                 // a car driving at the stretch about to be walked?
                 let mut busy = false;
@@ -928,8 +1617,8 @@ impl Peds {
                 }
                 let lights = match (plan, sig) {
                     (_, None) => true,
-                    (Plan::Straight(..) | Plan::Mesh(_, _, true), Some(st)) => st == 2,
-                    (Plan::Cross(..) | Plan::Mesh(_, _, false), Some(st)) => st == 0,
+                    (Plan::Straight(..), Some(st)) => st == 2,
+                    (Plan::Cross(..), Some(st)) => st == 0,
                 };
                 if lights && !busy {
                     match plan {
@@ -938,7 +1627,6 @@ impl Peds {
                             p.lat = lat;
                         }
                         Plan::Cross(q, n, lat) => p.cross = Some((q, n, lat)),
-                        Plan::Mesh(q, n, _) => p.cross = Some((q, n as usize, 0.0)),
                     }
                     p.plan = None;
                     if p.state == State::Idle {
@@ -967,51 +1655,29 @@ impl Peds {
                     }
                 }
             }
-            if p.state == State::Walk {
+            if p.state == State::Walk && mesh.is_none() {
                 if let Some((q, n, lat)) = p.cross {
                     if Vec3::new(q.x - p.pos.x, 0.0, q.z - p.pos.z).length() < 0.8 {
                         // over: walk away from the corner on the far side
-                        if let Some(mesh) = mesh {
-                            let dir = flat(q - p.entry).normalize_or(p.travel);
-                            p.poly = n as u32;
-                            p.prev = NO_POLY;
-                            let (next, goal, _) = mesh_next(mesh, p.poly, NO_POLY, p.pos, dir, p.side, rand());
-                            p.next = next;
-                            p.entry = p.pos;
-                            p.goal = goal;
-                            p.travel = dir;
-                        } else {
-                            p.link = n;
-                            p.lat = lat;
-                        }
+                        p.link = n;
+                        p.lat = lat;
                         p.cross = None;
                         self.crossings += 1;
                     }
                 }
-                let (mut target, right);
-                if let Some(mesh) = mesh {
-                    // along the line to the point on the edge, looking 2.5 m ahead (and up
-                    // to a metre past the edge, into the next polygon)
-                    let d = flat(p.goal - p.entry);
-                    let len = d.length();
-                    let s = flat(p.pos - p.entry).dot(d) / len.max(0.05);
-                    target = p.entry + (p.goal - p.entry) * ((s + 2.5).min(len + 1.0) / len.max(0.05));
-                    // "towards the buildings" below: towards the middle of the pavement
-                    let c = mesh.polys[p.poly as usize].center - p.pos;
-                    right = Vec3::new(-f.z, 0.0, f.x) * if c.dot(Vec3::new(-f.z, 0.0, f.x)) < 0.0 { -1.0 } else { 1.0 };
-                } else {
-                    let l = &nav.links[p.link];
-                    let dir = l.dir();
-                    right = dir.cross(Vec3::Y).normalize_or_zero();
-                    let s = (p.pos - l.a).dot(dir);
-                    target = l.a + dir * (s + if p.fwd { 2.5 } else { -2.5 }) + right * p.lat;
-                }
+                let l = &nav.links[p.link];
+                let dir = l.dir();
+                let right = dir.cross(Vec3::Y).normalize_or_zero();
+                let s = (p.pos - l.a).dot(dir);
+                let mut target = l.a + dir * (s + if p.fwd { 2.5 } else { -2.5 }) + right * p.lat;
                 if let Some((q, ..)) = p.cross {
                     target = q;
                 }
                 // walk around benches, lamp posts, news stands
+                boxes.clear();
+                obstacles(p.pos, 2.6, &mut boxes);
                 near.clear();
-                obstacles(p.pos, 2.6, &mut near);
+                near.extend(boxes.iter().map(|o| (o.0, o.2.length().min(o.2.max_element() * 1.1))));
                 let side = Vec3::new(-f.z, 0.0, f.x);
                 for (o, r) in &near {
                     let rel = Vec3::new(o.x - p.pos.x, 0.0, o.z - p.pos.z);
@@ -1034,8 +1700,14 @@ impl Peds {
             }
             p.rot = Quat::from_rotation_y(yaw);
             // on the mesh: the polygon's height, refined by the collision where the two agree
-            let floor = mesh.filter(|_| p.cross.is_none()).and_then(|m| {
-                [p.poly, p.next].into_iter().map(|i| &m.polys[i as usize]).find(|q| q.contains(p.pos.x, p.pos.z)).map(|q| q.height(p.pos.x, p.pos.z))
+            let floor = mesh.and_then(|m| {
+                if !m.polys[p.poly as usize].contains(p.pos.x, p.pos.z) {
+                    if let Some(k) = m.find(p.pos, !0, 2.0) {
+                        p.poly = k;
+                    }
+                }
+                let q = &m.polys[p.poly as usize];
+                q.contains(p.pos.x, p.pos.z).then(|| q.height(p.pos.x, p.pos.z))
             });
             let y = match (col.ground(p.pos, 0.7, 1.5), floor) {
                 (Some(g), Some(m)) => Some(if (g.point.y - m).abs() < 0.5 { g.point.y } else { m }),
@@ -1117,5 +1789,170 @@ impl Peds {
             return None;
         }
         Some(same[hash(mcla_formats::hash::joaat(voice), 3) as usize % same.len()].clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ambient::Tod;
+
+    fn quad() -> NavPoly {
+        NavPoly {
+            chunk: 0,
+            material: 0,
+            flags: AI_SIDEWALK,
+            area: 8.0,
+            center: Vec3::new(2.0, 0.0, 1.0),
+            normal: Vec3::Y,
+            nv: 4,
+            verts: [Vec3::new(0.0, 0.0, 0.0), Vec3::new(4.0, 0.0, 0.0), Vec3::new(4.0, 0.0, 2.0), Vec3::new(0.0, 0.0, 2.0)],
+            first_link: 0,
+            n_links: 0,
+        }
+    }
+
+    #[test]
+    fn random_point_is_inside_and_even() {
+        let q = quad();
+        let mut halves = [0; 2];
+        for i in 0..400 {
+            let p = random_point(&q, (i % 20) as f32 / 20.0 + 0.025, (i / 20) as f32 / 20.0 + 0.025);
+            assert!(q.contains(p.x, p.z), "{p:?}");
+            halves[(p.x >= 2.0) as usize] += 1;
+        }
+        // area-uniform: about as many on either half
+        assert!((halves[0] as i32 - halves[1] as i32).abs() < 40, "{halves:?}");
+    }
+
+    #[test]
+    fn tod_lookup_like_the_original() {
+        // Sunset Strip's pedestrian density table
+        let t = Tod(vec![(0, 200, 1.0), (200, 600, 0.2), (600, 1200, 0.5), (1200, 1800, 0.8), (1800, 0, 1.2)]);
+        assert_eq!(t.at(1.0), 1.0);
+        // HHMM inclusive both ends, the first row wins
+        assert_eq!(t.at(2.0), 1.0);
+        assert_eq!(t.at(2.5), 0.2);
+        assert_eq!(t.at(9.0), 0.5);
+        assert_eq!(t.at(23.99), 1.2);
+        assert_eq!(Tod::default().at(5.0), 1.0);
+    }
+
+    #[test]
+    fn view_cone_and_band() {
+        let mut p = Peds::new();
+        p.set_view(Vec3::X, 0.0);
+        let f = Vec3::ZERO;
+        // standing: everything within 95 m but straight across is in view, ahead or behind
+        assert!(p.in_view(Vec3::new(60.0, 0.0, 10.0)));
+        assert!(p.in_view(Vec3::new(-60.0, 0.0, 10.0)));
+        assert!(!p.in_view(Vec3::new(96.0, 0.0, 0.0)));
+        // at 45 mph and more the cone is 45 degrees
+        p.set_view(Vec3::X, 50.0);
+        assert!(!p.in_view(Vec3::new(30.0, 0.0, 31.0)));
+        assert!(p.in_view(Vec3::new(30.0, 0.0, 29.0)));
+        // unspawn: 50 m to the side, 150 m ahead, 75 m behind (the recording of the original)
+        assert!(!p.out_of_range(f, Vec3::new(149.0, 0.0, 0.0)));
+        assert!(p.out_of_range(f, Vec3::new(151.0, 0.0, 0.0)));
+        assert!(p.out_of_range(f, Vec3::new(-76.0, 0.0, 0.0)));
+        assert!(!p.out_of_range(f, Vec3::new(-60.0, 0.0, 40.0)));
+        assert!(p.out_of_range(f, Vec3::new(10.0, 0.0, 50.5)));
+    }
+
+    #[test]
+    fn stop_timer_like_the_original() {
+        // sub_8279A8C8 with the idle clip lengths seen live; the stop lengths recorded on the
+        // original were 2.07 / 2.40 / 4.40 / 4.73 / 6.73 / 25.4 s ...
+        let mut r = [0.0f32, 0.5, 0.9].into_iter().cycle();
+        let mut rand = || r.next().unwrap();
+        let v = 2.333;
+        let got: Vec<f32> = (0..3).map(|_| stop_time(v, &mut rand)).collect();
+        for (g, n) in got.iter().zip([1.0f32, 2.0, 3.0]) {
+            assert!((g - (n * v - 8.0 / 30.0)).abs() < 1e-4, "{got:?}");
+        }
+        assert!((stop_time(25.667, &mut rand) - 25.4).abs() < 1e-3);
+        let t = stop_time(0.0, &mut rand);
+        assert!((2.0..4.0).contains(&t));
+    }
+
+    #[test]
+    fn rails_go_midpoint_to_midpoint() {
+        let path: Vec<(Vec3, u32)> = (0..5).map(|k| (Vec3::new(k as f32 * 3.0, 0.0, 0.0), 0)).collect();
+        // on segment 0 facing along it: its middle is 1.5 m ahead
+        let m = next_rail(&path, Vec3::new(0.2, 0.0, 0.0), Vec3::X).unwrap();
+        assert!((m.x - 1.5).abs() < 1e-4);
+        // at that middle: the next one (the nearest is closer than 0.5 m)
+        let m = next_rail(&path, Vec3::new(1.5, 0.0, 0.0), Vec3::X).unwrap();
+        assert!((m.x - 4.5).abs() < 1e-4);
+        // facing back: only the fallback of 216 degrees for the nearest segment remains
+        let m = next_rail(&path, Vec3::new(0.2, 0.0, 0.0), -Vec3::X).unwrap();
+        assert!((m.x - 1.5).abs() < 1e-4);
+        // at the end of the path: nothing
+        assert!(next_rail(&path, Vec3::new(10.5, 0.0, 0.0), Vec3::X).is_none());
+    }
+
+    #[test]
+    fn car_prediction_over_a_second() {
+        let car = Threat { pos: Vec3::new(-10.0, 0.0, 0.0), vel: Vec3::new(20.0, 0.0, 0.0) };
+        // in its path within the next second (four steps of 0.25 s)
+        assert!(car_threat(Vec3::new(1.0, 0.0, 0.8), &[car]).is_some());
+        // beside its path, behind it, or further than a second away
+        assert!(car_threat(Vec3::new(1.0, 0.0, 3.0), &[car]).is_none());
+        assert!(car_threat(Vec3::new(-15.0, 0.0, 0.0), &[car]).is_none());
+        assert!(car_threat(Vec3::new(15.0, 0.0, 0.0), &[car]).is_none());
+        // the way out is away from its line
+        let (_, away, _) = car_threat(Vec3::new(1.0, 0.0, -0.8), &[car]).unwrap();
+        assert!(away.z < -0.9);
+    }
+
+    #[test]
+    fn furniture_boxes() {
+        let o: Obst = (Vec3::new(10.0, 0.0, 0.0), Vec3::X, glam::Vec2::new(1.0, 0.25));
+        assert_eq!(box_dist(&o, Vec3::new(10.5, 0.0, 0.1)), 0.0);
+        assert!((box_dist(&o, Vec3::new(10.0, 0.0, 1.25)) - 1.0).abs() < 1e-5);
+        assert!((box_dist(&o, Vec3::new(12.0, 0.0, 0.0)) - 1.0).abs() < 1e-5);
+        // a walker 0.9 m off a post is seen by the 0.667 m sphere only within reach
+        assert!(sphere_hit(Vec3::new(10.0, 0.0, 0.8), AWARE_RADIUS, 0, &[], &[o], false).is_some());
+        assert!(sphere_hit(Vec3::new(10.0, 0.0, 1.0), AWARE_RADIUS, 0, &[], &[o], false).is_none());
+    }
+
+    #[test]
+    #[ignore = "requires MCLA_DATA_DIR with the user's extracted disc"]
+    fn spawn_target_at_sunset_strip() {
+        let dir = std::env::var("MCLA_DATA_DIR").expect("MCLA_DATA_DIR");
+        let root = Path::new(&dir);
+        let mesh = NavMesh::parse(&load_resource_file(&root.join("resources/city/sc/0x69d17d57.r26")).unwrap()).unwrap();
+        // the recorded original: player car standing at Sunset Strip, 116 candidate
+        // polygons of 5351.95 m^2, density 0.5 (06:00-12:00), 30 pedestrians
+        let focus = Vec3::new(-638.9, 18.2, -636.8);
+        // the chunks' quadtrees (27 of 35 chunks have one), and the query through them finds
+        // every polygon a plain search finds
+        assert_eq!(mesh.quads.iter().filter(|q| q.is_some()).count(), 27);
+        let all = mesh.sphere_query(focus, 140.0, usize::MAX, |_, q| q.sidewalk() && q.nv >= 3 && q.closest(focus.x, focus.z).distance(focus) <= 140.0);
+        let mut plain = Vec::new();
+        mesh.near(focus, 140.0, |i, q| {
+            if q.sidewalk() && q.nv >= 3 && q.closest(focus.x, focus.z).distance(focus) <= 140.0 {
+                plain.push(i);
+            }
+        });
+        plain.sort_unstable();
+        assert_eq!(all, plain);
+        let c = spawn_candidates(&mesh, focus, 140.0);
+        let area: f32 = c.iter().map(|x| x.1).sum();
+        assert_eq!(c.len(), 116);
+        assert!((area - 5351.95).abs() < 1.0, "{area}");
+        let d = Distribution::load(root, "ped_");
+        let target = area * 0.011 * d.density_at(focus, 9.0);
+        assert!((target - 29.44).abs() < 0.05, "{target}");
+        // a random walk from there stays on the pavement
+        let start = mesh.find(Vec3::new(-640.0, 18.0, -640.0), AI_SIDEWALK, 3.0).or(c.first().map(|x| x.0)).unwrap();
+        let mut r = 7u32;
+        let mut rand = || {
+            r = r.wrapping_mul(1664525).wrapping_add(1013904223);
+            (r >> 8) as f32 / 16777216.0
+        };
+        let path = random_path(&mesh, start, mesh.polys[start as usize].center, Vec3::X, &mut rand);
+        assert!(!path.is_empty());
+        assert!(path.iter().all(|h| mesh.polys[h.2 as usize].sidewalk()));
     }
 }

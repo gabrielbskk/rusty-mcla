@@ -31,7 +31,7 @@ use crate::render::Frustum;
 
 /// Ground-plane distance from the camera to an occluder's sphere centre within which it is used
 /// (0x82007A48 = 40.0, times the scale 0x827D2958 = 1.0).
-const RANGE: f32 = 40.0;
+pub(crate) const RANGE: f32 = 40.0;
 /// No occluders above this camera height (0x82002C64).
 const MAX_CAM_Y: f32 = 1000.0;
 /// Volumes per view (the view's list holds 64).
@@ -242,6 +242,27 @@ impl Occluders {
         }
         Selected { volumes }
     }
+
+    /// The volumes of a view without a frustum (the pedestrian spawner's view 2, built in
+    /// sub_822C1FA8 by sub_825F2E10): occluders whose centre is within `range` in the ground
+    /// plane, at most 64 volumes; nearest first (the original's query order is not decoded).
+    pub fn select_around(&self, eye: Vec3, range: f32) -> Selected {
+        let mut volumes = Vec::new();
+        if !(eye.y <= MAX_CAM_Y) || !eye.is_finite() {
+            return Selected { volumes };
+        }
+        let mut near: Vec<(f32, &Occluder)> = self.list.iter().map(|o| ((o.centre.x - eye.x).powi(2) + (o.centre.z - eye.z).powi(2), o)).filter(|n| n.0 <= range * range).collect();
+        near.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for (_, o) in near {
+            if volumes.len() >= MAX_VOLUMES {
+                break;
+            }
+            if let Some(v) = o.volume(eye) {
+                volumes.push(v);
+            }
+        }
+        Selected { volumes }
+    }
 }
 
 impl Occluder {
@@ -387,6 +408,12 @@ impl Selected {
         false
     }
 
+    /// True when a sphere lies `r` or more behind every plane of one volume (sub_82175238,
+    /// occluder part).
+    pub fn hides_sphere(&self, c: Vec3, r: f32) -> bool {
+        self.volumes.iter().any(|planes| planes.iter().all(|p| p.truncate().dot(c) + p.w <= -r))
+    }
+
     /// True when all the boxes together are behind one occluder: the test for a sector, which
     /// the original hides or shows as a whole (its parts may be set back behind a wall's face,
     /// like shop windows, and must not be tested one by one).
@@ -418,19 +445,25 @@ fn eye_of(m: Mat4) -> Option<Vec3> {
     e.is_finite().then(|| e.as_vec3())
 }
 
-/// The volumes of this frame's main view, from the city's file (loaded on first use).
-/// Empty when the file is missing or `MCLA_NO_OCCLUDE` is set.
-pub fn frame(data_dir: &str, view_proj: Mat4, frustum: &Frustum) -> Selected {
+/// The city's occluders, loaded on first use; None when the file is missing or
+/// `MCLA_NO_OCCLUDE` is set.
+pub fn city(data_dir: &str) -> Option<&'static Occluders> {
     static CITY: OnceLock<Option<Occluders>> = OnceLock::new();
-    static CALLS: AtomicUsize = AtomicUsize::new(0);
-    let city = CITY.get_or_init(|| {
+    CITY.get_or_init(|| {
         if std::env::var("MCLA_NO_OCCLUDE").is_ok() {
             log::info!("occluders: off (MCLA_NO_OCCLUDE)");
             return None;
         }
         Occluders::load(data_dir)
-    });
-    let Some(city) = city else { return Selected::none() };
+    })
+    .as_ref()
+}
+
+/// The volumes of this frame's main view, from the city's file (loaded on first use).
+/// Empty when the file is missing or `MCLA_NO_OCCLUDE` is set.
+pub fn frame(data_dir: &str, view_proj: Mat4, frustum: &Frustum) -> Selected {
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    let Some(city) = city(data_dir) else { return Selected::none() };
     let s = city.select(view_proj, frustum);
     if CALLS.fetch_add(1, Ordering::Relaxed) % 120 == 60 {
         log::info!("occluders: {} volumes in view", s.len());

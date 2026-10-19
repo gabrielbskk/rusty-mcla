@@ -138,7 +138,97 @@ pub struct NavMesh {
     pub local_links: usize,
     /// links between chunks (each is entered on both of its polygons)
     pub spans: usize,
+    /// per chunk: its polygon quadtree (chunk data +0x04; 27 of the 35 chunks have one)
+    pub quads: Vec<Option<NavQuad>>,
     grid: HashMap<(i32, i32), Vec<u32>>,
+}
+
+/// A chunk's polygon quadtree as stored in the file: bounds and splits in the chunk's own
+/// x / z, every node listing the polygons (chunk-local indices) filed there.
+#[derive(Debug, Clone)]
+pub struct NavQuad {
+    pub min: [f32; 2],
+    pub max: [f32; 2],
+    /// the chunk's matrix rows (right, up, forward, position): local = rows^T (world - pos)
+    pub rows: [Vec3; 4],
+    /// node 0 is the root
+    pub nodes: Vec<QuadNode>,
+}
+
+#[derive(Debug, Clone)]
+pub struct QuadNode {
+    /// children (index into `nodes`, `u32::MAX` none): 0 low x low z, 1 high x low z,
+    /// 2 low x high z, 3 high x high z
+    pub child: [u32; 4],
+    pub polys: Vec<u16>,
+    pub split: [f32; 2],
+}
+
+impl NavQuad {
+    /// The polygons of the nodes a square (local x / z) reaches, as the original's walk
+    /// reports them (sub_825538B8 / 825530C0 / 82553190): depth first, a node's own polygons
+    /// before its children 0..3, every polygon once.
+    pub fn walk(&self, lo: [f32; 2], hi: [f32; 2], n_polys: usize, out: &mut Vec<u32>) {
+        if lo[0] > self.max[0] || lo[1] > self.max[1] || hi[0] < self.min[0] || hi[1] < self.min[1] || self.nodes.is_empty() {
+            return;
+        }
+        let mut seen = vec![false; n_polys];
+        let mut stack = vec![0u32];
+        while let Some(n) = stack.pop() {
+            let node = &self.nodes[n as usize];
+            for &p in &node.polys {
+                if (p as usize) < n_polys && !seen[p as usize] {
+                    seen[p as usize] = true;
+                    out.push(p as u32);
+                }
+            }
+            // pushed in reverse so that child 0 is visited first
+            for c in (0..4).rev() {
+                let ch = node.child[c];
+                if ch == u32::MAX {
+                    continue;
+                }
+                let xok = if c & 1 != 0 { hi[0] >= node.split[0] } else { lo[0] <= node.split[0] };
+                let zok = if c & 2 != 0 { hi[1] >= node.split[1] } else { lo[1] <= node.split[1] };
+                if xok && zok {
+                    stack.push(ch);
+                }
+            }
+        }
+    }
+}
+
+fn parse_quad(rd: &Rd, q: usize, rows: [Vec3; 4]) -> Option<NavQuad> {
+    if !rd.has(q, 52) {
+        return None;
+    }
+    let mut nodes: Vec<QuadNode> = Vec::new();
+    // (file offset, index of the parent's child slot to fill)
+    let mut todo: Vec<(usize, Option<(usize, usize)>)> = vec![(q + 20, None)];
+    while let Some((o, parent)) = todo.pop() {
+        if nodes.len() > 1 << 16 || !rd.has(o, 32) {
+            return None;
+        }
+        let i = nodes.len();
+        let mut polys = Vec::new();
+        if let Some(pp) = rd.ptr(o + 16) {
+            let n = rd.u16(o + 20) as usize;
+            if !rd.has(pp, 2 * n) {
+                return None;
+            }
+            polys = (0..n).map(|k| rd.u16(pp + 2 * k)).collect();
+        }
+        nodes.push(QuadNode { child: [u32::MAX; 4], polys, split: [rd.f32(o + 24), rd.f32(o + 28)] });
+        if let Some((pi, c)) = parent {
+            nodes[pi].child[c] = i as u32;
+        }
+        for c in 0..4 {
+            if let Some(ch) = rd.ptr(o + 4 * c) {
+                todo.push((ch, Some((i, c))));
+            }
+        }
+    }
+    Some(NavQuad { min: [rd.f32(q + 4), rd.f32(q + 8)], max: [rd.f32(q + 12), rd.f32(q + 16)], rows, nodes })
 }
 
 fn cell(x: f32, z: f32) -> (i32, i32) {
@@ -166,12 +256,14 @@ impl NavMesh {
         for ci in 0..n_chunks {
             mesh.chunk_first.push(mesh.polys.len() as u32);
             chunk_verts.push(Vec::new());
+            mesh.quads.push(None);
             let Some(c) = rd.ptr(chunks + 4 * ci) else { continue };
             let Some(d) = rd.ptr(cds + 4 * rd.u16(c + 0x50) as usize) else { continue };
             let rows = [v3(c + 0x10), v3(c + 0x20), v3(c + 0x30), v3(c + 0x40)];
             if !rows.iter().all(|r| r.is_finite()) {
                 continue;
             }
+            mesh.quads[ci] = rd.ptr(d + 0x04).and_then(|q| parse_quad(&rd, q, rows));
             let world = |v: Vec3| rows[0] * v.x + rows[1] * v.y + rows[2] * v.z + rows[3];
             let (n_links, n_normals, n_polys, n_verts) = (rd.u16(d + 0x20) as usize, rd.u16(d + 0x22) as usize, rd.u16(d + 0x24) as usize, rd.u16(d + 0x26) as usize);
             let (Some(lk), Some(po), Some(ve)) = (rd.ptr(d + 0x08).or((n_links == 0).then_some(0)), rd.ptr(d + 0x10), rd.ptr(d + 0x14)) else { continue };
@@ -285,6 +377,46 @@ impl NavMesh {
             }
         }
         (!mesh.polys.is_empty()).then_some(mesh)
+    }
+
+    /// Polygons of chunk `ci` (global indices).
+    pub fn chunk_polys(&self, ci: usize) -> std::ops::Range<u32> {
+        let a = self.chunk_first.get(ci).copied().unwrap_or(0);
+        let b = self.chunk_first.get(ci + 1).copied().unwrap_or(self.polys.len() as u32);
+        a..b.max(a)
+    }
+
+    /// The original's sphere query over the level (navlevel 0x827644F8 / 0x82764220): the
+    /// chunks in order; within a chunk the polygons its quadtree reports for the square of
+    /// `r` around `pos` (all of them, in order, without a tree); those `accept` takes, the
+    /// first `cap` kept, then sorted by (chunk, polygon) as sub_82761F20 does.
+    pub fn sphere_query(&self, pos: Vec3, r: f32, cap: usize, mut accept: impl FnMut(u32, &NavPoly) -> bool) -> Vec<u32> {
+        let mut out: Vec<u32> = Vec::new();
+        let mut seq: Vec<u32> = Vec::new();
+        for ci in 0..self.chunk_first.len() {
+            let range = self.chunk_polys(ci);
+            let n = (range.end - range.start) as usize;
+            if n == 0 {
+                continue;
+            }
+            seq.clear();
+            match self.quads.get(ci).and_then(|q| q.as_ref()) {
+                Some(q) => {
+                    let d = pos - q.rows[3];
+                    let (lx, lz) = (q.rows[0].dot(d), q.rows[2].dot(d));
+                    q.walk([lx - r, lz - r], [lx + r, lz + r], n, &mut seq);
+                }
+                None => seq.extend(0..n as u32),
+            }
+            for &p in &seq {
+                let gi = range.start + p;
+                if out.len() < cap && accept(gi, &self.polys[gi as usize]) {
+                    out.push(gi);
+                }
+            }
+        }
+        out.sort_unstable();
+        out
     }
 
     pub fn links_of(&self, poly: u32) -> &[NavLink] {

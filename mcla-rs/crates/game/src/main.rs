@@ -4115,7 +4115,12 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                     let threats: Vec<peds::Threat> = self.vehicles.cars.iter().filter(|c| c.parked.is_none() && c.placed).map(|c| peds::Threat { pos: c.state.pos, vel: c.state.vel }).collect();
                     let props = &self.props;
                     let signals = if self.vehicles.signals.junctions.is_empty() { None } else { Some((&self.vehicles.signals, self.vehicles.clock)) };
-                    self.peds.update(&mut gpu, nav, &world.collider, &|p, r, out| props.obstacles_near(p, r, out), focus, &threats, signals, self.time_of_day, sim_dt);
+                    // the original's spawner looks along the player car (speed in mph)
+                    match self.vehicles.player().filter(|_| self.drive) {
+                        Some(c) => self.peds.set_view(c.state.forward(), c.state.speed() * 2.236_936),
+                        None => self.peds.set_view(self.cam.forward(), 0.0),
+                    }
+                    self.peds.update(&mut gpu, nav, &world.collider, &|p, r, out| props.obstacle_boxes_near(p, r, out), focus, &threats, signals, self.time_of_day, sim_dt);
                     if self.tick_no % 90 == 0 && std::env::var("MCLA_PED_DUMP").is_ok() {
                         log::info!("peds: {} alive, {} evades, {} crossings, {} waiting, kerbs {:?}", self.peds.count(), self.peds.evades, self.peds.crossings, self.peds.waiting(), self.peds.curb_stats());
                         for (p, f, n) in self.peds.nearest(focus, 8) {

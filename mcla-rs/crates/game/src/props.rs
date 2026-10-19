@@ -1685,6 +1685,29 @@ impl Props {
         }
     }
 
+    /// Standing props around `p` as footprint boxes: centre, the box's own x axis (flat,
+    /// unit) and the half sizes along its x and z, for walkers that pass them by the corners.
+    pub fn obstacle_boxes_near(&self, p: Vec3, r: f32, out: &mut Vec<(Vec3, Vec3, Vec2)>) {
+        let (c0, c1) = (col_cell(p - Vec3::splat(r + 3.0)), col_cell(p + Vec3::splat(r + 3.0)));
+        for cx in c0.0..=c1.0 {
+            for cz in c0.1..=c1.1 {
+                let Some(list) = self.col_grid.get(&(cx, cz)) else { continue };
+                for &i in list {
+                    let c = &self.colliders[i as usize];
+                    if c.knocked || c.foot.height < 0.3 || (c.pos.y - p.y).abs() > 3.0 {
+                        continue;
+                    }
+                    let centre = c.pos + c.rot * Vec3::new(c.foot.center.x, 0.0, c.foot.center.y) * c.scale;
+                    let half = c.foot.half * c.scale;
+                    if centre.distance(p) < r + half.length() {
+                        let ax = c.rot * Vec3::X;
+                        out.push((centre, Vec3::new(ax.x, 0.0, ax.z).normalize_or(Vec3::X), half));
+                    }
+                }
+            }
+        }
+    }
+
     /// Solid things (trunks, masts, bus shelters) within `r` of a point: centre and radius.
     pub fn solid_near(&self, p: Vec3, r: f32, out: &mut Vec<(Vec3, f32)>) {
         let (c0, c1) = (col_cell(p - Vec3::splat(r + 3.0)), col_cell(p + Vec3::splat(r + 3.0)));
