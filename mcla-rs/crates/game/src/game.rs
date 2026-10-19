@@ -3174,9 +3174,6 @@ impl Game {
             }
         }
         race.prev_pos = vehicles.cars.iter().map(|c| c.state.pos).collect();
-        if std::env::var("MCLA_RACE_DUMP").map_or(false, |v| (race.time % v.parse::<f32>().ok().filter(|x| *x > 0.5).unwrap_or(10.0)) < dt) {
-            for (i, c) in vehicles.cars.iter().enumerate().filter(|(i, _)| race.participants.contains(i)) {
-                let k = race.next.get(i).copied().unwrap_or(0);
         // (a computer racer over the line brakes to a stop)
         for (i, c) in vehicles.cars.iter_mut().enumerate() {
             if !c.is_player && race.finish_time.get(i).map_or(false, |t| t.is_some()) {
@@ -3185,6 +3182,9 @@ impl Game {
                 }
             }
         }
+        if std::env::var("MCLA_RACE_DUMP").map_or(false, |v| (race.time % v.parse::<f32>().ok().filter(|x| *x > 0.5).unwrap_or(10.0)) < dt) {
+            for (i, c) in vehicles.cars.iter().enumerate().filter(|(i, _)| race.participants.contains(i)) {
+                let k = race.next.get(i).copied().unwrap_or(0);
                 if k < n {
                     let cp = race.checkpoints[k];
                     log::info!("race dump t {:.0}: car {} {} at ({:.0},{:.0},{:.0}) next {} dist {:.0} dy {:.1} speed {:.0} ai path_i {:?}", race.time, i, c.model.name, c.state.pos.x, c.state.pos.y, c.state.pos.z, k, Vec3::new(c.state.pos.x - cp.x, 0.0, c.state.pos.z - cp.z).length(), c.state.pos.y - cp.y, c.state.speed(), c.ai.as_ref().map(|a| a.path_i));
@@ -3830,12 +3830,10 @@ impl Game {
                 let t = ctx.input(|i| i.time);
                 let a = (150.0 + 105.0 * (t * 3.0).sin()) as u8;
                 self.text(&painter, egui::pos2(cx, band.top() + 122.0 * sc), egui::Align2::CENTER_TOP, "PRESS ENTER", 16.0 * sc, egui::Color32::from_rgba_unmultiplied(255, 255, 255, a));
-                self.text(&painter, egui::pos2(screen.right() - 40.0 * sc, screen.bottom() - 50.0 * sc), egui::Align2::RIGHT_CENTER, "ESC  QUIT", 11.0 * sc, egui::Color32::from_gray(170));
                 let clicked = ctx.input(|i| i.pointer.primary_clicked());
+                let _ = back;
                 if enter || clicked {
                     action = MenuAction::StartFreeRoam;
-                } else if back {
-                    action = MenuAction::Quit;
                 }
             }
             Mode::Paused if self.replay.is_some() => self.replay_ui(ctx, up, down, left, right, enter, back),

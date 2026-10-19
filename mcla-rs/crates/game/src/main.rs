@@ -3,6 +3,7 @@
 mod ability;
 mod hooks;
 mod mc4;
+mod pads;
 mod rewards;
 mod vinyl;
 mod ai;
@@ -203,7 +204,13 @@ struct App {
     frame_no: u64,
     vehicles: Vehicles,
     drive: bool,
-    gamepad: Option<gilrs::Gilrs>,
+    /// SDL's gamepad layer (`pads.rs`); none when it did not start
+    gamepad: Option<pads::Pads>,
+    /// the pad being played with: the last one whose button or stick was used (Windows can
+    /// list several - one controller as XInput and as a raw HID device, a dongle's spare slots)
+    pad_id: Option<pads::PadId>,
+    /// when each pad was last used (a button, or a stick or trigger past half way)
+    pad_used: std::collections::HashMap<pads::PadId, std::time::Instant>,
     game: Game,
     /// the race checkpoints' looks and which are open (`checkpoints.rs`)
     cp_markers: checkpoints::Markers,
@@ -561,7 +568,9 @@ impl App {
             show_ui: false,
             frame_no: 0,
             vehicles: Vehicles::new(),
-            gamepad: gilrs::Gilrs::new().ok(),
+            gamepad: open_pads(),
+            pad_id: None,
+            pad_used: Default::default(),
             game: Game::new(Vec::new(), 0),
             cp_markers: Default::default(),
             quit: false,
@@ -1289,17 +1298,15 @@ impl App {
 
     /// The pad as the original's poll has it (`mc4::PadState`).
     fn pad_state(&self) -> Option<crate::mc4::PadState> {
-        let (_, pad) = self.gamepad.as_ref()?.gamepads().next()?;
-        use gilrs::Button as B;
-        let ax = |a: gilrs::Axis| pad.axis_data(a).map(|d| d.value()).unwrap_or(0.0);
-        let bt = |b: B| pad.button_data(b).map(|d| d.value()).unwrap_or(0.0);
+        let pad = active_pad(self.gamepad.as_ref()?, self.pad_id)?;
+        use pads::{Axis as A, Button as B};
         let mut buttons = 0u16;
-        for (i, b) in [B::LeftTrigger2, B::RightTrigger2, B::LeftTrigger, B::RightTrigger, B::North, B::East, B::South, B::West, B::Select, B::LeftThumb, B::RightThumb, B::Start, B::DPadUp, B::DPadRight, B::DPadDown, B::DPadLeft].into_iter().enumerate() {
-            if pad.is_pressed(b) {
+        for (i, b) in [B::LeftTrigger, B::RightTrigger, B::LeftShoulder, B::RightShoulder, B::North, B::East, B::South, B::West, B::Back, B::LeftStick, B::RightStick, B::Start, B::DPadUp, B::DPadRight, B::DPadDown, B::DPadLeft].into_iter().enumerate() {
+            if pad.pressed(b) {
                 buttons |= 1 << i;
             }
         }
-        Some(crate::mc4::PadState::new([ax(gilrs::Axis::LeftStickX), ax(gilrs::Axis::LeftStickY), ax(gilrs::Axis::RightStickX), ax(gilrs::Axis::RightStickY)], [bt(B::LeftTrigger2), bt(B::RightTrigger2)], buttons))
+        Some(crate::mc4::PadState::new([pad.axis(A::LeftX), pad.axis(A::LeftY), pad.axis(A::RightX), pad.axis(A::RightY)], [pad.axis(A::LeftTrigger), pad.axis(A::RightTrigger)], buttons))
     }
 
     /// The pad's driving input, through the active controller map (`mc4`: the style of the
@@ -1314,22 +1321,19 @@ impl App {
                 let live = crate::mc4::pad_live(&p, &slots);
                 let value = |a: &str| crate::mc4::pad_analog(&p, &live, a);
                 let down = |a: &str| crate::mc4::pad_down(&p, &live, a);
+                // (a held steering key wins over the pad's stick)
                 let steer = value("STEER_AXIS");
-                if steer != 0.0 {
+                if steer != 0.0 && inp.steer == 0.0 {
                     inp.steer = steer;
                 }
                 // (the lean axis: the stick pulled back leans the rider back)
                 let lean = value("STEER_AXIS_UP_DN");
-                if lean != 0.0 {
+                if lean != 0.0 && inp.lean == 0.0 {
                     inp.lean = lean;
                 }
                 let (gas, brake) = (value("GAS"), value("BRAKE"));
-                if gas > 0.0 {
-                    inp.throttle = gas;
-                }
-                if brake > 0.0 {
-                    inp.brake = brake;
-                }
+                inp.throttle = inp.throttle.max(gas);
+                inp.brake = inp.brake.max(brake);
                 inp.handbrake |= down("HANDBRAKE") || pending & 1 != 0;
                 inp.xfer |= down("WEIGHT_XFER") || pending & 2 != 0;
                 inp.nitro |= down("NITRO") || pending & 4 != 0;
@@ -1344,45 +1348,44 @@ impl App {
                 return;
             }
         }
-        if let Some(g) = self.gamepad.as_mut() {
-            if let Some((_, pad)) = g.gamepads().next() {
-                let ax = |a: gilrs::Axis| pad.axis_data(a).map(|d| d.value()).unwrap_or(0.0);
-                let bt = |b: gilrs::Button| pad.button_data(b).map(|d| d.value()).unwrap_or(0.0);
-                let sx = ax(gilrs::Axis::LeftStickX);
-                if sx.abs() > 0.12 {
+        if let Some(g) = self.gamepad.as_ref() {
+            if let Some(pad) = active_pad(g, self.pad_id) {
+                use pads::{Axis as A, Button as B};
+                let sx = pad.axis(A::LeftX);
+                if sx.abs() > 0.12 && inp.steer == 0.0 {
                     inp.steer = sx;
                 }
                 // (pulling the stick back leans the rider back)
-                let sy = ax(gilrs::Axis::LeftStickY);
-                if sy.abs() > 0.3 {
+                let sy = pad.axis(A::LeftY);
+                if sy.abs() > 0.3 && inp.lean == 0.0 {
                     inp.lean = -sy;
                 }
-                let rt = bt(gilrs::Button::RightTrigger2);
-                let lt = bt(gilrs::Button::LeftTrigger2);
+                let rt = pad.axis(A::RightTrigger);
+                let lt = pad.axis(A::LeftTrigger);
                 if rt > 0.05 {
-                    inp.throttle = rt;
+                    inp.throttle = inp.throttle.max(rt);
                 }
                 if lt > 0.05 {
-                    inp.brake = lt;
+                    inp.brake = inp.brake.max(lt);
                 }
                 // (the buttons as the game's default layout has them - `xenon_controls_trigger`
                 // of tune/controller: A handbrake, X nitrous, B weight transfer)
                 if self.hyd_on && self.game.hydraulics {
                     // (switched on, the four face buttons are the four wheels, as on the original's pad)
-                    for (i, b) in [gilrs::Button::West, gilrs::Button::North, gilrs::Button::South, gilrs::Button::East].into_iter().enumerate() {
-                        let bit = match b { gilrs::Button::South => 0, gilrs::Button::East => 1, gilrs::Button::West => 2, _ => 3 };
-                        if pad.is_pressed(b) || pending & (1 << bit) != 0 {
+                    for (i, b) in [B::West, B::North, B::South, B::East].into_iter().enumerate() {
+                        let bit = match b { B::South => 0, B::East => 1, B::West => 2, _ => 3 };
+                        if pad.pressed(b) || pending & (1 << bit) != 0 {
                             inp.hyd |= 1 << i;
                         }
                     }
                 } else {
-                    if pad.is_pressed(gilrs::Button::South) || pending & 1 != 0 {
+                    if pad.pressed(B::South) || pending & 1 != 0 {
                         inp.handbrake = true;
                     }
-                    if pad.is_pressed(gilrs::Button::West) || pending & 4 != 0 {
+                    if pad.pressed(B::West) || pending & 4 != 0 {
                         inp.nitro = true;
                     }
-                    if pad.is_pressed(gilrs::Button::East) || pending & 2 != 0 {
+                    if pad.pressed(B::East) || pending & 2 != 0 {
                         inp.xfer = true;
                     }
                 }
@@ -1398,26 +1401,64 @@ impl App {
     fn gamepad_buttons(&mut self) {
         let (now, look, pressed) = {
             let Some(g) = self.gamepad.as_mut() else { return };
-            use gilrs::Button as B;
-            let list = [B::South, B::East, B::West, B::North, B::LeftTrigger, B::RightTrigger, B::Select, B::Start, B::LeftThumb, B::RightThumb, B::DPadUp, B::DPadDown, B::DPadLeft, B::DPadRight];
-            let id = g.gamepads().next().map(|(id, _)| id);
+            use pads::{Axis as A, Button as B, PadEvent as E};
+            let list = [B::South, B::East, B::West, B::North, B::LeftShoulder, B::RightShoulder, B::Back, B::Start, B::LeftStick, B::RightStick, B::DPadUp, B::DPadDown, B::DPadLeft, B::DPadRight];
+            let events = g.poll();
+            // (the pad played with: of the pads used in the last second - a button, or a stick
+            // or trigger past half way - the best ranked, the current one on a tie: one with
+            // rumble (XInput, SDL's HIDAPI drivers) first, then one SDL knows the kind of.)
+            let now_t = std::time::Instant::now();
+            for (id, ev) in &events {
+                match ev {
+                    E::Connected => {
+                        if let Some(p) = g.get(*id) {
+                            let (v, d) = p.usb_id();
+                            log::info!("pad: {} \"{}\" connected ({}, {v:04x}:{d:04x}, rumble {}): {}", id.0, p.name(), p.kind(), p.has_rumble(), p.mapping());
+                        }
+                    }
+                    E::Pressed(..) => {
+                        self.pad_used.insert(*id, now_t);
+                    }
+                    E::Moved(_, v) if v.abs() > 0.5 => {
+                        self.pad_used.insert(*id, now_t);
+                    }
+                    E::Disconnected => {
+                        log::info!("pad: {} disconnected", id.0);
+                        self.pad_used.remove(id);
+                        if self.pad_id == Some(*id) {
+                            self.pad_id = None;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let recent = |id: &pads::PadId| self.pad_used.get(id).map_or(false, |t| now_t.duration_since(*t).as_secs_f32() < 1.0);
+            let cur_rank = self.pad_id.filter(|id| recent(id)).and_then(|id| g.get(id)).map(|p| p.rank());
+            let best = self.pad_used.keys().copied().filter(|id| recent(id)).filter_map(|id| g.get(id).map(|p| (p.rank(), id))).max_by_key(|(r, _)| *r);
+            if let Some((rank, id)) = best {
+                if cur_rank.map_or(true, |c| rank > c) && self.pad_id != Some(id) {
+                    log::info!("pad: playing with {} \"{}\"", id.0, g.get(id).map(|p| p.name()).unwrap_or_default());
+                    self.pad_id = Some(id);
+                }
+            }
             let mut pressed = 0u32;
-            while let Some(ev) = g.next_event() {
-                if Some(ev.id) == id {
-                    if let gilrs::EventType::ButtonPressed(button, _) = ev.event {
-                        if let Some(i) = list.iter().position(|b| *b == button) { pressed |= 1 << i; }
+            for (id, ev) in &events {
+                if Some(*id) == self.pad_id {
+                    if let E::Pressed(button) = ev {
+                        if let Some(i) = list.iter().position(|b| b == button) {
+                            pressed |= 1 << i;
+                        }
                     }
                 }
             }
-            let Some((_, pad)) = g.gamepads().next() else { return };
-            let ax = |a: gilrs::Axis| pad.axis_data(a).map(|d| d.value()).unwrap_or(0.0);
+            let Some(pad) = active_pad(g, self.pad_id) else { return };
             let mut now = 0u32;
             for (i, b) in list.iter().enumerate() {
-                if pad.is_pressed(*b) {
+                if pad.pressed(*b) {
                     now |= 1 << i;
                 }
             }
-            let (lx, ly) = (ax(gilrs::Axis::LeftStickX), ax(gilrs::Axis::LeftStickY));
+            let (lx, ly) = (pad.axis(A::LeftX), pad.axis(A::LeftY));
             // (on the GPS map the left stick moves the cursor itself - not the d-pad's CHANGE TARGET)
             let stick_free = self.game.show_map && self.game.hm.is_some();
             for (i, on) in [ly > 0.6 && !stick_free, ly < -0.6 && !stick_free, lx < -0.6 && !stick_free, lx > 0.6 && !stick_free].into_iter().enumerate() {
@@ -1425,7 +1466,7 @@ impl App {
                     now |= 1 << (14 + i);
                 }
             }
-            (now, (ax(gilrs::Axis::RightStickX), ax(gilrs::Axis::RightStickY)), pressed)
+            (now, (pad.axis(A::RightX), pad.axis(A::RightY)), pressed)
         };
         let hit = (now & !self.pad_prev) | pressed;
         self.pad_prev = now;
@@ -1462,8 +1503,13 @@ impl App {
             // brand tabs, as `uinput.l1` / `uinput.r1` do in the game's own Rim.sc.xml
             self.game.nav_tab_prev |= p(4);
             self.game.nav_tab_next |= p(5);
-            self.game.nav_enter |= p(0);
-            self.game.nav_back |= (p(1) || p(7)) && !watching;
+            // (Start is the start screen's own button - its prompt is "PRESS (Start)"; elsewhere in
+            // the menus it backs out, as it closes the pause menu. It used to back out of the
+            // start screen too, which quits the game.)
+            let title = self.game.mode == Mode::MainMenu;
+            self.game.nav_enter |= p(0) || (p(7) && title);
+            // (B does nothing there either: the original's start screen has no way out)
+            self.game.nav_back |= ((p(1) || p(7)) && !title) && !watching;
             self.game.nav_map |= p(6) && self.game.show_map;
             return;
         }
@@ -1894,8 +1940,8 @@ impl App {
         // special abilities (real time); Zone slows the whole simulation down
         let mut fire = std::mem::take(&mut self.fire_ability);
         if let Some(g) = self.gamepad.as_ref() {
-            if let Some((_, pad)) = g.gamepads().next() {
-                fire |= pad.is_pressed(gilrs::Button::LeftTrigger);
+            if let Some(pad) = active_pad(g, self.pad_id) {
+                fire |= pad.pressed(pads::Button::LeftShoulder);
             }
         }
         // (N-VP-1: nothing fires on the grid before GO - abilities and power-ups wait for the race)
@@ -3304,6 +3350,9 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
             props::set_lens(self.cam.fov_y);
             self.vehicles.hide_player = self.hide_player;
             self.vehicles.update(&world, player_input, sim_dt);
+            if std::env::var_os("MCLA_STEER_DBG").is_some() && self.tick_no % 30 == 0 {
+                log::info!("steer dbg: tick {} drive {} menu {} mode {:?} in steer {:.2} thr {:.2} -> car input steer {:?} state steer {:?} veh steer {:?}", self.tick_no, self.drive, menu_open, self.game.mode, player_input.steer, player_input.throttle, self.vehicles.player().map(|c| c.input.steer), self.vehicles.player().map(|c| c.state.steer), self.vehicles.player().and_then(|c| c.state.veh.as_ref().map(|v| (v.pad_steer, v.steer))));
+            }
             self.props.collide(&gpu, &world, &mut self.vehicles.cars, sim_dt);
             // ---- pulling up at a garage opens it ----
             {
@@ -5486,9 +5535,8 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                 if self.input.down(KeyCode::KeyD) { stick.x += 1.0; }
                 if self.input.down(KeyCode::KeyW) { stick.y -= 1.0; }
                 if self.input.down(KeyCode::KeyS) { stick.y += 1.0; }
-                if let Some((_, pad)) = self.gamepad.as_ref().and_then(|g| g.gamepads().next()) {
-                    let ax = |a: gilrs::Axis| pad.axis_data(a).map(|d| d.value()).unwrap_or(0.0);
-                    let v = hudmap::NavCam::shape_stick(glam::Vec2::new(ax(gilrs::Axis::LeftStickX), -ax(gilrs::Axis::LeftStickY)));
+                if let Some(pad) = self.gamepad.as_ref().and_then(|g| active_pad(g, self.pad_id)) {
+                    let v = hudmap::NavCam::shape_stick(glam::Vec2::new(pad.axis(pads::Axis::LeftX), -pad.axis(pads::Axis::LeftY)));
                     if v != glam::Vec2::ZERO {
                         stick = v;
                     }
@@ -8231,13 +8279,10 @@ impl ApplicationHandler for App {
                             self.input.keys.insert(code);
                             self.input.pending_keys.insert(code);
                             match code {
-                                KeyCode::Escape => {
-                                    if self.game.mode == Mode::MainMenu {
-                                        event_loop.exit();
-                                    } else {
-                                        self.game.nav_back = true;
-                                    }
-                                }
+                                // (nothing on the start screen - the user's choice, DECISIONS.md;
+                                // the window's close button quits)
+                                KeyCode::Escape if self.game.mode == Mode::MainMenu => {}
+                                KeyCode::Escape => self.game.nav_back = true,
                                 KeyCode::KeyX if self.game.replay.is_some() => self.game.nav_x = true,
                                 KeyCode::KeyY if self.game.replay.is_some() => self.game.nav_y = true,
                                 KeyCode::Backspace if self.game.replay.is_some() => self.game.nav_select = true,
@@ -8330,6 +8375,16 @@ impl ApplicationHandler for App {
             w.request_redraw();
         }
     }
+}
+
+/// SDL's gamepad layer; none (and a line in the log) when it does not start.
+fn open_pads() -> Option<pads::Pads> {
+    pads::Pads::new().map_err(|e| log::warn!("pad: SDL's gamepad layer did not start: {e}")).ok()
+}
+
+/// The pad being played with (`App::pad_id`), while it is connected; none before a pad was used.
+fn active_pad(g: &pads::Pads, id: Option<pads::PadId>) -> Option<&pads::Pad> {
+    id.and_then(|id| g.get(id))
 }
 
 fn parse_args() -> Options {

@@ -2154,8 +2154,9 @@ if keep || c.state.pos.distance(center) < 450.0 {
                 }
             } else if self.cars[i].is_player {
                 // (on the grid the player's own pedals go through under the hold: `CarInput::hold`)
-                // (the steering is written 0 on the grid, 0x8232EC8C)
-                CarInput { hold: self.grid_hold.is_some(), steer: 0.0, ..player_input }
+                // (the steering is written 0 on the grid, 0x8232EC8C - only there)
+                let hold = self.grid_hold.is_some();
+                CarInput { hold, steer: if hold { 0.0 } else { player_input.steer }, ..player_input }
             } else if let (Some(nav), true) = (world.nav.as_ref(), self.cars[i].ai.is_some()) {
                 // (the driver knows its car from the game's calibration tables, at this car's state of tune)
                 if self.cars[i].ai.as_ref().map_or(false, |a| a.tune.is_none()) && self.cars[i].state.veh.is_some() {

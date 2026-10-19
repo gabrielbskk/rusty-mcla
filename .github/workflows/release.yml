@@ -132,6 +132,7 @@ jobs:
         working-directory: mcla-rs
         env:
           RUSTUP_TOOLCHAIN: ${{ env.GNU_TOOLCHAIN }}
+          CMAKE_GENERATOR: MinGW Makefiles   # SDL3 is built from source by sdl3-sys (cmake) with the WinLibs gcc, not Visual Studio
         run: cargo build --release -p mcla
 
       - name: Package

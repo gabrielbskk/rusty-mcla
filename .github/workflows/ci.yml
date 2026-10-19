@@ -76,10 +76,14 @@ jobs:
 
       - name: Test (release)
         working-directory: mcla-rs
+        env:
+          CMAKE_GENERATOR: MinGW Makefiles   # SDL3 is built from source by sdl3-sys (cmake); never the runner's Visual Studio
         run: cargo test --release --workspace --no-fail-fast
 
       - name: Build the game and the tool (release)
         working-directory: mcla-rs
+        env:
+          CMAKE_GENERATOR: MinGW Makefiles
         run: cargo build --release -p mcla -p mcla-tool
 
   launcher:
