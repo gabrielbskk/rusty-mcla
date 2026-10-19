@@ -186,19 +186,24 @@ pub fn parse_stream(d: &[u8]) -> std::result::Result<Vec<Channel>, String> {
         let choff = r.u64(bo)?;
         let seekoff = r.u64(bo + 8)?;
         let mut counts = Vec::with_capacity(nch as usize);
+        let mut skips = Vec::with_capacity(nch as usize);
         for c in 0..nch {
             let base = bo + choff + c * 16;
             let _start = r.u32(base)?;
             let npk = r.u32(base + 4)? as u64;
-            let _skip = r.u32(base + 8)?;
+            let skip = r.u32(base + 8)?;
             let _ns = r.u32(base + 12)?;
             counts.push(npk);
+            skips.push(skip);
         }
         let total_seek: u64 = counts.iter().sum();
         let data0 = bo + ((seekoff + total_seek * 8 + 0x7FF) & !0x7FF);
         let mut p = data0;
         for c in 0..nch as usize {
-            chans[c].data.extend_from_slice(r.slice(p, counts[c] * 0x800));
+            // A block whose channel record has samples to skip starts with the previous block's
+            // last packet again (the frame across the boundary); the stream is the packets once.
+            let first = if skips[c] != 0 { 1.min(counts[c]) } else { 0 };
+            chans[c].data.extend_from_slice(r.slice(p + first * 0x800, (counts[c] - first) * 0x800));
             p += counts[c] * 0x800;
         }
     }
@@ -350,6 +355,20 @@ fn convert_bank(ff: &Path, data: &[u8], out_dir: &Path, names: &NameMap, problem
     let idx = out_dir.join("_index.tsv");
     std::fs::write(&idx, crlf(&lines)).ctx(idx.display())?;
     Ok((ok, waves.len()))
+}
+
+/// Remove every converted stream (`<name>.mp3` with its `<name>.mp3.txt`) below `dir`, so the next audio stage converts them again.
+pub fn remove_streams(dir: &Path) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            remove_streams(&p);
+        } else if let Some(mp3) = p.to_str().and_then(|s| s.strip_suffix(".mp3.txt")) {
+            let _ = std::fs::remove_file(format!("{mp3}.mp3"));
+            let _ = std::fs::remove_file(&p);
+        }
+    }
 }
 
 fn convert_stream(ff: &Path, data: &[u8], base_name: &str, out_path: &Path, names: &NameMap, problems: &Mutex<Vec<String>>, label: &str) -> Result<(usize, usize)> {
@@ -591,6 +610,36 @@ mod tests {
     fn short_bank_is_an_error() {
         assert!(parse_bank(&[0u8; 10]).is_err());
         assert!(parse_stream(&[0u8; 10]).is_err());
+    }
+
+    #[test]
+    fn stream_block_repeat_packet_is_dropped() {
+        // one channel, two blocks; the second has samples to skip and starts with the first
+        // block's last packet again (as in every music stream of the disc)
+        let (hdr, bsize) = (0x800u64, 0x2000u64);
+        let mut d = vec![0u8; (hdr + 2 * bsize) as usize];
+        d[8..12].copy_from_slice(&2u32.to_be_bytes());
+        d[12..16].copy_from_slice(&(bsize as u32).to_be_bytes());
+        d[0x18..0x1C].copy_from_slice(&0x40u32.to_be_bytes());
+        d[0x24..0x28].copy_from_slice(&1u32.to_be_bytes());
+        d[0x2C..0x30].copy_from_slice(&(hdr as u32).to_be_bytes());
+        d[0x48..0x4C].copy_from_slice(&0x1234u32.to_be_bytes());
+        d[0x5C..0x60].copy_from_slice(&0x1800u32.to_be_bytes()); // size: three packets
+        d[0x68..0x6A].copy_from_slice(&44100u16.to_be_bytes());
+        for (b, skip, pk) in [(0u64, 0u32, [1u8, 2]), (1, 700, [2, 3])] {
+            let bo = (hdr + b * bsize) as usize;
+            d[bo..bo + 8].copy_from_slice(&0x18u64.to_be_bytes());
+            d[bo + 8..bo + 16].copy_from_slice(&0x28u64.to_be_bytes());
+            d[bo + 0x1C..bo + 0x20].copy_from_slice(&2u32.to_be_bytes());
+            d[bo + 0x20..bo + 0x24].copy_from_slice(&skip.to_be_bytes());
+            for (i, v) in pk.iter().enumerate() {
+                let p = bo + 0x800 + i * 0x800;
+                d[p..p + 0x800].fill(*v);
+            }
+        }
+        let ch = parse_stream(&d).unwrap();
+        let firsts: Vec<u8> = ch[0].data.chunks(0x800).map(|p| p[0]).collect();
+        assert_eq!(firsts, vec![1, 2, 3]);
     }
 
     #[test]

@@ -22,8 +22,9 @@ const NAMES: &str = include_str!("../../../names.txt");
 
 /// The data version at which each stage's output last changed. When the manifest's `data_version` moves, the finished flags of the stages
 /// that did not change since the data was built are kept, so a rebuild runs only the new or changed stages (version 2 added "shaders":
-/// existing data keeps its extraction, audio and video and only translates the shader programs).
-const STAGE_SINCE: [(&str, u32); 4] = [("extract", 1), ("audio", 1), ("video", 1), ("shaders", 2)];
+/// existing data keeps its extraction, audio and video and only translates the shader programs; version 3 joins the streams' blocks without
+/// the packet each block repeats, so the streams are converted again).
+const STAGE_SINCE: [(&str, u32); 4] = [("extract", 1), ("audio", 3), ("video", 1), ("shaders", 2)];
 
 #[derive(Debug, Clone)]
 pub struct InstallOptions {
@@ -111,6 +112,10 @@ pub fn install(opts: &InstallOptions, ctx: &Ctx) -> Result<InstallOutcome> {
     } else if state.data_version != m.data_version {
         let old = state.data_version;
         state.done.retain(|k, _| STAGE_SINCE.iter().any(|(n, since)| n == k && old >= *since));
+        if old < 3 {
+            // the stream conversions are skipped when their files exist: remove the ones made with the old block joining
+            audio::remove_streams(&l.audio_pc());
+        }
         state.data_version = m.data_version;
         migrated = !state.done.is_empty();
     }

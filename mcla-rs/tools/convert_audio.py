@@ -111,14 +111,19 @@ def parse_stream(d):
         choff, = struct.unpack(">Q", d[bo:bo + 8])
         seekoff, = struct.unpack(">Q", d[bo + 8:bo + 16])
         counts = []
+        skips = []
         for c in range(nch):
-            _start, npk, _skip, _ns = struct.unpack(">IIII", d[bo + choff + c * 16:bo + choff + c * 16 + 16])
+            _start, npk, skip, _ns = struct.unpack(">IIII", d[bo + choff + c * 16:bo + choff + c * 16 + 16])
             counts.append(npk)
+            skips.append(skip)
         total_seek = sum(counts)
         data0 = bo + ((seekoff + total_seek * 8 + 0x7FF) & ~0x7FF)
         p = data0
         for c in range(nch):
-            chans[c]["data"] += d[p:p + counts[c] * 0x800]
+            # A block whose channel record has samples to skip starts with the previous block's
+            # last packet again (the frame across the boundary); the stream is the packets once.
+            first = 1 if skips[c] else 0
+            chans[c]["data"] += d[p + first * 0x800:p + counts[c] * 0x800]
             p += counts[c] * 0x800
     for c in chans:
         c["data"] = bytes(c["data"][:c["size"]]) if c["size"] else bytes(c["data"])
