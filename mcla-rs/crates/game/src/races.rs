@@ -34,6 +34,10 @@ pub struct RaceDef {
     pub car: String,
     /// "2x4_Race_Grid", "3x3_Race_Grid", ... (selects the start-line camera moves)
     pub grid_type: String,
+    /// `AllowRaceStarter 0`: the race script passes camOnly to the start-scene picker (prerace.rs)
+    pub no_starter: bool,
+    /// `SafetyCam 1`: the start scene comes from the table's Safety list
+    pub safety_cam: bool,
 }
 
 impl RaceDef {
@@ -141,6 +145,8 @@ fn parse(text: &str) -> Vec<RaceDef> {
                 }
             }
             "OpponentsAllowed" => r.opponents = f(0) as usize,
+            "AllowRaceStarter" => r.no_starter = f(0) == 0.0,
+            "SafetyCam" => r.safety_cam = f(0) != 0.0,
             "GridType" => {
                 if r.grid_type.is_empty() {
                     r.grid_type = vals.join(" ");

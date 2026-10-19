@@ -282,6 +282,8 @@ struct App {
     cine_caption: Option<String>,
     /// test hook MCLA_SHOT_AT_GO: taken
     shot_at_go: bool,
+    /// the original's start-scene picker (its shuffle bags last the session)
+    prerace_picker: Option<prerace::Picker>,
     /// seconds without input on the main menu (the attract movie starts after a while)
     idle: f32,
     /// start-line camera waiting for the grid's surroundings: frames waited
@@ -511,6 +513,7 @@ impl App {
             cine_results: false,
             cine_caption: None,
             shot_at_go: false,
+            prerace_picker: None,
             idle: 0.0,
             prerace_wait: 0,
             dive_at: None,
@@ -2299,18 +2302,24 @@ impl App {
                 self.dive_at = None;
                 self.game.prerace = None;
                 self.prerace_wait = 0;
-                // "2x4_Split_Race_Grid" -> "racestart/gen_prerace_grid_2x4_split_"
-                let key = grid.to_ascii_lowercase().replace("_race_grid", "");
-                let mut scenes = self.cine.scenes(&format!("racestart/gen_prerace_grid_{key}_"));
-                // the same grids also have scenes with the woman who starts the race
-                scenes.extend(self.cine.scenes(&format!("racestart/gen_prerace_starter_{key}_")));
-                if key == "2x4" {
-                    scenes.retain(|s| !s.contains("split"));
+                // the scene from the original's picker and table (prerace.rs): the grid's list or a taunt,
+                // the Safety list for SafetyCam races; none for a grid the table does not have
+                if self.prerace_picker.is_none() {
+                    self.prerace_picker = Some(prerace::Picker::new(prerace::GridTable::load(&self.opt.data_dir), (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u32)) ^ self.tick_no as u32));
                 }
-                if scenes.is_empty() {
-                    scenes = self.cine.scenes("racestart/gen_prerace_grid_2x4_0");
-                }
-                let pick = std::env::var("MCLA_PRERACE").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(self.tick_no as usize);
+                let (mut args, slots) = self.game.prerace_args.take().unwrap_or_else(|| (prerace::PickArgs { grid: grid.clone(), first_race: true, ..Default::default() }, [front, front]));
+                args.front_lr = slots.iter().any(|s| self.vehicles.cars.iter().any(|c| (c.state.pos - *s).with_y(0.0).length() < 1.5 && c.model.name.contains("_lr_")));
+                let picker = self.prerace_picker.as_mut().unwrap();
+                // (test hooks: MCLA_PRERACE=n plays the grid's n-th scene, MCLA_PRERACE_TAUNT=n the n-th taunt)
+                let forced = std::env::var("MCLA_PRERACE").ok().and_then(|v| v.parse::<usize>().ok()).map(|n| (picker.list(&args.grid), n))
+                    .or_else(|| std::env::var("MCLA_PRERACE_TAUNT").ok().and_then(|v| v.parse::<usize>().ok()).map(|n| (picker.list("Taunt"), n)));
+                let chosen = match forced {
+                    Some((l, n)) => l.get(n % l.len().max(1)).cloned(),
+                    None => picker.pick(&args),
+                };
+                log::info!("prerace pick: {:?} -> {:?}", args, chosen);
+                let mut scenes: Vec<String> = chosen.into_iter().filter(|s| !self.cine.scenes(s).is_empty()).collect();
+                let pick = 0usize;
                 let mut origin = glam::Mat4::from_rotation_translation(glam::Quat::from_rotation_y(yaw), front);
                 if let Some(sc) = self.game.prerace_scene.take() {
                     // a scene staged at this very place (a delivery's intro: the race core binds the
@@ -2371,6 +2380,23 @@ impl App {
                     if let Some(e) = self.cine.playing.as_ref().filter(|_| self.cine_prerace).and_then(|sc| prerace::events(&sc.name)) {
                         if let Some(r) = self.game.race.as_mut() {
                             r.countdown = (e.go() - t).max(0.0);
+                        }
+                    }
+                    // (test hook MCLA_CINE_OVERLAP=1: a start scene's people standing inside a racer's car -
+                    // root within 1.0 m of its sides and 2.4 m of its centre along it, a typical car)
+                    if self.cine_prerace && self.tick_no % 6 == 0 && std::env::var("MCLA_CINE_OVERLAP").is_ok() {
+                        let racers = self.game.race.as_ref().map(|r| r.participants.clone()).unwrap_or_default();
+                        for (label, p) in self.cine.actor_roots() {
+                            for &ci in &racers {
+                                let Some(c) = self.vehicles.cars.get(ci) else { continue };
+                                let f = c.state.forward();
+                                let f = Vec3::new(f.x, 0.0, f.z).normalize_or_zero();
+                                let d = p - c.state.pos;
+                                let (along, side) = (d.dot(f), d.dot(Vec3::new(-f.z, 0.0, f.x)));
+                                if along.abs() < 2.4 && side.abs() < 1.0 {
+                                    log::info!("cine overlap: t {:.2} {} in car {} ({}) along {:.2} side {:.2}", t, label, ci, if c.is_player { "player" } else { c.model.name.as_str() }, along, side);
+                                }
+                            }
                         }
                     }
                     // the cars are where the scene puts them

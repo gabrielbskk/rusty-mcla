@@ -330,6 +330,19 @@ impl Cine {
     }
 
     /// Labels of the cars the scene moves.
+    /// Where the playing scene's characters stand now: (label, root bone in world space).
+    pub fn actor_roots(&self) -> Vec<(String, Vec3)> {
+        let Some(sc) = self.playing.as_ref() else { return Vec::new() };
+        let mut local: Vec<(Quat, Vec3)> = Vec::new();
+        sc.actors.iter().map(|a| {
+            let f = a.clip.anim.frame_at(sc.t);
+            a.clip.local(&a.model.bones, f, &mut local);
+            let (mt, mr) = a.clip.mover(f);
+            let root = local.first().map_or(Vec3::ZERO, |l| l.1);
+            (a.label.clone(), (sc.origin * Mat4::from_rotation_translation(mr, mt)).transform_point3(root))
+        }).collect()
+    }
+
     pub fn movers(&self) -> Vec<String> {
         self.playing.as_ref().map(|s| s.movers.iter().map(|m| m.label.clone()).collect()).unwrap_or_default()
     }

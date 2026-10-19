@@ -771,8 +771,11 @@ pub struct Game {
     pub movie: Option<crate::video::Video>,
     /// set when a movie has just ended or was skipped
     pub movie_done: bool,
-    /// a race has just been set up: (front row centre, grid yaw, grid type) for the start-line camera
+    /// a race has just been set up: (grid slot 0, grid yaw, grid type) for the start-line camera
     pub prerace: Option<(Vec3, f32, String)>,
+    /// what the race hands the start-scene picker (prerace.rs `PickArgs`; `front_lr` is filled when the
+    /// scene starts) and the places of grid slots 0 and 1
+    pub prerace_args: Option<(crate::prerace::PickArgs, [Vec3; 2])>,
     /// the scene is still loading: all black
     pub cine_black: bool,
     /// results screen: state of the career event the race belonged to, and its next race
@@ -1184,6 +1187,7 @@ impl Game {
             movie: None,
             movie_done: false,
             prerace: None,
+            prerace_args: None,
             cine_black: false,
             event_line: String::new(),
             next_event_race: None,
@@ -2738,8 +2742,16 @@ impl Game {
             RaceKind::Race => def.opponents.clamp(1, 7).min(def.grid.len().saturating_sub(1)),
         };
         if kind == RaceKind::Race {
-            let front = def.grid.get(1).map_or(def.grid[0].0, |g| (g.0 + def.grid[0].0) * 0.5);
+            // (the race core scripts bind the start scene to RaceGrid_GetPosition(grid, 0) and its
+            // heading - CineScript_SetGameCoordSysBinding, OrderedCheckpointCore / UnorderedCheckpointCore)
+            let front = if std::env::var("MCLA_PRERACE_MID").is_ok() { def.grid.get(1).map_or(def.grid[0].0, |g| (g.0 + def.grid[0].0) * 0.5) } else { def.grid[0].0 };
             self.prerace = Some((if n_opp == 0 { def.grid[0].0 } else { front }, def.grid[0].1, if n_opp == 0 { "1x1_Race_Grid".to_string() } else { def.grid_type.clone() }));
+            // (the race scripts: SafetyCam 1 -> the Safety list; no opponents -> grid 0, 1x1; camOnly =
+            // !AllowRaceStarter; a first race = a single race or a series' first round)
+            let grid = if def.safety_cam { "Safety".to_string() } else if n_opp == 0 { "1x1_Race_Grid".to_string() } else { def.grid_type.clone() };
+            let first_race = self.series.as_ref().map_or(true, |s| s.at == 0);
+            let slot1 = def.grid.get(1).map_or(def.grid[0].0, |g| g.0);
+            self.prerace_args = Some((crate::prerace::PickArgs { grid, first_race, cam_only: def.no_starter, front_lr: false }, [def.grid[0].0, slot1]));
         }
         // the player starts at the back of the field, like the original
         let pslot = n_opp.min(def.grid.len() - 1);
