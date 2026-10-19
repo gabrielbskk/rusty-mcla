@@ -7156,11 +7156,23 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                 }
                 // (brake lamps glow by day too)
                 self.vehicles.draw_glows(&mut pass, &gpu);
-                self.fx.draw(&mut pass, &gpu);
-                rain::draw(&mut pass);
             }
             pass.set_pipeline(&gpu.pipeline_blend);
             pass.set_bind_group(3, &gpu.identity_obj.bg, &[]);
+        }
+        if !map3d {
+            // (the particles and the rain in a pass of their own, the depth read-only: the
+            // checkpoint smoke reads it for its soft fade - PSCheckpointProj)
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("particles"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: gpu.post.scene_view(), resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &gpu.depth, depth_ops: None, stencil_ops: None }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_bind_group(0, &gpu.globals_bg, &[]);
+            self.fx.draw(&mut pass, &gpu);
+            rain::draw(&mut pass);
         }
         {
             // the original's post chain, tuned by the weather's keys; the radial blur follows the speed

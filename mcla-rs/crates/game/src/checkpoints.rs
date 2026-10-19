@@ -888,6 +888,11 @@ mod tests {
         let k = r.color.eval(0.5)[0];
         assert_eq!(((k * 255.0).floor(), (k * 0.713_725_5 * 255.0).floor(), (k * 0.098_039_22 * 255.0).floor()), (72.0, 51.0, 7.0));
         assert_eq!((p.color.eval(1.0)[0] * 255.0).floor(), 52.0);
+        // (the effect's own ZoomKF: 39.07 % on every particle's size and on the domains - the
+        // original's low smoke measured at ZoomKF x SizeKFOT x SizeKF, residual 0)
+        let e = &fx.effects[fx.effect("checkpoint_ctf_generic").unwrap()];
+        let z = e.zoom.eval(0.5);
+        assert!((z[0] - 39.06976).abs() < 1e-3 && (z[1] - 39.06976).abs() < 1e-3, "{:?}", z);
     }
 
     #[test]

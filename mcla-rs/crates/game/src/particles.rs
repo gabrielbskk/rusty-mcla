@@ -186,6 +186,8 @@ struct Effect {
     evo: [f32; 4],
     /// the checkpoint render setup's +48 (EffectPos.w): the projected arrows are on
     arrow: bool,
+    /// the instance's random number for its `ZoomKF` (instance byte 492)
+    zr: f32,
 }
 
 struct Rng(u32);
@@ -210,6 +212,9 @@ pub struct Particles {
     binds: Vec<Option<Arc<wgpu::BindGroup>>>,
     additive: Vec<bool>,
     buf: Option<wgpu::Buffer>,
+    /// the scene's depth for the particles' bind group 2 (made again every frame: the depth
+    /// target is remade when the window changes size)
+    depth_bg: Option<wgpu::BindGroup>,
     /// instance ranges per sheet after the last `prepare`
     ranges: Vec<(u32, u32)>,
     rng: u32,
@@ -289,6 +294,7 @@ impl Particles {
         Particles {
             list: Vec::new(),
             binds: vec![None; KINDS],
+            depth_bg: None,
             additive: SHEETS.iter().map(|s| s.3).collect(),
             buf: None,
             ranges: vec![(0, 0); KINDS],
@@ -483,12 +489,13 @@ impl Particles {
         }
         let mut rng = Rng(self.rng);
         let (dur, rate) = (rng.range(rule.duration[0], rule.duration[1]).max(0.01), rng.range(rule.time_scalar[0], rule.time_scalar[1]));
+        let zr = rng.f();
         self.rng = rng.0;
         let id = self.next_id;
         self.next_id += 1;
         // (for looking at an effect in a screenshot: where in its loop it starts, 0..1)
         let t = std::env::var("MCLA_FX_PHASE").ok().and_then(|v| v.parse::<f32>().ok()).map_or(0.0, |v| v.clamp(0.0, 0.99));
-        self.effects.push(Effect { key, id, effect: ei, pos, rot, vel, moved: Vec3::ZERO, t, dur, rate: if rate > 0.0 { rate } else { 1.0 }, loops: 0, done: false, seen: self.frame, fade, em: Vec::new(), kids: Vec::new(), tint, alpha, shadow, evo, arrow: false });
+        self.effects.push(Effect { key, id, effect: ei, pos, rot, vel, moved: Vec3::ZERO, t, dur, rate: if rate > 0.0 { rate } else { 1.0 }, loops: 0, done: false, seen: self.frame, fade, em: Vec::new(), kids: Vec::new(), tint, alpha, shadow, evo, arrow: false, zr });
         true
     }
 
@@ -535,7 +542,7 @@ impl Particles {
                         // where: a point of the event's domain, in the parent's frame
                         let at = domain.as_ref().map_or(Vec3::ZERO, |d| d.centre(0.0) + d.point(0.0, &mut || rng.f()));
                         let id = e.id;
-                        e.kids.push(Effect { key: 0, id, effect: *k, pos: e.pos + e.rot * at, rot: e.rot, vel: e.vel, moved: Vec3::ZERO, t: 0.0, dur: rng.range(kr.duration[0], kr.duration[1]).max(0.01), rate: rng.range(kr.time_scalar[0], kr.time_scalar[1]).max(0.01), loops: 0, done: false, seen: 0, fade: e.fade, em: Vec::new(), kids: Vec::new(), tint: e.tint, alpha: e.alpha, shadow: e.shadow, evo: [0.0; 4], arrow: false });
+                        e.kids.push(Effect { key: 0, id, effect: *k, pos: e.pos + e.rot * at, rot: e.rot, vel: e.vel, moved: Vec3::ZERO, t: 0.0, dur: rng.range(kr.duration[0], kr.duration[1]).max(0.01), rate: rng.range(kr.time_scalar[0], kr.time_scalar[1]).max(0.01), loops: 0, done: false, seen: 0, fade: e.fade, em: Vec::new(), kids: Vec::new(), tint: e.tint, alpha: e.alpha, shadow: e.shadow, evo: [0.0; 4], arrow: false, zr: rng.f() });
                     }
                     _ => {}
                 }
@@ -609,7 +616,11 @@ impl Particles {
         if em.t >= 1.0 {
             em.playing = false;
         }
-        let (uid, zoom, pscale) = (em.uid, em.zoom, e.rate * em.tsc * ts);
+        // (the zoom: the event's x the effect's own ZoomKF / 100 now - instance +500 x emitter
+        // +244, on sizes and domains; taken at the particle's birth here)
+        let ez = fx.effects[e.effect].zoom.eval(e.t);
+        let ez = if fx.effects[e.effect].zoom.keys.is_empty() { 1.0 } else { lerp(ez[0], ez[1], e.zr) * 0.01 };
+        let (uid, zoom, pscale) = (em.uid, em.zoom * ez, e.rate * em.tsc * ts);
         self.rng = rng.0;
         let Some(look) = self.looks[*pi].as_ref().filter(|_| live && n > 0) else { return };
         let ncards = look.cards.len();
@@ -946,6 +957,11 @@ impl Particles {
 
     /// Build the instance buffer (sorted by sheet, far to near inside a sheet).
     pub fn prepare(&mut self, gpu: &Gpu, cam: Vec3) {
+        self.depth_bg = Some(gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("particle depth"),
+            layout: &gpu.particle_depth_layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&gpu.depth) }],
+        }));
         for r in self.ranges.iter_mut() {
             *r = (0, 0);
         }
@@ -1030,7 +1046,9 @@ impl Particles {
                     let (du, dv) = (1.0 / s.tiles_x as f32, 1.0 / s.tiles_y as f32);
                     uv = [(f % s.tiles_x) as f32 * du, (f / s.tiles_x) as f32 * dv, du, dv];
                     let f0 = p.frame0 as u32 % (s.tiles_x * s.tiles_y);
-                    uv2 = [(f0 % s.tiles_x) as f32 * du, (f0 / s.tiles_x) as f32 * dv, p.anim, 0.0];
+                    // (w: the low smoke's soft fade - technique "draw" of mc4_rmptfx_projected)
+                    let soft = if projected && s.technique == "draw" { 1.0 } else { 0.0 };
+                    uv2 = [(f0 % s.tiles_x) as f32 * du, (f0 / s.tiles_x) as f32 * dv, p.anim, soft];
                     rot = p.theta;
                     if pr.flags & flag::DRAW_DIRECTIONAL != 0 {
                         // along its velocity, as the billboard sees it
@@ -1102,8 +1120,9 @@ impl Particles {
     }
 
     pub fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, gpu: &'a Gpu) {
-        let Some(buf) = self.buf.as_ref() else { return };
+        let (Some(buf), Some(dbg)) = (self.buf.as_ref(), self.depth_bg.as_ref()) else { return };
         pass.set_vertex_buffer(0, buf.slice(..));
+        pass.set_bind_group(2, dbg, &[]);
         for k in 0..self.binds.len().min(self.ranges.len()) {
             let (start, n) = self.ranges[k];
             let Some(bind) = self.binds[k].as_ref() else { continue };

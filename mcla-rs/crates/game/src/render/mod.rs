@@ -522,6 +522,7 @@ pub struct Gpu {
     pub env_glow_buf: wgpu::Buffer,
     pub pipeline_particle: wgpu::RenderPipeline,
     pub pipeline_particle_add: wgpu::RenderPipeline,
+    pub particle_depth_layout: wgpu::BindGroupLayout,
     /// sun shadow map
     pub shadow_view: wgpu::TextureView,
     pub shadow_buf: wgpu::Buffer,
@@ -1518,9 +1519,20 @@ impl Gpu {
             label: Some("particle"),
             source: wgpu::ShaderSource::Wgsl(include_str!("particle.wgsl").into()),
         });
+        // (the scene's depth, read by the checkpoint smoke's soft fade - PSCheckpointProj's
+        // DepthMapTexSampler; the particles' pass holds the depth read-only)
+        let particle_depth_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("particle depth"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+                count: None,
+            }],
+        });
         let particle_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("particle pl"),
-            bind_group_layouts: &[&globals_layout, &tex_layout],
+            bind_group_layouts: &[&globals_layout, &tex_layout, &particle_depth_layout],
             push_constant_ranges: &[],
         });
         let make_particle = |additive: bool| {
@@ -1746,6 +1758,7 @@ impl Gpu {
             env_glow_buf,
             pipeline_particle,
             pipeline_particle_add,
+            particle_depth_layout,
             shadow_view,
             shadow_buf,
             shadow_bg,

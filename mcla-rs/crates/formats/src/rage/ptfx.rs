@@ -712,6 +712,10 @@ pub struct EffectRule {
     pub fade_distance: f32,
     pub lod_near: f32,
     pub lod_far: f32,
+    /// +0x58 `ZoomKF` (per cent, x..y by a random number of the instance, over the effect's
+    /// time): scales every particle's size and the emitter / velocity domains with the event's
+    /// zoom (`sub_824B1058` 0x824B13AC -> instance +500; `sub_824BB3E8` 0x824BB670)
+    pub zoom: Keyframe,
     pub events: Vec<Event>,
     /// +100 -> `PtxEvoGroup`: the effect's evolutions by name (the instance keeps a value for
     /// each, `sub_8247A6A0`; "LOD" is set from the camera's distance, `sub_824B1058`)
@@ -758,7 +762,7 @@ impl FxList {
                     events.push(Event { time: rd.f32(e + 0x08), cap: rd.u32(e + 0x18) as i32, kind, evo: rd.ptr(e + 0x0c).map(|g| EvoGroup::parse(&rd, g)) });
                 }
             }
-            effects.push(EffectRule { name: rd.cstr_ptr(o + 0xf8).unwrap_or_default(), duration: [rd.f32(o + 0x15c), rd.f32(o + 0x160)], time_scalar: [rd.f32(o + 0x164), rd.f32(o + 0x168)], pre_update: rd.f32(tl + 0x08), num_loops: rd.u32(tl + 0x0c) as i32, cull_distance: rd.f32(o + 0x14c), fade_distance: rd.f32(o + 0x144), lod_near: rd.f32(o + 0x150), lod_far: rd.f32(o + 0x154), events, evo_names: rd.ptr(o + 0x100).map(|g| EvoGroup::parse(&rd, g).names).unwrap_or_default() });
+            effects.push(EffectRule { name: rd.cstr_ptr(o + 0xf8).unwrap_or_default(), duration: [rd.f32(o + 0x15c), rd.f32(o + 0x160)], time_scalar: [rd.f32(o + 0x164), rd.f32(o + 0x168)], pre_update: rd.f32(tl + 0x08), num_loops: rd.u32(tl + 0x0c) as i32, cull_distance: rd.f32(o + 0x14c), fade_distance: rd.f32(o + 0x144), lod_near: rd.f32(o + 0x150), lod_far: rd.f32(o + 0x154), zoom: Keyframe::parse(&rd, o + 0x58), events, evo_names: rd.ptr(o + 0x100).map(|g| EvoGroup::parse(&rd, g).names).unwrap_or_default() });
         }
         Ok(FxList { effects, emit_rules, particle_rules, effect_hashes: df.hashes.clone() })
     }

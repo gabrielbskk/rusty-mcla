@@ -41,6 +41,8 @@ fn to_scene(d: vec3<f32>) -> vec3<f32> {
 // the projected arrows' four textures, checkpoint_arrows_anim_0..3 one above the other
 // (particles.rs `arrow_atlas`; the effect sheets' second texture)
 @group(1) @binding(2) var t_arrow: texture_2d<f32>;
+// the scene's depth (reversed z), for PSCheckpointProj's soft fade
+@group(2) @binding(0) var t_depth: texture_depth_2d;
 
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
@@ -60,6 +62,7 @@ struct VsOut {
     @location(8) @interpolate(flat) ad: vec4<f32>,
     // (the sprite's frame A uv - `uv` is frame B - and the blend between them)
     @location(9) uva: vec3<f32>,
+    @location(10) @interpolate(flat) soft: f32,
 };
 
 @vertex
@@ -93,6 +96,7 @@ fn vs_particle(
     o.clip = g.view_proj * vec4<f32>(wp, 1.0);
     o.uv = uv_rect.xy + (corner * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5)) * uv_rect.zw;
     o.uva = vec3<f32>(uv2.xy + (corner * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5)) * uv_rect.zw, uv2.z);
+    o.soft = uv2.w;
     // smoke takes the light of the scene, flames and sparks glow on their own
     let light = g.ambient_sky.rgb * 0.9 + g.sun_color.rgb * g.sun_dir.w * 0.35;
     o.color = vec4<f32>(color.rgb * mix(vec3<f32>(1.0), light, select(misc.w, 0.0, misc.w > 1.5)), color.a);
@@ -222,6 +226,24 @@ fn arrow_add(in: VsOut) -> vec3<f32> {
     return max(arrow_map(uv, in.ab) * in.ac.w * in.ac.xyz, vec3<f32>(0.0));
 }
 
+// PSCheckpointProj's soft fade: sat(0.1 d^2), d = the scene's view depth at the pixel (its depth
+// map through NearFarPlane) - the particle's clip z (the original's projection: near 0.2, far
+// 6000, clip z = (view depth - 0.2) x f / (f - n)).
+fn soft_fade(in: VsOut) -> f32 {
+    if (in.soft < 0.5) {
+        return 1.0;
+    }
+    let px = vec2<i32>(in.clip.xy);
+    let d = textureLoad(t_depth, px, 0);
+    let ndc = vec2<f32>(in.clip.x / f32(textureDimensions(t_depth).x) * 2.0 - 1.0, 1.0 - in.clip.y / f32(textureDimensions(t_depth).y) * 2.0);
+    // (the scene's view depth = the clip w of the point under the pixel: 1 / w of its unprojection)
+    let h = g.inv_view_proj * vec4<f32>(ndc, d, 1.0);
+    let zs = select(1e6, 1.0 / h.w, abs(h.w) > 1e-9);
+    let zp = (in.pc.z - 0.2) * (6000.0 / 5999.8);
+    let dd = zs - zp;
+    return clamp(0.1 * dd * dd, 0.0, 1.0);
+}
+
 fn tonemap(c: vec3<f32>) -> vec3<f32> {
     let x = c * g.params.z;
     return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), vec3<f32>(0.0), vec3<f32>(1.0));
@@ -240,7 +262,7 @@ fn fs_particle(in: VsOut) -> @location(0) vec4<f32> {
         // own linear value - into the HDR target as the original writes it, not a display colour)
         let ta = mix(t_a.a, t.a, clamp(in.uva.z, 0.0, 1.0));
         let c = clamp(mix(in.extra.rgb, in.color.rgb * in.extra.w, ta), vec3<f32>(0.0), vec3<f32>(1.0)) + arrow_add(in);
-        return vec4<f32>(c, clamp(2.0 * ta * in.color.a, 0.0, 1.0));
+        return vec4<f32>(c, clamp(2.0 * ta * in.color.a, 0.0, 1.0) * soft_fade(in));
     }
     let pr = 1.0 - abs(in.prof.x);
     let a = t.a * in.color.a * mix(1.0, pr * pr, in.prof.y);
