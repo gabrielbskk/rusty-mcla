@@ -77,10 +77,6 @@ mod fillmap;
 /// 0.003. (approx.: the port's car origin taken as the original's instance origin; was
 /// (0, 1.38, -0.25), fitted by eye)
 const PAUSE_FRAME: Vec3 = Vec3::new(0.0, 1.42, 0.08);
-/// how long a race's opening shot from the air lasts (ticks)
-const DIVE_TICKS: u32 = 240;
-/// Placement on the grid -> start scene, 0.8 s (grid_hold_rule.md 1, AROUND HOLLYWOOD).
-const PLACE_TICKS: u32 = 48;
 mod rivals;
 mod rubber;
 mod vehicle_model;
@@ -314,7 +310,12 @@ struct App {
     /// start-line camera waiting for the grid's surroundings: frames waited
     prerace_wait: u32,
     /// the grid the opening shot comes down on (its front, its heading)
-    dive_at: Option<(Vec3, f32)>,
+    /// the race-start warp (hudmap::CineWarp), its elapsed time, its view (eye, look, up, fov radians)
+    warp: Option<hudmap::CineWarp>,
+    warp_t: f32,
+    warp_view: Option<(Vec3, Vec3, Vec3, f32)>,
+    /// the start scene chosen when the pre-race begins (the warp lands on its camera)
+    prerace_plan: Option<(Vec<String>, glam::Mat4)>,
     starter_was: bool,
     /// the delivery's place opens its panel (again once the car has been away)
     delivery_armed: bool,
@@ -435,6 +436,44 @@ impl App {
     /// A start scene begins (`BeginDescription` / `EndDescriptionAndStartClock`): its racer events armed, a
     /// taunt scene's speech prepared - the hookman (slot 1) speaks in the voice of his driver's character
     /// (CareerVoices.xml); when it is prepared, slot 0's left and slot 1's right windows go down at once.
+    /// The race's start scene from the original's picker and table (prerace.rs) and where it is staged.
+    fn prerace_choose(&mut self, front: Vec3, yaw: f32, grid: &str) -> (Vec<String>, glam::Mat4) {
+        let grid = grid.to_string();
+        // the scene from the original's picker and table (prerace.rs): the grid's list or a taunt,
+        // the Safety list for SafetyCam races; none for a grid the table does not have
+        if self.prerace_picker.is_none() {
+            self.prerace_picker = Some(prerace::Picker::new(prerace::GridTable::load(&self.opt.data_dir), (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u32)) ^ self.tick_no as u32));
+        }
+        let (mut args, slots) = self.game.prerace_args.take().unwrap_or_else(|| (prerace::PickArgs { grid: grid.clone(), first_race: true, ..Default::default() }, [front, front]));
+        args.front_lr = slots.iter().any(|s| self.vehicles.cars.iter().any(|c| (c.state.pos - *s).with_y(0.0).length() < 1.5 && c.model.name.contains("_lr_")));
+        let picker = self.prerace_picker.as_mut().unwrap();
+        // (test hooks: MCLA_PRERACE=n plays the grid's n-th scene, MCLA_PRERACE_TAUNT=n the n-th taunt)
+        let forced = std::env::var("MCLA_PRERACE").ok().and_then(|v| v.parse::<usize>().ok()).map(|n| (picker.list(&args.grid), n))
+            .or_else(|| std::env::var("MCLA_PRERACE_TAUNT").ok().and_then(|v| v.parse::<usize>().ok()).map(|n| (picker.list("Taunt"), n)));
+        let replay = std::mem::take(&mut self.prerace_replay).then(|| self.prerace_last.clone()).flatten().filter(|l| l.0 == self.game.current_race).map(|l| l.1);
+        let chosen = match (forced, replay) {
+            (Some((l, n)), _) => l.get(n % l.len().max(1)).cloned(),
+            (None, Some(again)) => Some(again),
+            (None, None) => picker.pick(&args),
+        };
+        if let Some(c) = chosen.as_ref() {
+            self.prerace_last = Some((self.game.current_race, c.clone()));
+        }
+        log::info!("prerace pick: {:?} -> {:?}", args, chosen);
+        let mut scenes: Vec<String> = chosen.into_iter().filter(|s| !self.cine.scenes(s).is_empty()).collect();
+        let pick = 0usize;
+        let mut origin = glam::Mat4::from_rotation_translation(glam::Quat::from_rotation_y(yaw), front);
+        if let Some(sc) = self.game.prerace_scene.take() {
+            // a scene staged at this very place (a delivery's intro: the race core binds the
+            // scene's coordinates to RaceGrid_GetPosition(grid, 0) -
+            // CineScript_SetGameCoordSysBinding, OrderedCheckpointCore 0x0F50)
+            if hudmap::delivery_intro(&sc).is_none() {
+                origin = glam::Mat4::IDENTITY;
+            }
+            scenes = vec![sc];
+        }
+        (scenes, origin)
+    }
     fn prerace_acts_begin(&mut self, scene: &str) {
         let events = prerace::slot_events(scene);
         let duration = self.cine.playing.as_ref().map_or(0.0, |sc| sc.duration);
@@ -641,7 +680,10 @@ impl App {
             prerace_replay: false,
             idle: 0.0,
             prerace_wait: 0,
-            dive_at: None,
+            warp: None,
+            warp_t: 0.0,
+            warp_view: None,
+            prerace_plan: None,
             starter_was: false,
             delivery_armed: true,
             delivery_intro: None,
@@ -2438,65 +2480,65 @@ impl App {
                 }
             }
         }
-        // ---- start-line camera: one of the game's fly-bys over the grid before the countdown ----
+        // ---- the race's start: the original's warp onto the start scene, then the scene ----
         if self.game.race.is_none() {
             self.game.prerace = None;
             self.game.dive_k = 0.0;
-            self.dive_at = None;
+            self.warp = None;
+            self.warp_view = None;
+            self.prerace_plan = None;
+        }
+        // The flight (CAREER_RACES.md "Race start: the warp"): mcWarper (`sub_8221A440`, the cinematic
+        // request of ARCADE's START RACE) waits for the start scene, then `sub_82219DA0` flies the render
+        // camera to the scene's camera at scene t 1.0 (`sub_823C0D10`) with one of the cinematic
+        // transitions (`hudmap::CineWarp`); 1 s before it lands the scene may start (state 19), so the
+        // scene's clock runs at flight time - (T - 1) and the flight ends on its camera.
+        if let Some(w) = self.warp.as_mut() {
+            self.warp_t += dt;
+            match w.step(dt) {
+                Some((rows, fov)) => self.warp_view = Some((rows.eye, rows.look_point(), rows.r1, fov)),
+                None => {
+                    self.warp = None;
+                    self.warp_view = None;
+                }
+            }
         }
         if let Some((front, yaw, grid)) = self.game.prerace.clone() {
             self.prerace_wait += 1;
             if let Some(r) = self.game.race.as_mut() {
+        self.game.dive_k = if self.warp_view.is_some() { 1.0 } else { 0.0 };
                 r.countdown = r.countdown.max(4.4);
             }
-            // The race opens from the air: the camera comes down out of the sky onto the
-            // grid, the race's badge up for the last of it (references `hg_acc_0`, `hg_acc_1`,
-            // `y_replay_intro`), before the grid's own scene. (approx.) four seconds; the
-            // path is by eye.
-            let dive = std::env::var("MCLA_NO_DIVE").is_err();
-            self.game.dive_k = if dive { (self.prerace_wait as f32 / DIVE_TICKS as f32).min(1.0) } else { 0.0 };
-            if dive {
-                self.dive_at = Some((front, yaw));
+            if self.prerace_plan.is_none() {
+                let plan = self.prerace_choose(front, yaw, &grid);
+                if std::env::var("MCLA_NO_DIVE").is_err() {
+                    if let Some((eye, fwd, up, fov)) = plan.0.first().and_then(|sc| self.cine.peek_camera(sc, plan.1, hudmap::CINE_HANDOVER)) {
+                        let look = (self.chase.look - self.chase.pos).normalize_or(Vec3::NEG_Z);
+                        let mut s = hudmap::CamRows::look_at(self.cam.pos, self.cam.pos + look, Vec3::Y);
+                        // (test hook MCLA_WARP_FROM=x,y,z,fx,fy,fz: the flight starts from that camera)
+                        let wf: Vec<f32> = std::env::var("MCLA_WARP_FROM").ok().map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_default();
+                        if wf.len() == 6 {
+                            let eye = Vec3::new(wf[0], wf[1], wf[2]);
+                            s = hudmap::CamRows::look_at(eye, eye + Vec3::new(wf[3], wf[4], wf[5]), Vec3::Y);
+                        }
+                        let e = hudmap::CamRows::look_at(eye, eye + fwd, up);
+                        let w = hudmap::CineWarp::new(s, e, Vec3::ZERO, self.cam.fov_y, fov);
+                        log::info!("race start warp: {:?} ({:.3} s) from {:?} to {:?} ({})", w.kind(), w.total(), s.eye, e.eye, plan.0[0]);
+                        self.warp = Some(w);
+                        self.warp_t = 0.0;
+                    }
+                }
+                self.prerace_plan = Some(plan);
             }
-            let waited = if dive { DIVE_TICKS } else { 25 };
-            if (self.prerace_wait > waited && world.streaming() == 0) || self.prerace_wait > waited + 400 {
-                self.game.dive_k = 0.0;
-                self.dive_at = None;
+            let ready = match self.warp.as_ref() {
+                Some(w) => self.warp_t >= w.total() - hudmap::CINE_HANDOVER,
+                None => (self.prerace_wait > 25 && world.streaming() == 0) || self.prerace_wait > 425,
+            };
+            if ready {
                 self.game.prerace = None;
                 self.prerace_wait = 0;
-                // the scene from the original's picker and table (prerace.rs): the grid's list or a taunt,
-                // the Safety list for SafetyCam races; none for a grid the table does not have
-                if self.prerace_picker.is_none() {
-                    self.prerace_picker = Some(prerace::Picker::new(prerace::GridTable::load(&self.opt.data_dir), (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u32)) ^ self.tick_no as u32));
-                }
-                let (mut args, slots) = self.game.prerace_args.take().unwrap_or_else(|| (prerace::PickArgs { grid: grid.clone(), first_race: true, ..Default::default() }, [front, front]));
-                args.front_lr = slots.iter().any(|s| self.vehicles.cars.iter().any(|c| (c.state.pos - *s).with_y(0.0).length() < 1.5 && c.model.name.contains("_lr_")));
-                let picker = self.prerace_picker.as_mut().unwrap();
-                // (test hooks: MCLA_PRERACE=n plays the grid's n-th scene, MCLA_PRERACE_TAUNT=n the n-th taunt)
-                let forced = std::env::var("MCLA_PRERACE").ok().and_then(|v| v.parse::<usize>().ok()).map(|n| (picker.list(&args.grid), n))
-                    .or_else(|| std::env::var("MCLA_PRERACE_TAUNT").ok().and_then(|v| v.parse::<usize>().ok()).map(|n| (picker.list("Taunt"), n)));
-                let replay = std::mem::take(&mut self.prerace_replay).then(|| self.prerace_last.clone()).flatten().filter(|l| l.0 == self.game.current_race).map(|l| l.1);
-                let chosen = match (forced, replay) {
-                    (Some((l, n)), _) => l.get(n % l.len().max(1)).cloned(),
-                    (None, Some(again)) => Some(again),
-                    (None, None) => picker.pick(&args),
-                };
-                if let Some(c) = chosen.as_ref() {
-                    self.prerace_last = Some((self.game.current_race, c.clone()));
-                }
-                log::info!("prerace pick: {:?} -> {:?}", args, chosen);
-                let mut scenes: Vec<String> = chosen.into_iter().filter(|s| !self.cine.scenes(s).is_empty()).collect();
+                let (scenes, origin) = self.prerace_plan.clone().unwrap_or_default();
                 let pick = 0usize;
-                let mut origin = glam::Mat4::from_rotation_translation(glam::Quat::from_rotation_y(yaw), front);
-                if let Some(sc) = self.game.prerace_scene.take() {
-                    // a scene staged at this very place (a delivery's intro: the race core binds the
-                    // scene's coordinates to RaceGrid_GetPosition(grid, 0) -
-                    // CineScript_SetGameCoordSysBinding, OrderedCheckpointCore 0x0F50)
-                    if hudmap::delivery_intro(&sc).is_none() {
-                        origin = glam::Mat4::IDENTITY;
-                    }
-                    scenes = vec![sc];
-                }
                 let p080_sc = scenes.get(pick % scenes.len().max(1)).cloned().unwrap_or_default();
                 if !scenes.is_empty() && std::env::var("MCLA_NO_CINE").is_err() && self.cuts.playing.is_none() && self.cine.start(&mut gpu, &scenes[pick % scenes.len()], origin) {
                     self.cine_free = true;
@@ -2512,6 +2554,9 @@ impl App {
                 }
             }
         }
+                    if let (Some(w), Some(sc)) = (self.warp.as_ref(), self.cine.playing.as_mut()) {
+                        sc.t = (self.warp_t - (w.total() - hudmap::CINE_HANDOVER)).max(0.0);
+                    }
         if self.cine.playing.is_some() {
             let t = if self.cine_free {
                 let skip = (self.cine_caption.is_some() && std::mem::take(&mut self.game.nav_enter)) || (self.cine_prerace && self.game.race.is_none()) || (self.cine_results && self.game.mode != Mode::Results);
@@ -2545,12 +2590,13 @@ impl App {
                         self.cine_caption = (t >= e.racename && t < e.racename + e.racename_len).then(|| self.game.race.as_ref().map(|r| r.name.to_uppercase().replace('_', " ")).unwrap_or_default());
                     }
                     // a grid / starter / taunt scene: GO 3 s after its countdown event, the badge from its
-                    // racename event for 2 s (as the delivery intros), no HUD before the countdown (prerace.rs)
+                    // racename event for that event's own duration (2 - 2.033 s; form 70 shown at its start,
+                    // closed at its end - as the delivery intros), no HUD before the countdown (prerace.rs)
                     if let Some(e) = self.cine.playing.as_ref().filter(|_| self.cine_prerace).and_then(|sc| prerace::events(&sc.name)) {
                         if let Some(r) = self.game.race.as_mut() {
                             r.countdown = (e.go() - t).max(0.0);
                         }
-                        self.cine_caption = (e.racename >= 0.0 && t >= e.racename && t < e.racename + 2.0).then(|| self.game.race.as_ref().map(|r| r.name.to_uppercase().replace('_', " ")).unwrap_or_default());
+                        self.cine_caption = (e.racename >= 0.0 && t >= e.racename && t < e.racename + e.racename_len).then(|| self.game.race.as_ref().map(|r| r.name.to_uppercase().replace('_', " ")).unwrap_or_default());
                         self.game.scene_hud_off = t < e.countdown;
                     }
                     // (test hook MCLA_CINE_OVERLAP=1: a start scene's people standing inside a racer's car -
@@ -2713,6 +2759,31 @@ impl App {
             // (test hook MCLA_RACE_END_SHOTS=<dir>;t1,t2,...: pictures t seconds after the line,
             // the camera logged in the car's frame - x right, y up, z rear)
             if let (Ok(v), Some(t)) = (std::env::var("MCLA_RACE_END_SHOTS"), self.game.race_end_t) {
+            // (test hook MCLA_RACE_START_SHOTS=<dir>;t1,t2,...: pictures t seconds after the race-start warp
+            // began, the camera logged)
+            if let Ok(v) = std::env::var("MCLA_RACE_START_SHOTS") {
+                static NEXT_S: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                static CLOCK: std::sync::Mutex<Option<f32>> = std::sync::Mutex::new(None);
+                let mut clock = CLOCK.lock().unwrap();
+                if self.warp.is_some() && clock.is_none() {
+                    *clock = Some(self.warp_t);
+                } else if let Some(c) = clock.as_mut() {
+                    *c += dt;
+                }
+                if let Some(t) = *clock {
+                    let (dir, ts) = v.split_once(';').unwrap_or((".", v.as_str()));
+                    let ts: Vec<f32> = ts.split(',').filter_map(|x| x.parse().ok()).collect();
+                    let n = NEXT_S.load(std::sync::atomic::Ordering::Relaxed);
+                    if let Some(&due) = ts.get(n) {
+                        if t >= due && self.photo_request.is_none() {
+                            NEXT_S.store(n + 1, std::sync::atomic::Ordering::Relaxed);
+                            let car = self.vehicles.player().map(|c| c.state.pos).unwrap_or_default();
+                            log::info!("race start shot {} at {:.3} s: eye {:.2} {:.2} {:.2} (car + {:.2} {:.2} {:.2}) look {:.2} {:.2} {:.2} fov {:.1} scene {:?} countdown {:.2}", n, t, self.chase.pos.x, self.chase.pos.y, self.chase.pos.z, self.chase.pos.x - car.x, self.chase.pos.y - car.y, self.chase.pos.z - car.z, self.chase.look.x, self.chase.look.y, self.chase.look.z, self.cam.fov_y.to_degrees(), self.cine.playing.as_ref().map(|sc| (sc.name.clone(), sc.t)), self.game.race.as_ref().map_or(-1.0, |r| r.countdown));
+                            self.photo_request = Some(format!("{}/rs_{:02}_{:05}.png", dir, n, (t * 1000.0) as u32));
+                        }
+                    }
+                }
+            }
                 static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
                 let (dir, ts) = v.split_once(';').unwrap_or((".", v.as_str()));
                 let ts: Vec<f32> = ts.split(',').filter_map(|x| x.parse().ok()).collect();
@@ -3220,7 +3291,7 @@ impl App {
             // (the original places the racers 0.8 s before its start scene begins - the player's engine
             // starts with the scene, grid_hold_rule.md 1; the port's dive in front of the scene stands for
             // the arrival, so the racers are held with no pedals until 0.8 s before its end)
-            self.vehicles.grid_wait = self.game.prerace.is_some() && self.game.dive_k > 0.0 && self.prerace_wait + PLACE_TICKS < DIVE_TICKS;
+            self.vehicles.grid_wait = self.game.prerace.is_some() && self.warp.is_some();
             if std::env::var("MCLA_STUCK_DUMP").is_ok() && self.tick_no % 60 == 0 {
                 if let Some(race) = self.game.race.as_ref().filter(|r| r.time > 6.0) {
                     for &ci in race.participants.iter().skip(1) {
@@ -5018,16 +5089,9 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                 } else {
                     replay_view
                 };
-                let replay_view = match self.dive_at.filter(|_| self.game.dive_k > 0.0 && self.game.race.is_some()) {
-                    Some((front, yaw)) => {
-                        let k = self.game.dive_k;
-                        let e = (1.0 - (std::f32::consts::PI * k).cos()) * 0.5;
-                        let back = glam::Quat::from_rotation_y(yaw) * Vec3::Z;
-                        let side = glam::Quat::from_rotation_y(yaw) * Vec3::X;
-                        let high = front + back * 260.0 + side * 120.0 + Vec3::Y * 520.0;
-                        let low = front + back * 6.0 + Vec3::Y * 58.0;
-                        Some((high.lerp(low, e), front, 50.0))
-                    }
+                // (the race-start warp: hudmap::CineWarp, roll included)
+                let replay_view = match self.warp_view.filter(|_| self.game.race.is_some()) {
+                    Some((eye, look, _, fov)) => Some((eye, look, fov.to_degrees())),
                     None => replay_view,
                 };
                 if let Some((eye, look, fov)) = replay_view {
@@ -5065,6 +5129,9 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                     let right = Vec3::new(-fwd.z, 0.0, fwd.x);
                     let dir = fwd * a.cos() + right * a.sin();
                     let ext = (car.model.max - car.model.min).length().max(4.0);
+                    if let Some((_, _, up, _)) = self.warp_view.filter(|_| self.game.race.is_some()) {
+                        self.boom_up = Some(up);
+                    }
                     let mut dist = (ext * 1.65).max(8.0);
                     let mut up = (0.34 * ext).max(1.6);
                     self.cam.fov_y = 50f32.to_radians();
@@ -5399,7 +5466,9 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
             }
         }
         self.chase.up = self.boom_up.unwrap_or(Vec3::Y);
-        if let Some((eye, fwd, up, fov)) = self.cine.camera() {
+        // (the race-start warp keeps the picture until it lands on the scene's camera, though the scene
+        // already runs for its last second - mcWarper state 19 / 29)
+        if let Some((eye, fwd, up, fov)) = self.cine.camera().filter(|_| self.warp_view.is_none()) {
             self.chase.pos = eye;
             self.chase.look = eye + fwd;
             self.chase.up = up;

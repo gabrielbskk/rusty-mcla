@@ -338,9 +338,35 @@ impl Cine {
         self.buf.clear();
     }
 
+    /// A scene's camera at scene time `t` without starting it (the race-start warp flies to the start
+    /// scene's camera at t 1.0 before the scene plays - `sub_823C0D10`): (eye, forward, up, vertical
+    /// field of view in radians) through `origin`.
+    pub fn peek_camera(&self, scene: &str, origin: Mat4, t: f32) -> Option<(Vec3, Vec3, Vec3, f32)> {
+        let key = scene.to_ascii_lowercase();
+        for (name, f) in self.index.get(&key)? {
+            if !name.to_ascii_lowercase().ends_with("/cscamera") {
+                continue;
+            }
+            let Ok(res) = load_resource_file(f) else { continue };
+            let rd = Rd::new(&res);
+            for (o, n) in pack_entries(&res) {
+                if n != *name {
+                    continue;
+                }
+                let anim = animation_named(&rd, o)?;
+                let sc = Scene { name: key.clone(), camera: Some(Arc::new(anim)), actors: Vec::new(), movers: Vec::new(), duration: 0.0, t, origin };
+                return Self::scene_camera(&sc);
+            }
+        }
+        None
+    }
+
     /// Camera at the scene's time: (eye, forward, up, vertical field of view in radians).
     pub fn camera(&self) -> Option<(Vec3, Vec3, Vec3, f32)> {
-        let sc = self.playing.as_ref()?;
+        Self::scene_camera(self.playing.as_ref()?)
+    }
+
+    fn scene_camera(sc: &Scene) -> Option<(Vec3, Vec3, Vec3, f32)> {
         let cam = sc.camera.as_ref()?;
         let f = cam.frame_at(sc.t);
         let pos = cam.track(KIND_TRANSLATION, 0)?.data.vec(f);

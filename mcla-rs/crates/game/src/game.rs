@@ -595,6 +595,9 @@ pub struct Game {
     pub althk: crate::althk::RaceState,
     /// the race's badge is up over its opening shot
     pub start_badge_on: bool,
+    /// the badge going: the popup movie fades its own `cur_alpha` out (template_StartOfRace: 10 a frame
+    /// at 30 frames a second) after `cur_visibility` 0, so it is drawn on until that reaches 0
+    pub start_badge_out: bool,
     /// the paint shop's PAINT OPTIONS: PARTS, the PAINT AREA worked on (`PAINT_AREAS`), and
     /// the body's own colour while another area's is in the shop's hands
     pub paint_parts: bool,
@@ -1114,6 +1117,7 @@ impl Game {
             event_diff: None,
             althk: Default::default(),
             start_badge_on: false,
+            start_badge_out: false,
             paint_parts: false,
             paint_area: 0,
             paint_body: None,
@@ -7552,9 +7556,31 @@ impl Game {
                         }
                     }
                     self.start_badge_on = true;
+                    self.start_badge_out = false;
                 } else if std::mem::take(&mut self.start_badge_on) {
                     if let Some(fp) = self.flash_popup.as_mut() {
                         fp.hide();
+                    }
+                    self.start_badge_out = true;
+                }
+                // the badge's fade: the popup movie's own clip event (`cur_visibility` 1: `cur_alpha` += 10 a
+                // frame to 100; 0: -= 10 - 5 only for template_CutsceneTitile -, the movie disabled at 0),
+                // 1/3 s each way at the movie's 30 frames a second - drawn on after the racename event ends
+                if self.start_badge_out && !self.start_badge_on {
+                    let dt = ctx.input(|i| i.stable_dt).min(0.1);
+                    match self.flash_popup.as_mut() {
+                        Some(fp) if !fp.is_shown() => {
+                            fp.movie.player.update(dt);
+                            fp.movie.paint(ctx, &ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("cine"))));
+                            let a = fp.movie.player.get_path("cur_alpha").map_or(0.0, |v| v.to_f32());
+                            if std::env::var("MCLA_BADGE_LOG").is_ok() {
+                                log::info!("badge fade out: cur_alpha {:.0}", a);
+                            }
+                            if a <= 0.0 {
+                                self.start_badge_out = false;
+                            }
+                        }
+                        _ => self.start_badge_out = false,
                     }
                 }
                 // a race's start scene: no HUD before its countdown event, the race HUD (map and 3-2-1)

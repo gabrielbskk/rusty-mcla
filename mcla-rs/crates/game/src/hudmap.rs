@@ -2980,6 +2980,378 @@ impl NavExit {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// The cinematic warps (race start from the map: mcWarper `sub_8221A440` / `sub_82219DA0`,
+// `work/career2/re_start/notes.md`, rule_exitcam.md "Cinematic warps (race start)")
+
+/// The start scene begins (`sub_8221BE98` state 19 clears cineMgr+293 = IsGameReadyForScene) when the
+/// flight's time reaches `total - CINE_HANDOVER` (`+260 + 1e-4 >= T - 30 * frame_dt` = T - 1.0 s at the
+/// original's 30 Hz). The flight's end E is the scene camera at scene t = 1.0 (`sub_823C0D10`, req+3 = 0),
+/// so scene t = flight time - (total - CINE_HANDOVER) and the flight lands on the scene camera exactly when
+/// it is over; from then on the camera is the scene's.
+pub const CINE_HANDOVER: f32 = 1.0;
+
+/// Which cinematic warp (`sub_82219678` with req+9 = 1, the `Warp_*_Cinematically` states of
+/// tune/ui/transitions/Main.sc.xml).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CineKind {
+    /// Warp_HighAltitude_Cinematically (Main.sc.xml l.37; 3.0 s, no easing)
+    HighAltitude,
+    /// Warp_LowAltitude_FarAway_Cinematically (l.107; 5.25 s)
+    LowAltitudeFarAway,
+    /// Warp_CloseToTarget (l.601; 2.033 s, a UITransition_Lerp)
+    CloseToTarget,
+    /// Warp_AboveCar_Cinematically (l.316; 3.0 s)
+    AboveCar,
+    /// Warp_SharpAngle_Cinematically (l.268; 3.033 s)
+    SharpAngle,
+    /// Warp_SouthSideCloseCar_Cinematically (l.227; 3.033 s)
+    SouthSideCloseCar,
+}
+
+impl CineKind {
+    /// `sub_82219678`, req+9 = 1: S = the render camera (playerMgr+0x513E0), E = the start scene's camera
+    /// at scene t 1.0; h = S.y, dist = |flat(S - E)|, f30 = sangle(E.r2, S.r2) as `ExitKind::choose`.
+    /// Differs from the GPS tree: the f1 test is `f1 > 0.75 && f1 < -0.75` (never true) and an extra
+    /// `E.z > S.z -> AboveCar` comes before the f30 test (`0x8221980C..0x822198EC`). req+4 (forces
+    /// CloseToTarget) is 0 on the race start.
+    pub fn choose(s: &CamRows, e: &CamRows) -> CineKind {
+        let h = s.eye.y;
+        let d = s.eye - e.eye;
+        let dist = Vec3::new(d.x, 0.0, d.z).length();
+        let f30 = sangle0(e.r2, s.r2);
+        if h > 6000.0 {
+            CineKind::HighAltitude
+        } else if dist > 2000.0 {
+            CineKind::LowAltitudeFarAway
+        } else if dist < 100.0 && h < 200.0 {
+            CineKind::CloseToTarget
+        } else if (h < 6000.0 && dist < 0.25 * h + 600.0) || e.eye.z > s.eye.z {
+            CineKind::AboveCar
+        } else if f30.abs() > 2.5 {
+            CineKind::SharpAngle
+        } else {
+            CineKind::SouthSideCloseCar
+        }
+    }
+
+    /// The flight's length (the top node's real total, `sub_82228180`): max over the children of
+    /// delay + total with the times snapped by `ui_time`; equal to the Lean's own length in every state.
+    pub fn total(self) -> f32 {
+        match self {
+            CineKind::HighAltitude | CineKind::AboveCar => 3.0,
+            // (AxisStages' 1.5 + 3.75; LookAtTarget after the 3.75 Rotate y: + 1.5)
+            CineKind::LowAltitudeFarAway => 5.25,
+            // (Axis2Stages 1.5 + .55, the .55 snapped to 16/30; the Lerp's 2)
+            CineKind::CloseToTarget => 1.5 + ui_time(0.55),
+            // (Y 3.05 -> 91/30; Axis2Stages 2 + 1.05 -> 2 + 31/30)
+            CineKind::SharpAngle => ui_time(3.05),
+            // (AxisStages 2.5025 + .533866 -> 2.5 + 16/30; Axis2Stages 2.002 + 1.03436667 -> 2 + 31/30)
+            CineKind::SouthSideCloseCar => ui_time(2.5025) + ui_time(0.533_866),
+        }
+    }
+
+    /// The Lean's child clock at real time `t` (`sub_82229AA0`): ease_out C = T sin(pi t / 2T)
+    /// (LowAltitude, AboveCar, SharpAngle, SouthSide), ease_in_out C = T (1 - cos(pi t / T)) / 2
+    /// (CloseToTarget), none (HighAltitude: neither its Parallel nor its Lean has an easing).
+    fn clock(self, t: f32) -> f32 {
+        let tl = self.total();
+        let x = (t / tl).clamp(0.0, 1.0);
+        match self {
+            CineKind::HighAltitude => t.min(tl),
+            CineKind::CloseToTarget => tl * (1.0 - (PI * x).cos()) * 0.5,
+            _ => tl * (x * PI * 0.5).sin(),
+        }
+    }
+
+    fn lean_factor(self) -> f32 {
+        if self == CineKind::CloseToTarget {
+            0.0
+        } else {
+            20.0
+        }
+    }
+}
+
+/// The end-velocity part of the Translate_Axis profile (`sub_8222BF18` / `sub_82230908` with d = 0,
+/// v0 = 0, v1 = +404): `vm = -v1/2, a1 = -v1/T, a2 = 3v1/T` give p = v1 T h(u), h(u) = -u^2/2 (u <= 1/2),
+/// -1/8 - w/2 + 1.5 w^2 with w = u - 1/2; 0 at both ends, slope v1 at u = 1.
+fn ta_end(v1: f32, t: f32, tau: f32) -> f32 {
+    let u = (tau / t).clamp(0.0, 1.0);
+    let h = if u <= 0.5 {
+        -0.5 * u * u
+    } else {
+        let w = u - 0.5;
+        -0.125 - 0.5 * w + 1.5 * w * w
+    };
+    v1 * t * h
+}
+
+/// A cinematic warp flight from the render camera S to the start scene's camera E (`sub_82219DA0`):
+/// the chosen state with output warper+192, start S, end E, T.720(V = req+80, the scene camera's
+/// velocity from `sub_823C0F88`), and the lens's Lerp_Float (warper+292, `sub_82219B40`).
+///
+/// T.720 (Lean / Parallel `sub_822296E8`: every child; Serial `sub_8222A850`: 720 to its LAST child,
+/// 724 to all) gives every Translate_Axis that gets it the vector (+448, the target_velocity direction)
+/// and, with 720 (`sub_8222BBB8`), the end speed v1 = its projection (vfunc 860) - so with V != 0 the
+/// pieces arrive moving with the scene camera; the target_velocity Axis2Stages moves `-k` then `+k`
+/// along n(V) (net 0, the second stage ending at |V|). V = 0 adds nothing.
+/// Not handed in: the chooser's T.736 (the render camera's own velocity, playerMgr+0x51420) - assumed 0
+/// (the map camera at rest).
+#[derive(Clone)]
+pub struct CineWarp {
+    kind: CineKind,
+    s: CamRows,
+    e: CamRows,
+    vel: Vec3,
+    t: f32,
+    out: CamRows,
+    /// LookAtTarget's A (the render camera when it starts)
+    lat_a: Option<CamRows>,
+    /// Lean: history, last, previous out, its 30 Hz clock, roll
+    hist: [f32; 4],
+    last: f32,
+    prev: CamRows,
+    acc: f32,
+    lam: f32,
+    /// the outer Parallel's clock of the frame before (a delayed Translate_Axis shows 0 on the frame
+    /// that crosses its delay)
+    t_prev: f32,
+    lens: NavLens,
+}
+
+impl CineWarp {
+    /// `fov_from` = the current lens (warper+284), `fov_to` = the scene camera's (req+96); any unit.
+    pub fn new(s: CamRows, e: CamRows, vel: Vec3, fov_from: f32, fov_to: f32) -> CineWarp {
+        let kind = CineKind::choose(&s, &e);
+        let total = kind.total();
+        // Lerp_Float: 804(from), 812(to), 576(0.6 T) length, 580(0.3 T) delay, cosine ease (as NavLens)
+        let lens = NavLens { from: fov_from, to: fov_to, delay: 0.3 * total, dur: 0.6 * total, clock: 0.0, deg: fov_from };
+        if std::env::var("MCLA_NAV_LOG").is_ok() {
+            let d = s.eye - e.eye;
+            log::info!("cine warp: {:?} ({:.3} s) h {:.1} dist {:.1} f30 {:.4} from {:?} to {:?} vel {:?}", kind, total, s.eye.y, Vec3::new(d.x, 0.0, d.z).length(), sangle0(e.r2, s.r2), s.eye, e.eye, vel);
+        }
+        CineWarp { kind, s, e, vel, t: 0.0, out: s, lat_a: None, hist: [0.0; 4], last: 0.0, prev: s, acc: 0.0, lam: 0.0, t_prev: 0.0, lens }
+    }
+
+    pub fn kind(&self) -> CineKind {
+        self.kind
+    }
+
+    /// the flight's length (`CineKind::total`)
+    pub fn total(&self) -> f32 {
+        self.kind.total()
+    }
+
+    /// The eye at Lean clock `c`, outer (linear) clock `tl` (`tl_prev` = that clock a frame before).
+    fn eye_at(&self, c: f32, tl: f32, tl_prev: f32) -> Vec3 {
+        let (s, e, v) = (self.s, self.e, self.vel);
+        let flat = |v: Vec3| Vec3::new(v.x, 0.0, v.z);
+        let fl = flat_n(e.r2);
+        let moving = v != Vec3::ZERO;
+        let mut eye = match self.kind {
+            CineKind::HighAltitude => {
+                // Y (0, 3); Serial[along_final_look 500 (0, 2); Par[X, Z (0, 1)]]
+                let p = flat(e.eye) + fl * 500.0;
+                let xz = flat(s.eye) + (p - flat(s.eye)) * s_curve(c / 2.0) + (flat(e.eye) - p) * s_curve(c - 2.0);
+                let mut q = Vec3::new(xz.x, s.eye.y + (e.eye.y - s.eye.y) * s_curve(c / 3.0), xz.z);
+                if moving {
+                    // (Y: v1 = V.y; the Serial's last child, the Parallel, gives X / Z theirs)
+                    q += Vec3::new(ta_end(v.x, 1.0, c - 2.0), ta_end(v.y, 3.0, c), ta_end(v.z, 1.0, c - 2.0));
+                }
+                q
+            }
+            CineKind::LowAltitudeFarAway => {
+                // AxisStages('Y', 2500, 1.5, 3.75); Serial[along_final_look 100 (0, 4.5); Par[X, Z (0, .75)]]
+                // (.75 snaps to 22/30)
+                let t2 = ui_time(0.75);
+                let y = s.eye.y + (e.eye.y + 2500.0 - s.eye.y) * s_curve(c / 1.5) - 2500.0 * s_curve((c - 1.5) / 3.75);
+                let p = flat(e.eye) + fl * 100.0;
+                let xz = flat(s.eye) + (p - flat(s.eye)) * s_curve(c / 4.5) + (flat(e.eye) - p) * s_curve((c - 4.5) / t2);
+                let mut q = Vec3::new(xz.x, y, xz.z);
+                if moving {
+                    q += Vec3::new(ta_end(v.x, t2, c - 4.5), ta_end(v.y, 3.75, c - 1.5), ta_end(v.z, t2, c - 4.5));
+                }
+                q
+            }
+            CineKind::SouthSideCloseCar => {
+                // X, Z (0, 3.003 -> 3); AxisStages('Y', 100, 2.5025 -> 2.5, .533866 -> 16/30);
+                // Forward(+300 (0, 2.002 -> 2), -300 (0, 1))
+                let (txz, y1, y2, f1) = (ui_time(3.003), ui_time(2.5025), ui_time(0.533_866), ui_time(2.002));
+                let xz = flat(s.eye) + (flat(e.eye) - flat(s.eye)) * s_curve(c / txz);
+                let y = s.eye.y + (e.eye.y + 100.0 - s.eye.y) * s_curve(c / y1) - 100.0 * s_curve((c - y1) / y2);
+                let mut q = Vec3::new(xz.x, y, xz.z) + fl * (300.0 * s_curve(c / f1) - 300.0 * s_curve(c - f1));
+                if moving {
+                    q += Vec3::new(ta_end(v.x, txz, c), ta_end(v.y, y2, c - y1), ta_end(v.z, txz, c)) + fl * ta_end(fl.dot(v), 1.0, c - f1);
+                }
+                q
+            }
+            CineKind::SharpAngle => {
+                // UITransition_Translate_Spline_ExitSharpAngle total 3 (as ExitKind::SharpAngle, x = c / 3);
+                // Y (0, 3.05 -> 91/30)
+                let sign = if sangle0(e.r2, s.r2) >= 0.0 { 1.0 } else { -1.0 };
+                let (p0, p2) = (s.eye, e.eye);
+                let p1 = e.eye + e.r0.normalize_or(Vec3::X) * (100.0 * sign) - flat(e.eye - s.eye).normalize_or_zero() * 150.0;
+                let x = c / 3.0;
+                let q = if x < 0.9999 {
+                    let seg = (2.0 * x) as i32;
+                    let u = 2.0 * x - seg as f32;
+                    if seg == 0 {
+                        catmull([p0 * 2.0 - p1, p0, p1, p2], u)
+                    } else {
+                        catmull([p0, p1, p2, p2 * 2.0 - p1], u)
+                    }
+                } else {
+                    p2
+                };
+                let ty = ui_time(3.05);
+                let mut y = s.eye.y + (e.eye.y - s.eye.y) * s_curve(c / ty);
+                if moving {
+                    y += ta_end(v.y, ty, c);
+                }
+                Vec3::new(q.x, y, q.z)
+            }
+            CineKind::AboveCar => {
+                // X, Y, Z (0, 3); Forward(+300 (0, .75 -> 22/30), -300 (0, 2.25 -> 67/30))
+                let (f1, f2) = (ui_time(0.75), ui_time(2.25));
+                let mut q = s.eye + (e.eye - s.eye) * s_curve(c / 3.0) + fl * (300.0 * s_curve(c / f1) - 300.0 * s_curve((c - f1) / f2));
+                if moving {
+                    q += Vec3::new(ta_end(v.x, 3.0, c), ta_end(v.y, 3.0, c), ta_end(v.z, 3.0, c)) + fl * ta_end(fl.dot(v), f2, c - f1);
+                }
+                q
+            }
+            CineKind::CloseToTarget => {
+                // UITransition_Lerp (start `sub_822314D0`, update `sub_8222DE78`, `sub_8222DD28`): its own
+                // ease_in_out clock over 2 s on top of the Lean's; eye = S + (E - S) p
+                s.eye + (e.eye - s.eye) * self.lerp_p(c)
+            }
+        };
+        if moving {
+            // Axis2Stages('target_velocity', ..): 'set' -k (D1, T1) then +k (D2, T2) along n(V), the
+            // second stage ending at |V| (outside the Lean on the linear clock, inside it for SharpAngle
+            // and CloseToTarget)
+            let (k, d1, t1, d2, t2, ct, ct_prev) = match self.kind {
+                CineKind::HighAltitude | CineKind::AboveCar => (10.0, 0.0, 2.0, 0.0, 1.0, tl, tl_prev),
+                CineKind::LowAltitudeFarAway => (10.0, 0.0, 1.0, 3.25, 1.0, tl, tl_prev),
+                CineKind::SouthSideCloseCar => (10.0, 0.0, ui_time(2.002), 0.0, ui_time(1.034_366_7), tl, tl_prev),
+                CineKind::SharpAngle => (10.0, 0.0, 2.0, 0.0, ui_time(1.05), c, self.kind.clock(tl_prev)),
+                CineKind::CloseToTarget => (2.0, 0.0, 1.5, 0.0, ui_time(0.55), c, self.kind.clock(tl_prev)),
+            };
+            let s2 = d1 + t1 + d2;
+            let tau2 = if d2 > 0.0 && ct_prev < s2 { 0.0 } else { ct - s2 };
+            let p = -k * s_curve((ct - d1) / t1) + k * s_curve(tau2 / t2) + ta_end(v.length(), t2, tau2);
+            eye += v.normalize_or_zero() * p;
+        }
+        eye
+    }
+
+    /// The Lerp's progress at Lean clock `c`: (1 - cos(pi min(1, c / 2))) / 2 (its ease_in_out,
+    /// `sub_82227CE8`, total 2).
+    fn lerp_p(&self, c: f32) -> f32 {
+        (1.0 - (PI * (c / 2.0).clamp(0.0, 1.0)).cos()) * 0.5
+    }
+
+    /// One frame: the camera and the lens, or None once the flight is over (t >= total; the scene
+    /// camera, now at scene t 1.0 = E, takes over).
+    pub fn step(&mut self, dt: f32) -> Option<(CamRows, f32)> {
+        self.t += dt;
+        let total = self.kind.total();
+        if self.t >= total - 1e-4 {
+            return None;
+        }
+        let fov = self.lens.step(dt);
+        let c = self.kind.clock(self.t);
+        let t_prev = self.t_prev;
+        self.t_prev = self.t;
+        let (s, e) = (self.s, self.e);
+        let prev_eye = self.out.eye;
+        let cur = self.out;
+        let eye = self.eye_at(c, self.t, t_prev);
+        let ey = |r: CamRows| r.r2.x.atan2(r.r2.z);
+        // LookAtTarget (`sub_82231DA8`): from A toward looking at L = E.r3 + n(E.r2) target (796 sets
+        // +452 = 0: req+10 = 0) from the camera's last place, up E.r1, cosine weight over `ttl` (not
+        // snapped) from `d0`, w = 1 once its snapped delay + total `done` is passed
+        let look = |this: &mut CineWarp, a: CamRows, d0: f32, ttl: f32, done: f32, target: f32, delay_up: bool| {
+            let a = *this.lat_a.get_or_insert(a);
+            let l = e.eye + e.r2.normalize_or(Vec3::Z) * target;
+            let b = CamRows::look_at(prev_eye, l, e.r1);
+            let w = if c >= done { 1.0 } else { (1.0 - (PI * ((c - d0) / ttl).clamp(0.0, 1.0)).cos()) * 0.5 };
+            blend_rows(a, b, w, delay_up)
+        };
+        let mut out = match self.kind {
+            CineKind::HighAltitude => {
+                // LookAtTarget(1, 1, 2, -50, final_up, final_look, 1, delay_up_rotate)
+                if c >= 1.0 {
+                    look(self, cur, 1.0, 1.0, 3.0, -50.0, true)
+                } else {
+                    s
+                }
+            }
+            CineKind::LowAltitudeFarAway => {
+                // Serial[Par[Rotate x -1.370796 (0, 2.25 -> 67/30), Rotate y final_look (0, 3.75)];
+                //        LookAtTarget(0, 1.5, 1.5, -15)]
+                if c >= 3.75 {
+                    look(self, cur, 3.75, 1.5, 5.25, -15.0, false)
+                } else {
+                    let dx = -1.370_796 - (-s.r2.y).clamp(-1.0, 1.0).asin();
+                    let dy = wrap_pi(ey(e) - ey(s));
+                    s.pitch(dx * s_curve(c / ui_time(2.25))).roty(dy * s_curve(c / 3.75))
+                }
+            }
+            CineKind::SouthSideCloseCar => {
+                // LookAtTarget(0, 3.003, 3.003 -> 3, -50) from the render camera at the start
+                look(self, cur, 0.0, 3.003, ui_time(3.003), -50.0, false)
+            }
+            CineKind::SharpAngle => {
+                // LookAtTarget(0, 1.5015, 3.003 -> 3, -50)
+                look(self, cur, 0.0, 1.5015, ui_time(3.003), -50.0, false)
+            }
+            CineKind::AboveCar => {
+                // Serial[Rotate y final_look (0, 2.25 -> 67/30); LookAtTarget(0, .75, .75 -> 22/30, -50)]
+                let (tr, tlat) = (ui_time(2.25), ui_time(0.75));
+                let d = wrap_pi(ey(e) - ey(s));
+                if c >= tr {
+                    look(self, s.roty(d), tr, 0.75, tr + tlat, -50.0, false)
+                } else {
+                    s.roty(d * s_curve(c / tr))
+                }
+            }
+            CineKind::CloseToTarget => {
+                // the Lerp's rows: slerp of the start / end quaternions (`sub_821BA038`, shorter way,
+                // `sub_821D5BE8`)
+                let q = |r: CamRows| glam::Quat::from_mat3(&glam::Mat3::from_cols(r.r0, r.r1, r.r2)).normalize();
+                let m = glam::Mat3::from_quat(q(s).slerp(q(e), self.lerp_p(c)));
+                CamRows { r0: m.x_axis, r1: m.y_axis, r2: m.z_axis, eye }
+            }
+        };
+        out.eye = eye;
+        // Lean (`sub_8222ED38`) at 30 Hz, as NavExit
+        let lean_factor = self.kind.lean_factor();
+        self.acc += dt;
+        while self.acc >= 1.0 / 30.0 {
+            self.acc -= 1.0 / 30.0;
+            let d = sangle(self.prev.r2, out.r2);
+            self.prev = out;
+            self.lam = if c >= total - 0.5 {
+                (total - (c + 0.0333)).max(0.0) * 2.0 * self.last
+            } else {
+                let l = ((self.hist.iter().sum::<f32>() + lean_factor * d) / 5.0).clamp(-PI / 4.0, PI / 4.0);
+                self.hist.rotate_right(1);
+                self.hist[0] = l;
+                self.last = l;
+                l
+            };
+        }
+        let mut k = 2.0 * (1.0 - out.r2.y);
+        if !(0.0..=1.0).contains(&k) {
+            k = 1.0;
+        }
+        out = out.roll(k * self.lam.clamp(-PI / 4.0, PI / 4.0));
+        self.out = out;
+        Some((out, fov))
+    }
+}
+
 /// The opening's turn (Entering_Map_MaxHeight's Rotate children, rule_exitcam.md 7): from the game
 /// camera's rows `s`, at real time `t` of the 1.5 s move.
 pub fn nav_open_rows(s: CamRows, t: f32) -> CamRows {
@@ -3615,6 +3987,128 @@ mod tests {
         let m = rot_y(h, 1.0, Vec3::ZERO);
         let z = m.z_axis.truncate();
         assert!((z - Vec3::new(0.475, 0.0, -0.880).normalize()).length() < 1e-3);
+    }
+
+    /// st1 (work/career2/mk/rec/st1.txt): the map camera S and the start scene's camera at t 1.0 E
+    fn cine_st1() -> (CamRows, CamRows) {
+        let se = Vec3::new(819.61, 850.0, 491.59);
+        let ee = Vec3::new(-624.57, 28.22, -649.17);
+        (CamRows::look_at(se, se + Vec3::new(0.0, -0.539, -0.842), Vec3::Y), CamRows::look_at(ee, ee + Vec3::new(-0.722, -0.482, 0.497), Vec3::Y))
+    }
+
+    #[test]
+    fn cine_warp_choice_st1() {
+        let (s, e) = cine_st1();
+        assert_eq!(CineKind::choose(&s, &e), CineKind::SouthSideCloseCar);
+        let w = CineWarp::new(s, e, Vec3::ZERO, 40.0, 51.0);
+        assert!((w.total() - 91.0 / 30.0).abs() < 1e-6, "{}", w.total());
+        // (the other branches)
+        let ab = CamRows::look_at(Vec3::new(0.0, 850.0, 500.0), Vec3::new(0.0, 0.0, 400.0), Vec3::Y);
+        let e0 = CamRows::look_at(Vec3::ZERO, Vec3::new(0.0, 0.0, -10.0), Vec3::Y);
+        assert_eq!(CineKind::choose(&ab, &e0), CineKind::AboveCar);
+        let hi = CamRows::look_at(Vec3::new(0.0, 7000.0, 500.0), Vec3::new(0.0, 0.0, 400.0), Vec3::Y);
+        assert_eq!(CineKind::choose(&hi, &e0), CineKind::HighAltitude);
+        let far = CamRows::look_at(Vec3::new(0.0, 850.0, 2500.0), Vec3::new(0.0, 0.0, 2400.0), Vec3::Y);
+        assert_eq!(CineKind::choose(&far, &e0), CineKind::LowAltitudeFarAway);
+        let near = CamRows::look_at(Vec3::new(30.0, 50.0, 30.0), Vec3::ZERO, Vec3::Y);
+        assert_eq!(CineKind::choose(&near, &e0), CineKind::CloseToTarget);
+        // (E north of S and looking south-ish: |f30| > 2.5)
+        let south = CamRows::look_at(Vec3::new(0.0, 850.0, 1300.0), Vec3::new(0.0, 0.0, 1200.0), Vec3::Y);
+        let es = CamRows::look_at(Vec3::ZERO, Vec3::new(1.0, -0.5, 10.0), Vec3::Y);
+        assert_eq!(CineKind::choose(&south, &es), CineKind::SharpAngle);
+        // (E south of S: the extra E.z > S.z test)
+        let en = CamRows::look_at(Vec3::new(0.0, 0.0, 1500.0), Vec3::new(1.0, -0.5, 1490.0), Vec3::Y);
+        let sn = CamRows::look_at(Vec3::new(0.0, 850.0, 0.0), Vec3::new(0.0, 0.0, 100.0), Vec3::Y);
+        assert_eq!(CineKind::choose(&sn, &en), CineKind::AboveCar);
+    }
+
+    /// The eye path of st1 against the original's recorded render camera (flight start 4.68 s, samples
+    /// 4.721..7.749): nearest distance to the port's path (sim_warp.py's path mode). One sample (6.993:
+    /// car + (0, 2, 0) looking +z for one frame, not part of the flight) is off.
+    #[test]
+    fn cine_warp_eye_path_st1() {
+        let rec = [
+            (817.45, 847.47, 487.88), (814.75, 844.31, 483.25), (806.12, 834.21, 468.45), (800.20, 827.29, 458.30),
+            (785.20, 809.73, 432.57), (776.13, 799.12, 417.01), (754.92, 774.30, 380.63), (729.69, 744.77, 337.35),
+            (715.60, 728.29, 313.19), (684.57, 691.98, 259.96), (667.67, 672.19, 230.96), (631.17, 629.49, 168.37),
+            (611.46, 606.62, 134.96), (566.24, 557.98, 66.18), (540.70, 532.26, 30.94), (484.05, 478.37, -41.10),
+            (453.04, 451.94, -77.84), (385.93, 402.81, -152.62), (349.96, 380.05, -190.59), (274.90, 338.08, -266.45),
+            (274.90, 338.08, -266.45), (203.31, 300.66, -336.31), (169.24, 283.61, -368.70), (104.50, 252.67, -428.57),
+            (73.79, 238.74, -456.11), (15.60, 213.81, -506.63), (-11.91, 202.76, -529.67), (-63.92, 183.35, -571.51),
+            (-89.30, 174.92, -589.80), (-114.79, 167.31, -606.05), (-165.98, 154.40, -632.74), (-191.62, 149.05, -643.34),
+            (-217.25, 144.39, -652.22), (-268.32, 137.02, -665.16), (-293.70, 134.24, -669.37), (-318.94, 132.03, -672.18),
+            (-344.01, 130.36, -673.69), (-368.87, 129.19, -673.97), (-417.84, 128.23, -671.15), (-441.24, 127.76, -668.67),
+            (-482.30, 123.47, -664.30), (-500.15, 119.82, -662.40), (-530.98, 109.96, -659.12), (-555.93, 97.27, -656.47),
+            (-566.44, 90.07, -655.35), (-638.91, 20.21, -636.81), (-591.12, 67.36, -652.73), (-602.71, 55.54, -651.49),
+            (-607.28, 50.74, -651.01), (-614.37, 43.06, -650.25), (-617.01, 40.04, -649.97), (-620.83, 35.41, -649.57),
+            (-622.13, 33.69, -649.43), (-623.77, 31.18, -649.25), (-624.21, 30.31, -649.21), (-624.57, 29.16, -649.17),
+            (-624.57, 28.81, -649.17), (-624.57, 28.41, -649.17), (-624.57, 28.31, -649.17), (-624.57, 28.23, -649.17),
+            (-624.57, 28.22, -649.17),
+        ];
+        let (s, e) = cine_st1();
+        let mut w = CineWarp::new(s, e, Vec3::ZERO, 40.0, 51.0);
+        let mut path = vec![s.eye];
+        while let Some((c, _)) = w.step(1.0 / 3000.0) {
+            path.push(c.eye);
+        }
+        path.push(e.eye);
+        let seg_d = |p: Vec3, a: Vec3, b: Vec3| {
+            let ab = b - a;
+            let u = if ab.length_squared() > 0.0 { ((p - a).dot(ab) / ab.length_squared()).clamp(0.0, 1.0) } else { 0.0 };
+            (a + ab * u - p).length()
+        };
+        let mut off = 0;
+        let mut worst = 0.0f32;
+        for (x, y, z) in rec {
+            let p = Vec3::new(x, y, z);
+            let d = path.windows(2).map(|q| seg_d(p, q[0], q[1])).fold(f32::MAX, f32::min);
+            if d > 0.1 {
+                off += 1;
+            } else {
+                worst = worst.max(d);
+            }
+        }
+        assert!(off <= 1, "{off} samples off the path");
+        assert!(worst < 0.1, "{worst}");
+    }
+
+    /// Every kind lands exactly on E (eye at the Lean's last clock; rows and lens on the last frame),
+    /// at rest and with a scene camera velocity handed in.
+    #[test]
+    fn cine_warp_every_kind_ends_on_e() {
+        let (st, est) = cine_st1();
+        let e0 = CamRows::look_at(Vec3::ZERO, Vec3::new(0.0, 0.0, -10.0), Vec3::Y);
+        let es = CamRows::look_at(Vec3::ZERO, Vec3::new(1.0, -0.5, 10.0), Vec3::Y);
+        let cases = [
+            (CamRows::look_at(Vec3::new(0.0, 7000.0, 500.0), Vec3::new(0.0, 0.0, 400.0), Vec3::Y), e0, CineKind::HighAltitude),
+            (CamRows::look_at(Vec3::new(0.0, 850.0, 2500.0), Vec3::new(0.0, 0.0, 2400.0), Vec3::Y), e0, CineKind::LowAltitudeFarAway),
+            (CamRows::look_at(Vec3::new(30.0, 50.0, 30.0), Vec3::ZERO, Vec3::Y), e0, CineKind::CloseToTarget),
+            (CamRows::look_at(Vec3::new(0.0, 850.0, 500.0), Vec3::new(0.0, 0.0, 400.0), Vec3::Y), e0, CineKind::AboveCar),
+            (CamRows::look_at(Vec3::new(0.0, 850.0, 1300.0), Vec3::new(0.0, 0.0, 1200.0), Vec3::Y), es, CineKind::SharpAngle),
+            (st, est, CineKind::SouthSideCloseCar),
+        ];
+        for (s, e, kind) in cases {
+            for vel in [Vec3::ZERO, Vec3::new(3.0, 0.5, -2.0)] {
+                let mut w = CineWarp::new(s, e, vel, 40.0, 51.0);
+                assert_eq!(w.kind(), kind);
+                let tt = w.total();
+                let end = w.eye_at(kind.clock(tt), tt, tt);
+                assert!((end - e.eye).length() < 1e-3, "{kind:?} {vel}: {end} vs {}", e.eye);
+                let mut last = None;
+                let mut n = 0;
+                while let Some(o) = w.step(1.0 / 600.0) {
+                    last = Some(o);
+                    n += 1;
+                }
+                assert!((n as f32 / 600.0 - tt).abs() < 2.0 / 600.0, "{kind:?}: {n} frames for {tt}");
+                let (c, fov) = last.unwrap();
+                assert!((c.eye - e.eye).length() < 0.05, "{kind:?} {vel}: {} vs {}", c.eye, e.eye);
+                for (a, b) in [(c.r0, e.r0), (c.r1, e.r1), (c.r2, e.r2)] {
+                    assert!(a.dot(b) > 0.9999, "{kind:?} {vel}: rows {a} vs {b}");
+                }
+                assert!((fov - 51.0).abs() < 1e-4, "{kind:?}: fov {fov}");
+            }
+        }
     }
 
     #[test]
