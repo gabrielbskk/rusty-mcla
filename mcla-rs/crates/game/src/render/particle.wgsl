@@ -58,6 +58,8 @@ struct VsOut {
     @location(6) @interpolate(flat) ab: vec4<f32>,
     @location(7) @interpolate(flat) ac: vec4<f32>,
     @location(8) @interpolate(flat) ad: vec4<f32>,
+    // (the sprite's frame A uv - `uv` is frame B - and the blend between them)
+    @location(9) uva: vec3<f32>,
 };
 
 @vertex
@@ -72,6 +74,7 @@ fn vs_particle(
     @location(6) arrow_b: vec4<f32>,
     @location(7) arrow_c: vec4<f32>,
     @location(8) arrow_d: vec4<f32>,
+    @location(9) uv2: vec4<f32>,       // frame A's u0, v0; the blend A -> B
 ) -> VsOut {
     var o: VsOut;
     let corner = vec2<f32>(f32((vi << 1u) & 2u), f32(vi & 2u)) - vec2<f32>(1.0);
@@ -89,6 +92,7 @@ fn vs_particle(
     let wp = pos_size.xyz + (right * r.x + up * r.y) * pos_size.w;
     o.clip = g.view_proj * vec4<f32>(wp, 1.0);
     o.uv = uv_rect.xy + (corner * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5)) * uv_rect.zw;
+    o.uva = vec3<f32>(uv2.xy + (corner * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5)) * uv_rect.zw, uv2.z);
     // smoke takes the light of the scene, flames and sparks glow on their own
     let light = g.ambient_sky.rgb * 0.9 + g.sun_color.rgb * g.sun_dir.w * 0.35;
     o.color = vec4<f32>(color.rgb * mix(vec3<f32>(1.0), light, select(misc.w, 0.0, misc.w > 1.5)), color.a);
@@ -140,14 +144,23 @@ fn arrow_quad(px: vec2<f32>, cz: f32, sz: f32, cx: f32, sx: f32) -> vec3<f32> {
     return vec3<f32>(-0.4 + 1.8 * (q.x + 12.0) / 24.0, 1.2 - 1.4 * (q.y + 12.0) / 24.0, 1.0);
 }
 
-// One texel of the target: the arrow texture (frame `f` of the four) where the quad covers it.
-fn arrow_texel(q: vec3<f32>, f: f32, lod: f32) -> vec3<f32> {
+// One texel of the target: the arrow texture (frame `f` of the four) where the quad covers it,
+// filtered as the target's draw samples it - linear, mips 0..4, 4:1 anisotropic (fetch dword 3
+// 0x06a80d10): `n` taps spread along the footprint's long axis `ax` (in u, v), at level `lod`.
+fn arrow_tap(u: vec2<f32>, f: f32, lod: f32) -> vec3<f32> {
+    let h = max(64.0 / exp2(lod), 1.0);
+    let v = clamp(clamp(u.y, 0.0, 1.0), 0.5 / h, 1.0 - 0.5 / h);
+    return textureSampleLevel(t_arrow, s_sprite, vec2<f32>(clamp(u.x, 0.0, 1.0), (f + v) * 0.25), lod).rgb;
+}
+fn arrow_texel(q: vec3<f32>, f: f32, lod: f32, ax: vec2<f32>, n: f32) -> vec3<f32> {
     if (q.z < 0.0) {
         return vec3<f32>(0.0);
     }
-    let h = max(64.0 / exp2(lod), 1.0);
-    let v = clamp(clamp(q.y, 0.0, 1.0), 0.5 / h, 1.0 - 0.5 / h);
-    return textureSampleLevel(t_arrow, s_sprite, vec2<f32>(clamp(q.x, 0.0, 1.0), (f + v) * 0.25), lod).rgb;
+    var c = vec3<f32>(0.0);
+    for (var i = 0; i < i32(n); i++) {
+        c += arrow_tap(q.xy + ax * ((f32(i) + 0.5) / n - 0.5), f, lod);
+    }
+    return c / n;
 }
 
 // ProjMapSampler at `uv` (bilinear over the target's texels).
@@ -165,14 +178,24 @@ fn arrow_map(uv: vec2<f32>, ab: vec4<f32>) -> vec3<f32> {
     let q10 = arrow_quad(vec2<f32>(b.x, a.y), cz, sz, cx, sx);
     let q01 = arrow_quad(vec2<f32>(a.x, b.y), cz, sz, cx, sx);
     let q11 = arrow_quad(b, cz, sz, cx, sx);
-    // (the level the target's own draw would take: the texture's step from one texel to the next)
+    // (the level the target's own draw would take, 4:1 anisotropic: the texture's step from one
+    // texel to the next along both axes - n = min(ceil(long / short), 4) taps along the long one,
+    // the level of long / n)
     var lod = 0.0;
+    var ax = vec2<f32>(0.0);
+    var n = 1.0;
     if (q00.z > 0.0 && q10.z > 0.0 && q01.z > 0.0) {
-        let dx = (q10.xy - q00.xy) * vec2<f32>(128.0, 64.0);
-        let dy = (q01.xy - q00.xy) * vec2<f32>(128.0, 64.0);
-        lod = clamp(log2(max(max(length(dx), length(dy)), 1e-4)), 0.0, 4.0);
+        let dx = q10.xy - q00.xy;
+        let dy = q01.xy - q00.xy;
+        let lx = length(dx * vec2<f32>(128.0, 64.0));
+        let ly = length(dy * vec2<f32>(128.0, 64.0));
+        let pmax = max(max(lx, ly), 1e-4);
+        let pmin = max(min(lx, ly), 1e-4);
+        n = clamp(ceil(pmax / pmin), 1.0, 4.0);
+        lod = clamp(log2(pmax / n), 0.0, 4.0);
+        ax = select(dy, dx, lx >= ly);
     }
-    let c = mix(mix(arrow_texel(q00, ab.z, lod), arrow_texel(q10, ab.z, lod), fr.x), mix(arrow_texel(q01, ab.z, lod), arrow_texel(q11, ab.z, lod), fr.x), fr.y);
+    let c = mix(mix(arrow_texel(q00, ab.z, lod, ax, n), arrow_texel(q10, ab.z, lod, ax, n), fr.x), mix(arrow_texel(q01, ab.z, lod, ax, n), arrow_texel(q11, ab.z, lod, ax, n), fr.x), fr.y);
     return c;
 }
 
@@ -208,12 +231,16 @@ fn tonemap(c: vec3<f32>) -> vec3<f32> {
 @fragment
 fn fs_particle(in: VsOut) -> @location(0) vec4<f32> {
     let t = textureSample(t_sprite, s_sprite, in.uv);
+    let t_a = textureSample(t_sprite, s_sprite, in.uva.xy);
     // (the column's PS_Draw: alpha x (1 - 2 |v - 0.5|) squared)
     if (in.prof.y > 1.5) {
-        // (the checkpoint smoke, mc4_rmptfx_projected's PSCheckpoint: lerp(ShadowColor, colour x
-        // boost, texture alpha), alpha = sat(2 x texture alpha x colour alpha))
-        let c = clamp(mix(in.extra.rgb, in.color.rgb * in.extra.w, t.a), vec3<f32>(0.0), vec3<f32>(1.0)) + arrow_add(in);
-        return vec4<f32>(to_scene(c), clamp(2.0 * t.a * in.color.a, 0.0, 1.0));
+        // (the checkpoint smoke, mc4_rmptfx_projected's PSCheckpoint: the texture's alpha from
+        // frames A and B by the blend, lerp(ShadowColor, colour x boost, it), alpha = sat(2 x it x
+        // colour alpha); the projected arrows added on top, unclamped. The output is the scene's
+        // own linear value - into the HDR target as the original writes it, not a display colour)
+        let ta = mix(t_a.a, t.a, clamp(in.uva.z, 0.0, 1.0));
+        let c = clamp(mix(in.extra.rgb, in.color.rgb * in.extra.w, ta), vec3<f32>(0.0), vec3<f32>(1.0)) + arrow_add(in);
+        return vec4<f32>(c, clamp(2.0 * ta * in.color.a, 0.0, 1.0));
     }
     let pr = 1.0 - abs(in.prof.x);
     let a = t.a * in.color.a * mix(1.0, pr * pr, in.prof.y);

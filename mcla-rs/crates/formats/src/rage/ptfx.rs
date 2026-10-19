@@ -253,6 +253,11 @@ pub mod flag {
     /// the animation runs once through `frame_start..=anim_end` over the particle's life
     pub const SCALE_TEX_ANIM_RATE_BY_LIFE: u32 = 1 << 21;
     pub const HOLD_LAST_TEX_FRAME: u32 = 1 << 22;
+    /// sprite: the colour lies between `ColorKF` and `ColorMaxKF` by a random number of the
+    /// particle; without it `ColorMaxKF` is not read (`sub_824B5728` 0x824B5834, the bit from
+    /// `sub_824BB3E8` 0x824BB6B8; model particles: bit 7, `sub_824B6E40` 0x824B6FD4)
+    pub const RANDOM_COLOR: u32 = 1 << 23;
+    pub const MODEL_RANDOM_COLOR: u32 = 1 << 7;
     /// the acceleration is multiplied by the event's zoom
     pub const ZOOM_ACCELERATION: u32 = 1 << 26;
 }

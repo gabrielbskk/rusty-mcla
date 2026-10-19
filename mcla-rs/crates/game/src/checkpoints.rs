@@ -879,6 +879,15 @@ mod tests {
         assert_eq!(v("ArrowColorTint"), [1.0, 1.0, 1.0, 0.0]);
         let p = fx.particle_rules.iter().find(|r| r.name == "rage_flare_smoke_plume").unwrap();
         assert_eq!(p.sprite.as_ref().unwrap().technique, "draw_noarrow");
+        // (both smokes: no random-colour bit - their vertices carry ColorKF x the tint, as the
+        // original's vertex buffer shows: [A, 72, 51, 7] for the low smoke with cp's tint)
+        for q in [r, p] {
+            assert_eq!(q.flags, 0x2d28_5388);
+            assert_eq!(q.flags & mcla_formats::rage::ptfx::flag::RANDOM_COLOR, 0);
+        }
+        let k = r.color.eval(0.5)[0];
+        assert_eq!(((k * 255.0).floor(), (k * 0.713_725_5 * 255.0).floor(), (k * 0.098_039_22 * 255.0).floor()), (72.0, 51.0, 7.0));
+        assert_eq!((p.color.eval(1.0)[0] * 255.0).floor(), 52.0);
     }
 
     #[test]

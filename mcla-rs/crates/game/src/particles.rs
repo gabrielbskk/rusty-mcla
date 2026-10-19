@@ -32,6 +32,9 @@ pub struct PInst {
     arrow_b: [f32; 4],
     arrow_c: [f32; 4],
     arrow_d: [f32; 4],
+    /// the rule's sprites: frame A's u0, v0 (`uv` holds frame B), the blend between them
+    /// (`blk+84`, vertex float 17 of `sub_825F8358`)
+    uv2: [f32; 4],
 }
 
 impl PInst {
@@ -48,6 +51,7 @@ impl PInst {
             wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 96, shader_location: 6 },
             wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 112, shader_location: 7 },
             wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 128, shader_location: 8 },
+            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 144, shader_location: 9 },
         ],
     };
 }
@@ -116,6 +120,8 @@ struct RuleParticle {
     r: [f32; 9],
     theta: f32,
     spin0: f32,
+    /// the texture frames it blends between (`blk+92` A, `blk+93` B) by `anim`
+    frame0: u8,
     frame: u8,
     anim: f32,
     /// the emit rule's factors at its birth (size x y; acceleration, damping x y z; matrix weight)
@@ -653,6 +659,7 @@ impl Particles {
                 r: [0.0; 9],
                 theta: 0.0,
                 spin0: 0.0,
+                frame0: 0,
                 frame: 0,
                 anim: 0.0,
                 size_ot: [sot[0] * 0.01, sot[1] * 0.01],
@@ -674,6 +681,7 @@ impl Particles {
             if let Some(s) = &pr.sprite {
                 // first frame, first turn (degrees), first spin (turns a second)
                 p.frame = (s.frame_start + (rng.f() * (s.frame_end - s.frame_start + 1) as f32) as i32).clamp(0, 255) as u8;
+                p.frame0 = p.frame;
                 let (th, rv) = (s.init_theta.eval(te), s.init_rot_vel.eval(te));
                 p.theta = rng.range(th[0], th[1]).to_radians();
                 p.spin0 = rng.range(rv[0], rv[1]) * std::f32::consts::TAU;
@@ -753,6 +761,8 @@ impl Particles {
                         } else {
                             p.frame as i32 + 1
                         };
+                        // (sub_824BE248: A takes B, B the next frame)
+                        p.frame0 = p.frame;
                         p.frame = next.clamp(0, 255) as u8;
                     }
                 }
@@ -962,7 +972,7 @@ impl Particles {
             } else {
                 (1.0, 1.0, p.rot)
             };
-            items.push((k as u32, p.pos.distance_squared(cam), PInst { pos_size: [p.pos.x, p.pos.y, p.pos.z, size], color: [p.color[0], p.color[1], p.color[2], p.color[3] * fade], uv: [fx as f32 * du, fy as f32 * dv, du, dv], misc: [rot, sx, sy, if matches!(p.kind, Kind::Smoke | Kind::Splash) { 1.0 } else { 0.0 }], extra: [0.0; 4], arrow_a: [0.0; 4], arrow_b: [0.0; 4], arrow_c: [0.0; 4], arrow_d: [0.0; 4] }));
+            items.push((k as u32, p.pos.distance_squared(cam), PInst { pos_size: [p.pos.x, p.pos.y, p.pos.z, size], color: [p.color[0], p.color[1], p.color[2], p.color[3] * fade], uv: [fx as f32 * du, fy as f32 * dv, du, dv], misc: [rot, sx, sy, if matches!(p.kind, Kind::Smoke | Kind::Splash) { 1.0 } else { 0.0 }], extra: [0.0; 4], arrow_a: [0.0; 4], arrow_b: [0.0; 4], arrow_c: [0.0; 4], arrow_d: [0.0; 4], uv2: [0.0; 4] }));
         }
         if let Some(fx) = self.fx.as_ref() {
             // (every effect instance's opacity and evolution values, by its id)
@@ -985,10 +995,17 @@ impl Particles {
                 };
                 let Some(card) = self.looks[p.rule as usize].as_ref().and_then(|l| l.cards.get(p.card as usize)) else { continue };
                 // colour between ColorKF and ColorMaxKF, alpha between AlphaKF's x and y
-                let mut c = v3(pev(0, pr.color.eval(p.t))).lerp(v3(pev(1, pr.color_max.eval(p.t))), p.r[1]);
+                // (`sub_824B5728`: ColorKF; between it and ColorMaxKF by a random number of the
+                // particle only with the rule's random-colour bit)
+                let mut c = v3(pev(0, pr.color.eval(p.t)));
+                if pr.flags & if pr.sprite.is_some() { flag::RANDOM_COLOR } else { flag::MODEL_RANDOM_COLOR } != 0 {
+                    c = c.lerp(v3(pev(1, pr.color_max.eval(p.t))), p.r[1]);
+                }
                 if pr.flags & 8 != 0 {
                     c *= Vec3::from(p.tint);
                 }
+                // (the vertex holds it as 8-bit A, R, G, B: clamped, x 255, truncated - `sub_821D2470`)
+                let c = (c.clamp(Vec3::ZERO, Vec3::ONE) * 255.0).floor() / 255.0;
                 // (`mc4_rmptfx_column`: turned about the up axis only, fading to its ends - the
                 // particle shader's mode 2)
                 let column = pr.sprite.as_ref().map_or(false, |s| s.shader == "mc4_rmptfx_column");
@@ -998,11 +1015,12 @@ impl Particles {
                 let projected = pr.sprite.as_ref().map_or(false, |s| s.shader == "mc4_rmptfx_projected");
                 let night = (4.0 * ((self.hour / 12.0 - 1.0).abs() - 0.4)).clamp(0.0, 1.0);
                 let a = pev(19, pr.alpha.eval(p.t));
-                let alpha = lerp(a[0], a[1], p.r[2]).clamp(0.0, 1.0) * p.fade * ialpha;
+                let alpha = ((lerp(a[0], a[1], p.r[2]) * p.fade * ialpha).clamp(0.0, 1.0) * 255.0).floor() / 255.0;
                 if alpha <= 0.002 {
                     continue;
                 }
                 let (w, h, uv, mut rot);
+                let mut uv2 = [0.0f32; 4];
                 if let Some(s) = &pr.sprite {
                     // SizeKF: half width x..z, half height y..w, one random number for both
                     let sz = pev(4, s.size.eval(p.t));
@@ -1011,6 +1029,8 @@ impl Particles {
                     let f = p.frame as u32 % (s.tiles_x * s.tiles_y);
                     let (du, dv) = (1.0 / s.tiles_x as f32, 1.0 / s.tiles_y as f32);
                     uv = [(f % s.tiles_x) as f32 * du, (f / s.tiles_x) as f32 * dv, du, dv];
+                    let f0 = p.frame0 as u32 % (s.tiles_x * s.tiles_y);
+                    uv2 = [(f0 % s.tiles_x) as f32 * du, (f0 / s.tiles_x) as f32 * dv, p.anim, 0.0];
                     rot = p.theta;
                     if pr.flags & flag::DRAW_DIRECTIONAL != 0 {
                         // along its velocity, as the billboard sees it
@@ -1056,7 +1076,7 @@ impl Particles {
                     arrow_c = [tint[0], tint[1], tint[2], boost];
                     arrow_d = [self.arrow_rt[2], tile, self.clock * rate, night];
                 }
-                items.push((card.sheet as u32, p.pos.distance_squared(cam), PInst { pos_size: [p.pos.x, p.pos.y, p.pos.z, h], color: [c.x, c.y, c.z, alpha], uv, misc: [rot, w / h, 1.0, lit], extra, arrow_a, arrow_b, arrow_c, arrow_d }));
+                items.push((card.sheet as u32, p.pos.distance_squared(cam), PInst { pos_size: [p.pos.x, p.pos.y, p.pos.z, h], color: [c.x, c.y, c.z, alpha], uv, misc: [rot, w / h, 1.0, lit], extra, arrow_a, arrow_b, arrow_c, arrow_d, uv2 }));
             }
         }
         items.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)));
