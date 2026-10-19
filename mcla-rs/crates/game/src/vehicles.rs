@@ -346,6 +346,9 @@ pub struct Vehicles {
     /// drivers at their pre-race antics (`AiDriver::grid_input`) - so revving and burnouts happen as
     /// in the original.
     pub grid_hold: Option<f32>,
+    /// under the grid hold, the racers are not placed yet (the port's dive in front of the start scene):
+    /// held by the grid rules with no pedals, the computer drivers' antics not begun (main.rs PLACE_TICKS)
+    pub grid_wait: bool,
     /// no car has its lamps on (VEHICLE SELECT: three cars standing in a lot)
     pub lights_off: bool,
     /// the finish of the player's rims by zone - spoke A, spoke B, lip (the rim meshes'
@@ -2009,6 +2012,8 @@ if keep || c.state.pos.distance(center) < 450.0 {
                     ai.reverse_timer = 0.0;
                 }
                 CarInput { brake: 1.0, ..Default::default() }
+            } else if let (Some(_), true) = (self.grid_hold, self.grid_wait) {
+                CarInput { hold: true, ..Default::default() }
             } else if let (Some(to_go), false) = (self.grid_hold, self.cars[i].is_player) {
                 // (on the grid: a computer driver's pre-race antics - a burst at placement, revving
                 // against the brake, burnouts, the one it holds to GO)

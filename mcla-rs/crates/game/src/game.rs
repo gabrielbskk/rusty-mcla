@@ -564,6 +564,8 @@ pub struct Game {
     pub starter_swap: Option<String>,
     /// a race's opening shot from the air is on: how far through it is (0 = not)
     pub dive_k: f32,
+    /// race time stepped since the last UI frame: the HUD's 3-2-1 runs on it, so it stays on the race clock
+    pub ui_sim_dt: f32,
     /// the hangout pulled into, by its key in the string table (`hw_local_hangout1` ...),
     /// the difficulty chosen on its panel, and the difficulty an event was accepted at
     pub hangout_key: Option<String>,
@@ -1078,6 +1080,7 @@ impl Game {
             starter_pick: None,
             starter_swap: None,
             dive_k: 0.0,
+            ui_sim_dt: 0.0,
             hangout_key: None,
             hangout_diff: 0,
             hangout_page: (0, 0),
@@ -3324,6 +3327,7 @@ impl Game {
 
     /// Draw menus / HUD. Returns the action chosen this frame.
     pub fn ui(&mut self, ctx: &egui::Context, vehicles: &Vehicles, world: &World, hud: HudInfo) -> MenuAction {
+        let race_dt = std::mem::take(&mut self.ui_sim_dt);
         if !self.art_tried && !self.data_dir.is_empty() {
             self.art_tried = true;
             self.art = Some(crate::hud::UiArt::load(ctx, &self.data_dir));
@@ -7504,6 +7508,16 @@ impl Game {
                         fp.hide();
                     }
                 }
+                // a race's start scene (the HUD below is not drawn while its badge or letterbox is up):
+                // the 3-2-1 comes over the scene's camera from its countdown event (GO 3 s later,
+                // prerace.rs; the "3" over the grid scene, rec/g2.png), the rest of the HUD with the cut
+                // to the game camera
+                if race_badge_shown(self.start_badge_on) || self.dive_k > 0.0 || self.cine.is_some() {
+                    if let (Some(countdown), Some(fh)) = (self.race.as_ref().map(|r| r.countdown).filter(|c| *c > 0.0 && *c <= 3.0), self.flash_hud.as_mut()) {
+                        fh.drive_replay_intro(countdown, race_dt);
+                        fh.movie.paint(ctx, &ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("flash_hud"))));
+                    }
+                }
                 if race_badge_shown(self.start_badge_on) || self.dive_k > 0.0 {
                 } else if let Some(sub) = self.cine.as_ref() {
                     // story scene: black bars, the line being spoken in the lower one
@@ -7681,7 +7695,8 @@ impl Game {
                         // (hudOverheadMap's onentry sets HUDMOVIE cur_visibility = 0, but hudBigMap's
                         // refreshHUD follows it: the original keeps the gauges up under the overhead
                         // map - recorded, `work/mm/cap/ov_s2.png`)
-                        fh.drive(&hud, race_hud, dt);
+                        // (before GO the movie steps with the race clock: its 3-2-1 ends on the GO tick)
+                        fh.drive(&hud, race_hud, if self.race.as_ref().map_or(false, |r| r.countdown > 0.0) { race_dt } else { dt });
                         let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("flash_hud"));
                         // above the port's own HUD layer, which still draws the map's streets
                         ctx.move_to_top(layer);

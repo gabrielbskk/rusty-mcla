@@ -60,6 +60,7 @@ mod render;
 mod rimshop;
 mod dimensions;
 mod menu3d;
+mod prerace;
 mod mapmesh;
 mod hudmap;
 mod hudmap_gpu;
@@ -71,6 +72,8 @@ mod fillmap;
 const PAUSE_FRAME: Vec3 = Vec3::new(0.0, 1.38, -0.25);
 /// how long a race's opening shot from the air lasts (ticks)
 const DIVE_TICKS: u32 = 240;
+/// Placement on the grid -> start scene, 0.8 s (grid_hold_rule.md 1, AROUND HOLLYWOOD).
+const PLACE_TICKS: u32 = 48;
 mod rivals;
 mod rubber;
 mod vehicle_model;
@@ -277,6 +280,8 @@ struct App {
     cine_results: bool,
     /// line shown in the letterbox of a free-running scene
     cine_caption: Option<String>,
+    /// test hook MCLA_SHOT_AT_GO: taken
+    shot_at_go: bool,
     /// seconds without input on the main menu (the attract movie starts after a while)
     idle: f32,
     /// start-line camera waiting for the grid's surroundings: frames waited
@@ -505,6 +510,7 @@ impl App {
             mode_before: Mode::MainMenu,
             cine_results: false,
             cine_caption: None,
+            shot_at_go: false,
             idle: 0.0,
             prerace_wait: 0,
             dive_at: None,
@@ -2332,13 +2338,17 @@ impl App {
         if self.cine.playing.is_some() {
             let t = if self.cine_free {
                 let skip = (self.cine_caption.is_some() && std::mem::take(&mut self.game.nav_enter)) || (self.cine_prerace && self.game.race.is_none()) || (self.cine_results && self.game.mode != Mode::Results);
-                if let (true, Some(r)) = (self.cine_prerace, self.game.race.as_mut()) {
+                // (a scene without its own countdown event holds the count; the race-start scripts all
+                // have one - prerace.rs)
+                let own = self.cine.playing.as_ref().map_or(false, |sc| prerace::events(&sc.name).is_some());
+                if let (true, false, Some(r)) = (self.cine_prerace, own, self.game.race.as_mut()) {
                     r.countdown = r.countdown.max(4.4);
                 }
                 self.cine.playing.as_mut().and_then(|sc| {
                     sc.t += dt;
                     // (p080: a delivery intro's bookmark_cut_to_game - the game camera from there)
-                    let cut = hudmap::delivery_intro(&sc.name).map_or(false, |e| sc.t >= e.up);
+                    let cut = hudmap::delivery_intro(&sc.name).map_or(false, |e| sc.t >= e.up)
+                        || prerace::events(&sc.name).map_or(false, |e| sc.t >= e.cut);
                     if sc.t >= sc.duration || skip || cut { None } else { Some(sc.t) }
                 })
             } else {
@@ -2356,6 +2366,12 @@ impl App {
                             r.countdown = (e.countdown + 3.0 - t).max(0.0);
                         }
                         self.cine_caption = (t >= e.racename && t < e.racename + e.racename_len).then(|| self.game.race.as_ref().map(|r| r.name.to_uppercase().replace('_', " ")).unwrap_or_default());
+                    }
+                    // a grid / starter / taunt scene: GO 3 s after its countdown event (prerace.rs)
+                    if let Some(e) = self.cine.playing.as_ref().filter(|_| self.cine_prerace).and_then(|sc| prerace::events(&sc.name)) {
+                        if let Some(r) = self.game.race.as_mut() {
+                            r.countdown = (e.go() - t).max(0.0);
+                        }
                     }
                     // the cars are where the scene puts them
                     for label in self.cine.movers() {
@@ -2383,6 +2399,9 @@ impl App {
                             if self.game.race.is_some() {
                                 self.delivery_tail = Some((name, st.max(e.up)));
                             }
+                        } else if let (Some(e), true) = (prerace::events(&name), self.cine_prerace && self.game.race.is_some()) {
+                            // (cut to the game camera, or skipped: the script's countdown event still comes)
+                            self.delivery_tail = Some((name, st.max(e.cut)));
                         } else if name.contains("cut_delivery_get_keys") && self.game.race.is_some() {
                             if let Some((sc, g0, yaw)) = self.delivery_intro.take() {
                                 if let Some(i) = self.vehicles.cars.iter().position(|c| c.is_player) {
@@ -2426,14 +2445,14 @@ impl App {
             }
             if let Some((name, t)) = self.delivery_tail.as_mut() {
                 *t += dt;
-                let (t, e) = (*t, hudmap::delivery_intro(name));
-                if let (Some(e), Some(r)) = (e, self.game.race.as_mut()) {
-                    if t < e.countdown {
-                        r.countdown = (e.countdown + 3.0 - t).max(0.0);
+                let (t, e) = (*t, hudmap::delivery_intro(name).map(|e| (e.countdown, e.scene)).or_else(|| prerace::events(name).map(|e| (e.countdown, e.scene))));
+                if let (Some((countdown, scene)), Some(r)) = (e, self.game.race.as_mut()) {
+                    if t < countdown {
+                        r.countdown = (countdown + 3.0 - t).max(0.0);
                     } else {
                         // (the countdown runs on by itself: GO at e.countdown + 3)
-                        r.countdown = r.countdown.min((e.countdown + 3.0 - t).max(0.0));
-                        log::info!("delivery intro: countdown event at {:.2} s of {}, GO in {:.2} s", t, e.scene, r.countdown);
+                        r.countdown = r.countdown.min((countdown + 3.0 - t).max(0.0));
+                        log::info!("prerace scene: countdown event at {:.2} s of {}, GO in {:.2} s", t, scene, r.countdown);
                         self.delivery_tail = None;
                     }
                 } else {
@@ -2472,6 +2491,13 @@ impl App {
                 }
             } else {
                 UP.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
+            // (test hook MCLA_SHOT_AT_GO=s: the screenshot once the race is s seconds from GO)
+            if let (Some(s), Some(r)) = (std::env::var("MCLA_SHOT_AT_GO").ok().and_then(|v| v.parse::<f32>().ok()), self.game.race.as_ref()) {
+                if r.countdown > 0.0 && r.countdown <= s && self.game.prerace.is_none() && !std::mem::replace(&mut self.shot_at_go, true) {
+                    log::info!("shot at {:.2} s to GO (scene {:?})", r.countdown, self.cine.playing.as_ref().map(|sc| (sc.name.clone(), sc.t)));
+                    self.game.shot_now = true;
+                }
             }
         }
         self.game.cine_black = self.cine_hold.is_some();
@@ -2949,6 +2975,11 @@ impl App {
         if self.game.mode == Mode::Race {
             let ready = self.vehicles.player().map_or(true, |c| world.ready_at(c.state.pos));
             race_finished = self.game.update_race(&mut self.vehicles, sim_dt, ready);
+            self.game.ui_sim_dt += sim_dt;
+            // (the original places the racers 0.8 s before its start scene begins - the player's engine
+            // starts with the scene, grid_hold_rule.md 1; the port's dive in front of the scene stands for
+            // the arrival, so the racers are held with no pedals until 0.8 s before its end)
+            self.vehicles.grid_wait = self.game.prerace.is_some() && self.game.dive_k > 0.0 && self.prerace_wait + PLACE_TICKS < DIVE_TICKS;
             if std::env::var("MCLA_STUCK_DUMP").is_ok() && self.tick_no % 60 == 0 {
                 if let Some(race) = self.game.race.as_ref().filter(|r| r.time > 6.0) {
                     for &ci in race.participants.iter().skip(1) {
