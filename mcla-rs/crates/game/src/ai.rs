@@ -4,6 +4,36 @@ use crate::physics::{CarInput, CarState};
 use glam::Vec3;
 use mcla_formats::rage::navsys::NavSys;
 
+/// A computer driver's pre-race antics on the grid (`AiDriver::grid_input`): the phase it is in, when
+/// (seconds since placement) that phase ends, when (seconds to GO) it commits to the burnout it holds
+/// to GO, and the throttle lifts during that burnout as (from, to) in seconds to GO.
+#[derive(Debug, Clone, Default)]
+pub struct GridPlan {
+    pub t: f32,
+    pub phase: GridPhase,
+    pub until: f32,
+    pub commit_at: f32,
+    pub lifts: Vec<(f32, f32)>,
+    pub committed: bool,
+    /// set when the opening burst ends: the car's drivetrain is reset (vehsim.rs `grid_reset`)
+    pub reset: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum GridPhase {
+    /// the pedals off but the brake
+    #[default]
+    Off,
+    /// the burst right after placement: handbrake and throttle for a quarter second
+    Burst,
+    /// revving against the brake
+    Rev,
+    /// a burnout: handbrake and throttle
+    Burn,
+    /// the handbrake and the brake (the charge decaying)
+    HandOnly,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct AiDriver {
     pub link: Option<usize>,
@@ -36,6 +66,8 @@ pub struct AiDriver {
     pub chase: Option<(Vec3, Vec3)>,
     /// the car as its driver knows it: the game's calibration (speed for a bend, braking, steering)
     pub tune: Option<std::sync::Arc<mcla_formats::rage::aitune::AiTune>>,
+    /// the pre-race antics on the grid (`grid_input`)
+    pub grid: Option<GridPlan>,
     /// the speed asked for already allows for the bends ahead (set while following a race line)
     line_speed: bool,
     /// racing: seconds boxed in behind something standing
@@ -59,6 +91,84 @@ impl AiDriver {
         x ^= x << 5;
         self.rng = x;
         (x % 10000) as f32 / 10000.0
+    }
+
+    /// a draw between `lo` and `hi` seconds
+    fn span(&mut self, lo: f32, hi: f32) -> f32 {
+        lo + self.rand() * (hi - lo)
+    }
+
+    /// What a computer driver does on the grid while the race has not started (N-VP-1), with `to_go`
+    /// seconds to GO. Recorded on the original 2026-10-18 (`work/physics2/rec`: a.1, c2, c3, c4 - an R8,
+    /// a Murcielago and a Ducati 999 over four starts of AROUND HOLLYWOOD):
+    /// - about 0.1 - 0.2 s after placement every car does a burst of handbrake and full throttle for
+    ///   0.2 - 0.3 s (the charge reaches 0.2 - 0.5), then lets everything go for 0.5 - 1.4 s;
+    /// - then, in no fixed order, phases of revving against the brake (brake and throttle 1 - the rev
+    ///   limiter cuts the pedal from a half, so the engine saws between its limits; 0.8 - 2.6 s), of a
+    ///   burnout (handbrake and throttle 1, the charge to full and held; 0.9 - 2.7 s, after which the
+    ///   handbrake stays on alone while the charge decays and for 0.7 - 1.3 s more), and of nothing but
+    ///   the brake (0.7 - 1.3 s);
+    /// - 3.5 - 3.9 s before GO the car commits to a burnout held to GO, lifting the throttle (handbrake
+    ///   kept) once or twice for 0.15 - 0.7 s; at GO the handbrake goes with the throttle down and the
+    ///   charge launches the car (the burnout's boost, `vehsim.rs`).
+    /// The phase kinds and lengths are drawn from those ranges; the original's brain randomness itself
+    /// is not decoded (approximate). The sim does the rest: the rev limiter's cut, the burnout's axle,
+    /// its charge, the launch. The inputs carry `hold` (the grid flag): the pedals reach the chassis as
+    /// they are, the gearbox is held whenever the handbrake is off (so revving against the brake stands
+    /// still) and the brake never selects reverse. As recorded, the brain's brake is on in every phase
+    /// but a burnout: alone when idle, with the throttle when revving, with the handbrake while a charge
+    /// decays.
+    pub fn grid_input(&mut self, to_go: f32, dt: f32, _bike: bool) -> CarInput {
+        if self.grid.is_none() {
+            let commit_at = self.span(3.5, 3.9);
+            let n = (self.rand() * 3.0) as usize;
+            let mut lifts = Vec::new();
+            for _ in 0..n {
+                let len = self.span(0.15, 0.7);
+                let from = self.span(1.0, (commit_at - 0.5).max(1.0));
+                lifts.push((from, (from - len).max(0.25)));
+            }
+            let first = self.span(0.1, 0.2);
+            self.grid = Some(GridPlan { t: 0.0, phase: GridPhase::Off, until: first, commit_at, lifts, committed: false, reset: false });
+        }
+        let mut g = self.grid.take().unwrap();
+        g.t += dt;
+        if to_go <= g.commit_at && !g.committed {
+            g.committed = true;
+            g.phase = GridPhase::Burn;
+            g.until = f32::INFINITY;
+        }
+        if !g.committed && g.t >= g.until {
+            // the next phase: after the burst and its release the kinds alternate at random
+            let (phase, len) = match g.phase {
+                GridPhase::Off if g.t < 1.0 && g.until < 0.5 => (GridPhase::Burst, self.span(0.2, 0.32)),
+                GridPhase::Burst => {
+                    // (recorded: the burst ends with the drivetrain reset in place, a.1 k115)
+                    g.reset = true;
+                    (GridPhase::Off, self.span(0.5, 1.4))
+                }
+                GridPhase::Rev => (GridPhase::Off, self.span(0.7, 1.3)),
+                // (the handbrake stays on while the charge decays - 0.85 s from full - and a little longer)
+                GridPhase::Burn => (GridPhase::HandOnly, self.span(0.9, 2.0)),
+                GridPhase::Off | GridPhase::HandOnly => {
+                    if self.rand() < 0.5 { (GridPhase::Rev, self.span(0.8, 2.6)) } else { (GridPhase::Burn, self.span(0.9, 2.7)) }
+                }
+            };
+            g.phase = phase;
+            g.until = g.t + len;
+        }
+        let mut phase = g.phase;
+        if g.committed && g.lifts.iter().any(|&(from, to)| to_go <= from && to_go > to) {
+            phase = GridPhase::HandOnly;
+        }
+        self.grid = Some(g);
+        let (ai, hold) = (true, true);
+        match phase {
+            GridPhase::Burst | GridPhase::Burn => CarInput { throttle: 1.0, handbrake: true, ai, hold, ..Default::default() },
+            GridPhase::Rev => CarInput { throttle: 1.0, brake: 1.0, ai, hold, ..Default::default() },
+            GridPhase::HandOnly => CarInput { handbrake: true, brake: 1.0, ai, hold, ..Default::default() },
+            GridPhase::Off => CarInput { brake: 1.0, ai, hold, ..Default::default() },
+        }
     }
 
     pub fn locate(&mut self, nav: &NavSys, pos: Vec3, heading: Vec3) {
@@ -475,5 +585,45 @@ impl AiDriver {
             input.steer = -steer;
         }
         input
+    }
+}
+
+#[cfg(test)]
+mod grid_tests {
+    use super::*;
+
+    /// The pre-race antics (N-VP-1) keep the shape of the original's recordings: a burst of handbrake
+    /// and throttle inside the first 0.6 s, the brake on in every phase but a burnout, the grid flag on
+    /// every input, a burnout committed 3.5 - 3.9 s before GO and held through the last quarter second.
+    #[test]
+    fn grid_antics_have_the_recorded_shape() {
+        for seed in [1u32, 77, 1234, 99991] {
+            let mut d = AiDriver::new(seed);
+            let dt = 1.0 / 60.0;
+            let mut burst_at = None;
+            let mut committed_at = None;
+            let mut t = 0.0f32;
+            while t < 12.0 {
+                let to_go = 12.0 - t;
+                let i = d.grid_input(to_go, dt, false);
+                assert!(i.ai && i.hold);
+                assert!(!(i.handbrake && i.throttle > 0.0 && i.brake > 0.0), "brake in a burnout at t {t}");
+                assert!(i.handbrake || i.brake > 0.0, "nothing holds the car at t {t}");
+                if i.handbrake && i.throttle > 0.0 && burst_at.is_none() {
+                    burst_at = Some(t);
+                }
+                if d.grid.as_ref().unwrap().committed && committed_at.is_none() {
+                    committed_at = Some(to_go);
+                }
+                if to_go <= 0.25 {
+                    assert!(i.handbrake && i.throttle == 1.0, "not burning out at to_go {to_go}");
+                }
+                t += dt;
+            }
+            let b = burst_at.expect("no burst");
+            assert!(b > 0.05 && b < 0.6, "burst at {b}");
+            let c = committed_at.expect("never committed");
+            assert!((3.45..=3.95).contains(&c), "committed at {c}");
+        }
     }
 }

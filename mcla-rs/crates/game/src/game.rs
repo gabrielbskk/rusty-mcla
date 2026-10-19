@@ -3005,15 +3005,22 @@ impl Game {
         if self.mc4_payback_over(vehicles) {
             finished_now = true;
         }
-        let Some(race) = self.race.as_mut() else { return false };
+        let Some(race) = self.race.as_mut() else {
+            vehicles.grid_hold = None;
+            return false;
+        };
         if race.countdown > 0.0 {
             if world_ready || race.countdown < 3.4 {
                 race.countdown -= dt;
             }
-            vehicles.frozen = race.countdown > 0.0;
+            // (N-VP-1: the grid is not frozen - the cars simulate, held by their brakes, so revving and
+            // burnouts happen as in the original: `Vehicles::grid_hold`, `CarInput::hold`, `AiDriver::grid_input`)
+            vehicles.frozen = false;
+            vehicles.grid_hold = (race.countdown > 0.0).then_some(race.countdown);
             return false;
         }
         vehicles.frozen = false;
+        vehicles.grid_hold = None;
         race.time += dt;
         let n = race.checkpoints.len();
         while race.next.len() < vehicles.cars.len() {

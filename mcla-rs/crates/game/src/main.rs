@@ -1621,6 +1621,18 @@ impl App {
                 self.hyd_on = false;
             }
             // a charged slipstream turbo is spent by the nitrous button, before the bottles
+        // (test hook: MCLA_GRID_NITRO=1 holds the nitrous button all the time)
+        if std::env::var("MCLA_GRID_NITRO").is_ok() {
+            player_input.nitro = true;
+        }
+        // (N-VP-1: on the grid, from the intro to GO, the player can only burn out and rev - throttle,
+        // brake, handbrake, the steering for the wheels; no nitrous, slipstream turbo, weight shift,
+        // hydraulics or gear keys. Special abilities and power-ups are held further down.)
+        if self.game.race.as_ref().map_or(false, |r| r.countdown > 0.0) {
+            player_input = CarInput { throttle: player_input.throttle, brake: player_input.brake, handbrake: player_input.handbrake, steer: player_input.steer, ai: player_input.ai, ..Default::default() };
+            self.sst_hold = false;
+        }
+            // a charged slipstream turbo is spent by the nitrous button, before the bottles
             if player_input.nitro && !self.nitro_was && self.ability.sst_ready() {
                 if let Some(vs) = self.vehicles.player_mut().and_then(|c| c.state.veh.as_mut()) {
                     if vs.sst_level <= 0.0 && vs.nitro_level <= 0.0 {
@@ -1674,7 +1686,7 @@ impl App {
         let mut world = self.world.take().unwrap();
         let mut gpu = self.gpu.take().unwrap();
         self.vehicles.auto_player = self.drive && self.opt.auto;
-        let frozen_now = self.vehicles.frozen;
+        let frozen_now = self.vehicles.frozen || self.vehicles.grid_hold.is_some();
         if self.drive && self.opt.auto {
             if let (Some(nav), Some(car)) = (world.nav.as_ref(), self.vehicles.player_mut()) {
                 let route = self.game.race.as_ref().map(|r| r.route.clone());
@@ -1773,6 +1785,10 @@ impl App {
             if let Some((_, pad)) = g.gamepads().next() {
                 fire |= pad.is_pressed(gilrs::Button::LeftTrigger);
             }
+        }
+        // (N-VP-1: nothing fires on the grid before GO - abilities and power-ups wait for the race)
+        if self.game.race.as_ref().map_or(false, |r| r.countdown > 0.0) {
+            fire = false;
         }
         // (a career has no special ability before its INSTALL_ABILITY mission: the cluster's
         // two dials are empty rings in a new career - `ng_c4`)
@@ -3775,14 +3791,21 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                         // spinning or sliding tyres smoke; the driven axle most of all
                         let over = (w.slip - 1.0).max(0.0);
                         let mut burn = over * if speed > 3.0 || c.input.throttle > 0.6 { 1.0 } else { 0.0 };
-                        // hard launches light up the driven tyres; the handbrake locks the rears
-                        let pr = c.tuned.as_deref().unwrap_or(&c.model.params);
-                        let driven = if wi < 2 { pr.drive_front > 0.4 } else { pr.drive_front < 0.6 };
-                        if driven && c.input.throttle > 0.9 && speed < 11.0 && pr.accel_at(speed) > 5.2 {
-                            burn = burn.max(0.7 * (1.0 - speed / 11.0));
-                        }
-                        if wi >= 2 && c.input.handbrake && speed > 6.0 {
-                            burn = burn.max(0.6);
+                        if c.state.veh.is_some() {
+                            // (N-VP-1: on the original's simulation each wheel's own slide decides - a burnout's
+                            // spinning axle smokes, its braked axle and a wheel at rest do not, whatever the
+                            // pedals or the tuning's drive split say; a decaying charge still smokes)
+                            burn = over;
+                        } else {
+                            // hard launches light up the driven tyres; the handbrake locks the rears
+                            let pr = c.tuned.as_deref().unwrap_or(&c.model.params);
+                            let driven = if wi < 2 { pr.drive_front > 0.4 } else { pr.drive_front < 0.6 };
+                            if driven && c.input.throttle > 0.9 && speed < 11.0 && pr.accel_at(speed) > 5.2 {
+                                burn = burn.max(0.7 * (1.0 - speed / 11.0));
+                            }
+                            if wi >= 2 && c.input.handbrake && speed > 6.0 {
+                                burn = burn.max(0.6);
+                            }
                         }
                         if burn > 0.12 && (self.tick_no + wi as u64) % 2 == 0 {
                             self.fx.tyre_smoke(w.contact, st.vel, (burn * 1.6).min(1.0));

@@ -339,8 +339,13 @@ pub struct Vehicles {
     pub road_density: std::collections::HashMap<usize, i32>,
     pub spawn_timer: f32,
     pub rng: u32,
-    /// countdown: physics and AI are held
+    /// a scene or the vehicle pick: physics and AI are held
     pub frozen: bool,
+    /// the race's grid hold (N-VP-1): seconds to GO. The cars simulate, held by their brakes - the
+    /// player's chassis brake forced and his front wheels locked (`CarInput::hold`), the computer
+    /// drivers at their pre-race antics (`AiDriver::grid_input`) - so revving and burnouts happen as
+    /// in the original.
+    pub grid_hold: Option<f32>,
     /// no car has its lamps on (VEHICLE SELECT: three cars standing in a lot)
     pub lights_off: bool,
     /// the finish of the player's rims by zone - spoke A, spoke B, lip (the rim meshes'
@@ -1996,8 +2001,37 @@ if keep || c.state.pos.distance(center) < 450.0 {
                     ai.reverse_timer = 0.0;
                 }
                 CarInput { brake: 1.0, ..Default::default() }
+            } else if let (Some(_), false, false) = (self.grid_hold, self.cars[i].is_player, self.cars[i].pinned) {
+                // (the rest of the world - traffic, police - stands while the racers wait for GO, as the
+                // countdown held it before)
+                if let Some(ai) = self.cars[i].ai.as_mut() {
+                    ai.stuck_timer = 0.0;
+                    ai.reverse_timer = 0.0;
+                }
+                CarInput { brake: 1.0, ..Default::default() }
+            } else if let (Some(to_go), false) = (self.grid_hold, self.cars[i].is_player) {
+                // (on the grid: a computer driver's pre-race antics - a burst at placement, revving
+                // against the brake, burnouts, the one it holds to GO)
+                let bike = self.cars[i].model.bike;
+                match self.cars[i].ai.as_mut() {
+                    Some(ai) => {
+                        ai.stuck_timer = 0.0;
+                        ai.reverse_timer = 0.0;
+                        let input = ai.grid_input(to_go, dt, bike);
+                        // (the end of the opening burst: the drivetrain's reset, vehsim.rs `grid_reset`)
+                        if ai.grid.as_mut().map_or(false, |g| std::mem::take(&mut g.reset)) {
+                            if let Some(vs) = self.cars[i].state.veh.as_mut() {
+                                vs.grid_reset = true;
+                            }
+                        }
+                        input
+                    }
+                    None => CarInput { brake: 1.0, ..Default::default() },
+                }
             } else if self.cars[i].is_player {
-                player_input
+                // (on the grid the player's own pedals go through under the hold: `CarInput::hold`)
+                // (the steering is written 0 on the grid, 0x8232EC8C)
+                CarInput { hold: self.grid_hold.is_some(), steer: 0.0, ..player_input }
             } else if let (Some(nav), true) = (world.nav.as_ref(), self.cars[i].ai.is_some()) {
                 // (the driver knows its car from the game's calibration tables, at this car's state of tune)
                 if self.cars[i].ai.as_ref().map_or(false, |a| a.tune.is_none()) && self.cars[i].state.veh.is_some() {
@@ -2013,7 +2047,7 @@ if keep || c.state.pos.distance(center) < 450.0 {
             let pursuing = self.cars[i].cop && self.cars[i].ai.as_ref().map_or(false, |a| a.chase.is_some());
             // Racers do not queue behind traffic: they pull out and pass, on whichever side
             // is free of cars and walls.
-            let racing = ((!self.cars[i].is_player && self.cars[i].pinned) || (self.cars[i].is_player && self.auto_player)) && self.cars[i].parked.is_none() && !self.frozen && !self.cars[i].driver.starts_with(crate::racescript::TAG) && self.cars[i].ai.as_ref().map_or(false, |a| a.path.is_some());
+            let racing = ((!self.cars[i].is_player && self.cars[i].pinned) || (self.cars[i].is_player && self.auto_player)) && self.cars[i].parked.is_none() && !self.frozen && self.grid_hold.is_none() && !self.cars[i].driver.starts_with(crate::racescript::TAG) && self.cars[i].ai.as_ref().map_or(false, |a| a.path.is_some());
             let mut passing = false;
             if racing {
                 let v = positions[i].2;
@@ -2111,7 +2145,8 @@ if keep || c.state.pos.distance(center) < 450.0 {
                 }
             }
             let mut boxed_in = false;
-            if !self.cars[i].is_player && self.cars[i].parked.is_none() && !pursuing && !passing {
+            // (not on the grid: the field stands nose to tail there and the antics are the brain's own)
+            if !self.cars[i].is_player && self.cars[i].parked.is_none() && !pursuing && !passing && self.grid_hold.is_none() {
                 // brake for cars ahead
                 for j in 0..n {
                     if i == j {
@@ -2208,7 +2243,8 @@ if keep || c.state.pos.distance(center) < 450.0 {
                 self.cars[i].stunned -= dt;
                 input = CarInput { brake: 0.15, ..Default::default() };
             }
-            if self.cars[i].boost > 0.0 && !self.cars[i].is_player {
+            // (no nitrous on the grid: a race script's boost waits for GO)
+            if self.cars[i].boost > 0.0 && !self.cars[i].is_player && self.grid_hold.is_none() {
                 self.cars[i].boost -= dt;
                 if input.throttle > 0.3 {
                     input.nitro = true;
@@ -2274,7 +2310,8 @@ if keep || c.state.pos.distance(center) < 450.0 {
             }
             // Racers outside the streamed-in part of the city have no ground to drive on:
             // move them along the race line until the world around them is loaded.
-            if !c.is_player && !self.frozen && c.parked.is_none() && !world.ready_at(c.state.pos) {
+            // (not on the grid: there the cars stand on their brakes while the world streams in)
+            if !c.is_player && !self.frozen && self.grid_hold.is_none() && c.parked.is_none() && !world.ready_at(c.state.pos) {
                 if let Some(ai) = c.ai.as_mut() {
                     if ai.path.is_some() {
                         let v = ai.target_speed * 0.8;
@@ -2333,7 +2370,7 @@ if keep || c.state.pos.distance(center) < 450.0 {
                 }
                 continue;
             }
-            if self.frozen {
+            if self.frozen || (self.grid_hold.is_some() && !c.is_player && !c.pinned) {
                 // settle onto the ground but do not drive
                 c.state.step(c.tuned.as_deref().unwrap_or(&c.model.params), CarInput { brake: 1.0, ..Default::default() }, &world.collider, dt.min(1.0 / 30.0));
                 c.state.vel.x = 0.0;
@@ -2342,6 +2379,26 @@ if keep || c.state.pos.distance(center) < 450.0 {
                 continue;
             }
             c.state.step(c.tuned.as_deref().unwrap_or(&c.model.params), c.input, &world.collider, dt.min(1.0 / 30.0));
+            // (N-VP-1 test hook: MCLA_GRID_TRACE=1 logs the racers through the grid hold and 10 s after it)
+            if (c.pinned || c.is_player) && std::env::var("MCLA_GRID_TRACE").is_ok() {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static LEFT: AtomicU32 = AtomicU32::new(0);
+                if self.grid_hold.is_some() {
+                    LEFT.store(600, Ordering::Relaxed);
+                }
+                let left = LEFT.load(Ordering::Relaxed);
+                if left > 0 {
+                    if c.is_player && self.grid_hold.is_none() {
+                        LEFT.store(left - 1, Ordering::Relaxed);
+                    }
+                    if let Some(vs) = c.state.veh.as_ref() {
+                        let f = c.state.forward();
+                        log::info!("grid {:<22} to_go {:6.2} thr {:.2} brk {:.2} hand {} st {} charge {:.2} rpm {:5.0} gear {} spd {:6.2} rear slide {:.2} {:.2} vlong {:6.1} {:6.1} front slide {:.2} {:.2} vlong {:6.1} pos {:.3} {:.3} nitro {} rspin {:.1} {:.1} shaft {:.1} {:.1} drive {} clutch {} held {} | F load {:.0} flong {:.0} disp {:.4} slide {:.2} | R load {:.0} flong {:.0} disp {:.4} slide {:.2} | v {:.3}",
+                            if c.is_player { "player" } else { c.model.name.as_str() }, self.grid_hold.unwrap_or(0.0), c.input.throttle, c.input.brake, c.input.handbrake as u8, vs.burn_state, vs.burn, c.state.rpm, vs.gear, c.state.vel.dot(f),
+                            vs.wheels[2].slide, vs.wheels[3].slide, vs.wheels[2].velocity_long, vs.wheels[3].velocity_long, vs.wheels[0].slide, vs.wheels[1].slide, vs.wheels[0].velocity_long, c.state.pos.x, c.state.pos.z, c.input.nitro as u8, vs.wheels[2].spin_rate, vs.wheels[3].spin_rate, vs.omega[0], vs.omega[1], vs.drive, vs.clutch as u8, vs.trans_inhibited as u8, vs.wheels[0].load, vs.wheels[0].f_long, vs.wheels[0].disp_long, vs.wheels[0].slide, vs.wheels[2].load, vs.wheels[2].f_long, vs.wheels[2].disp_long, vs.wheels[2].slide, c.state.vel.length());
+                    }
+                }
+            }
         }
         // car-car separation (soft spheres)
         for i in 0..n {

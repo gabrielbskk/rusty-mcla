@@ -763,11 +763,15 @@ pub struct VehState {
     /// A2: the player's pad between frames (pedals, the next steering value, the smoothed stick)
     pub pad: super::pad::PadHeld,
     pub steer_back: f32,
+    /// N-VP-1: the drivetrain's reset seen at the end of a computer driver's opening grid burst (engine to
+    /// idle, wheels and shafts still, no burnout charge, the drive layout and centre of mass as tuned), done at
+    /// the head of the next update
+    pub grid_reset: bool,
 }
 
 impl Default for VehState {
     fn default() -> Self {
-        VehState { shaft_speed_in: 0.0, wipe_dir: Vec3::ZERO, set_down: false, prev_up: None, body_exact: None, body_now: None, rest_exact: None, body_at_exact: None, sums_gyro: [Vec3::ZERO; 4], gyro_sums_exact: None, com_exact: None, body: None, momentum_exact: None, drift_level: 1.0, wheel_grip: [1.0; 4], hull_kept: Vec::new(), manifolds: Vec::new(), wipe: None, loose: Default::default(), hull_last: None, cell_ball: None, by: BurnTick { exact: false, state_in: 0, held: false, brake_layout: None, cg: None, cg_return: true, launch: None, launch_layout: 0 }, lift_err: 0.0, rev: RevLimit { cut: 0.0, timer: 0.0, on: false, left: 0.0, pad: 0.0 }, last_seen: None, push_turn_left: Vec3::ZERO, deep_count: 0, last_set: false, stuck: 0, stuck_at: Vec3::ZERO, stuck_timer: 0.0, still_timer: 0.0, last_speed: 0.0, drive: 255, engine_w: 100.0, gear: 1, shift_timer: 0.0, gear_change: GearChange::default(), engine_pedal: 0.0, engine_torque: 0.0, engine_roll: 0.0, engine_auxiliary: 0.0, trans_inhibited: false, shift_mod: [1.0; 2], pedal_was: 0.0, hyd: Hydraulics::default(), two: 0, two_target: 0.0, two_err: 0.0, two_trim: 0.0, two_wait: 0, two_acc: 0.0, omega: [0.0; 2], diff: [1.0; 2], wheels: [WheelSim::default(); 4], boost_timer: 0.0, steer: 0.0, nitro_timer: 0.0, turn_err: 0.0, turn_force: 0.0, melt: 0.0, sst_level: 0.0, lean: 0.0, lean_acc: 0.0, wheelie: 0, wheelie_boost: 0.0, wheelie_pitch: 0.0, wheelie_err: 0.0, wheelie_lift: 0.0, air_roll: 0.0, air_acc: [0.0; 3], torque_mult: 1.0, clutch: true, auto_brake: 0.0, started: false, nitro_level: 0.0, nitro_held: false, nitro_burning: false, nitro_records: 0, air584: 0.0, air584_before: 0.0, nitro_rest: 0.0, nitro_view: 0.0, nitro_pad: 0.0, nitro_left: false, aero_damp: 1.0, air_time: 0.0, burn_state: 0, burn: 0.0, burn_yaw: 0.0, bump_phase: 0.0, rng: [0x2545_F491, 0x1234_5678], gauss_spare: None, last_force: Vec3::ZERO, last_torque: Vec3::ZERO, pulse: None, last_gyro: Vec3::ZERO, cg: [0.0; 2], cg_set: false, bike_vel: Vec3::ZERO, bike_acc: Vec3::ZERO, lean_scale: 0.0, lean_lat: 0.0, lean_target: 0.0, bike_turn: Vec3::ZERO, bike_push: Vec3::ZERO, sss_chassis: 1.0, pad_steer: 0.0, w_then: [0.0; 4], bg: BikeGyro::default(), bike_spin: None, bike_pending: None, sss_chassis_exact: 1.0, way_after: 0, pad: super::pad::PadHeld { pedals: super::pad::Pedals { state: 0, throttle: 0.0, brake: 0.0, way: 1 }, steer_next: 0.0, stick_y: 0.0, stick_next: 0.0, second_tick: false, live: false, cruise: super::pad::CruiseHeld { on: false, speed: 0.0 }, button: false }, steer_back: 0.0 }
+        VehState { shaft_speed_in: 0.0, wipe_dir: Vec3::ZERO, set_down: false, prev_up: None, body_exact: None, body_now: None, rest_exact: None, body_at_exact: None, sums_gyro: [Vec3::ZERO; 4], gyro_sums_exact: None, com_exact: None, body: None, momentum_exact: None, drift_level: 1.0, wheel_grip: [1.0; 4], hull_kept: Vec::new(), manifolds: Vec::new(), wipe: None, loose: Default::default(), hull_last: None, cell_ball: None, by: BurnTick { exact: false, state_in: 0, held: false, brake_layout: None, cg: None, cg_return: true, launch: None, launch_layout: 0 }, lift_err: 0.0, rev: RevLimit { cut: 0.0, timer: 0.0, on: false, left: 0.0, pad: 0.0 }, last_seen: None, push_turn_left: Vec3::ZERO, deep_count: 0, last_set: false, stuck: 0, stuck_at: Vec3::ZERO, stuck_timer: 0.0, still_timer: 0.0, last_speed: 0.0, drive: 255, engine_w: 100.0, gear: 1, shift_timer: 0.0, gear_change: GearChange::default(), engine_pedal: 0.0, engine_torque: 0.0, engine_roll: 0.0, engine_auxiliary: 0.0, trans_inhibited: false, shift_mod: [1.0; 2], pedal_was: 0.0, hyd: Hydraulics::default(), two: 0, two_target: 0.0, two_err: 0.0, two_trim: 0.0, two_wait: 0, two_acc: 0.0, omega: [0.0; 2], diff: [1.0; 2], wheels: [WheelSim::default(); 4], boost_timer: 0.0, steer: 0.0, nitro_timer: 0.0, turn_err: 0.0, turn_force: 0.0, melt: 0.0, sst_level: 0.0, lean: 0.0, lean_acc: 0.0, wheelie: 0, wheelie_boost: 0.0, wheelie_pitch: 0.0, wheelie_err: 0.0, wheelie_lift: 0.0, air_roll: 0.0, air_acc: [0.0; 3], torque_mult: 1.0, clutch: true, auto_brake: 0.0, started: false, nitro_level: 0.0, nitro_held: false, nitro_burning: false, nitro_records: 0, air584: 0.0, air584_before: 0.0, nitro_rest: 0.0, nitro_view: 0.0, nitro_pad: 0.0, nitro_left: false, aero_damp: 1.0, air_time: 0.0, burn_state: 0, burn: 0.0, burn_yaw: 0.0, bump_phase: 0.0, rng: [0x2545_F491, 0x1234_5678], gauss_spare: None, last_force: Vec3::ZERO, last_torque: Vec3::ZERO, pulse: None, last_gyro: Vec3::ZERO, cg: [0.0; 2], cg_set: false, bike_vel: Vec3::ZERO, bike_acc: Vec3::ZERO, lean_scale: 0.0, lean_lat: 0.0, lean_target: 0.0, bike_turn: Vec3::ZERO, bike_push: Vec3::ZERO, sss_chassis: 1.0, pad_steer: 0.0, w_then: [0.0; 4], bg: BikeGyro::default(), bike_spin: None, bike_pending: None, sss_chassis_exact: 1.0, way_after: 0, pad: super::pad::PadHeld { pedals: super::pad::Pedals { state: 0, throttle: 0.0, brake: 0.0, way: 1 }, steer_next: 0.0, stick_y: 0.0, stick_next: 0.0, second_tick: false, live: false, cruise: super::pad::CruiseHeld { on: false, speed: 0.0 }, button: false }, steer_back: 0.0, grid_reset: false }
     }
 }
 
@@ -887,7 +891,14 @@ fn update_engine(vs: &mut VehState, vt: &VehTune, input: CarInput, pedal_release
     // the throttle, and after every upshift, the engine pulls BoostTorque harder, fading over
     // BoostDuration. (Checked against the running original: timer 2.0 at rest, 1.983 on the
     // first frame of throttle and again after the change into second.)
-    if vs.gear_change.direction != 0 && vs.gear >= 2 {
+    // (0x8232F098: on the grid - chassis +592 bit 0x2 - with the handbrake off and less than 0.95 of
+    // burnout charge, 0x82007FB4, the transmission is held, +32 = 1, ahead of the rules below and
+    // skipping them: the engine revs free against the held wheels and saws on the rev limiter. Recorded:
+    // the player's throttle-only grid (a.2), the opponents' revving phases.)
+    let grid_held = input.hold && vs.burn < 0.95 && !input.handbrake && !bike_old(vt);
+    if grid_held {
+        vs.trans_inhibited = true;
+    } else if vs.gear_change.direction != 0 && vs.gear >= 2 {
         vs.boost_timer = 0.0;
         vs.trans_inhibited = true;
     } else if vs.gear == 0 {
@@ -910,7 +921,10 @@ fn update_engine(vs: &mut VehState, vt: &VehTune, input: CarInput, pedal_release
     }
     // (0x8232F2FC, after the rules above: the automatic brake holds the transmission - a car
     // standing still is held, which is why the first frame of throttle starts a whole boost)
-    if vs.auto_brake > 0.0 && !computer {
+    // (N-VP-1: on the grid, chassis +592 bit 0x2, the computer drivers' cars get the automatic brake and its hold
+    // too - recorded: the opponents' transmission +32 = 1 and their wheels' +480 rising 45 a tick, 1389, 1434 ..,
+    // in their idle and handbrake phases, c4 R8 k44.., a.1 k116..)
+    if vs.auto_brake > 0.0 && (!computer || input.hold) {
         vs.trans_inhibited = true;
     }
     let pedal = if vs.gear < 0 { input.brake } else { input.throttle }.clamp(0.0, 1.0);
@@ -1041,7 +1055,9 @@ pub fn step(st: &mut CarState, p: &CarParams, vt: &VehTune, input: CarInput, wor
     // (the chassis' own throttle, +136: nothing on the pedal at all)
     let pedal_released = (input.throttle <= if input.ai { 0.01 } else { 0.0 }, input.brake <= if input.ai { 0.01 } else { 0.0 });
     // a computer driver asks for a share of the pull; the engine's pedal coasts at one half
-    let input = if input.ai {
+    // (on the grid, `hold`, the brain's pedals are written to the chassis as they are: a phase with the
+    // throttle up shows +136 = 0 in the recordings, so the coasting share below does not apply)
+    let input = if input.ai && !input.hold {
         let map = |x: f32| if x > 0.01 { 0.5 + 0.5 * x.min(1.0) } else { 0.42 };
         if input.brake > 0.1 && input.throttle < 0.01 { input } else { CarInput { throttle: map(input.throttle), ..input } }
     } else {
@@ -1056,6 +1072,22 @@ pub fn step(st: &mut CarState, p: &CarParams, vt: &VehTune, input: CarInput, wor
     }
     let t = &vt.t;
     let e = &t.engine.s;
+    // (N-VP-1, recorded: a.1 k114 -> k115, every opponent's first burst - in one tick the engine is at idle,
+    // the wheels stand, the charge and burnout state are 0 and the centre of mass is back, where the car stands.
+    // What sends it is not found; ai.rs asks for it at the burst's end, `AiDriver::grid_input`.)
+    if std::mem::take(&mut vs.grid_reset) {
+        vs.burn = 0.0;
+        vs.burn_state = 0;
+        vs.drive = t.drivetrain_type as u8;
+        vs.cg_set = false;
+        vs.engine_w = e.idle_rpm * 0.104_719_76;
+        vs.omega = [0.0; 2];
+        for w in vs.wheels.iter_mut() {
+            w.spin_rate = 0.0;
+        }
+        vs.rev.on = false;
+        vs.rev.timer = 0.0;
+    }
 
     // ---- gearbox (automatic) ----
     let fwd_speed = st.fwd_speed();
@@ -1105,6 +1137,31 @@ pub fn step(st: &mut CarState, p: &CarParams, vt: &VehTune, input: CarInput, wor
     } else {
         vs.pad = super::pad::PadHeld::default();
     }
+    // ---- the race's grid hold (N-VP-1; recorded on the original 2026-10-18, work/physics2/rec a.0 /
+    // a.2 / a.3): from the first tick on the grid with the engine running until GO the player's chassis
+    // brake, +140, is written 1 once a frame whatever the pedal - the wheels' pedal torque, +480, is the
+    // full one on every tick - while throttle and handbrake pass: the throttle alone revs the engine
+    // against the brake in first gear (the rev limiter cutting from a half), throttle and handbrake burn
+    // out as anywhere. A computer driver gets no such write: its brain brakes itself (ai.rs). ----
+    // (the grid rule itself, mcCarSim::Update 0x8232EC8C..0x8232EDB8, on every car with chassis +592 bit 0x2:
+    // first gear is set out of reverse or neutral (0x82561D90); throttle and handbrake together - a burnout -
+    // keep the throttle, the handbrake is written 1; otherwise the brake is written 1, and with burnout charge
+    // left under the handbrake the throttle 0. The steering, +132, is written 0 in every case - here it is
+    // zeroed where the grid input is made, vehicles.rs. The `noburnout` switch, 0x8288E614, is 0 in a game.)
+    if input.hold {
+        if vs.gear <= 0 {
+            vs.gear = 1;
+            vs.shift_timer = 0.0;
+        }
+        if input.throttle > 0.0 && input.handbrake {
+            input.handbrake = true;
+        } else if vs.burn == 0.0 || !input.handbrake {
+            input.brake = 1.0;
+        } else {
+            input.throttle = 0.0;
+            input.brake = 1.0;
+        }
+    }
     // (a replay's pedals are the recording's chassis +136 - which the update itself leaves cut by the rev
     // limiter, and the pad writes only every other tick: where a sample shows what the last update
     // left there, the pad's own throttle is the one before)
@@ -1145,7 +1202,9 @@ pub fn step(st: &mut CarState, p: &CarParams, vt: &VehTune, input: CarInput, wor
         }
     }
     let pedal_released = (input.throttle <= if input.ai { 0.01 } else { 0.0 }, input.brake <= if input.ai { 0.01 } else { 0.0 });
-    let reverse_wanted = input.brake > 0.1 && input.throttle < 0.1 && fwd_speed < 1.0;
+    // (not on the grid, `hold`: the gearbox is held there whenever the handbrake is off (0x8232F098) and
+    // every recorded racer stays in first gear through its braking phases)
+    let reverse_wanted = !input.hold && input.brake > 0.1 && input.throttle < 0.1 && fwd_speed < 1.0;
     let old_gear = vs.gear;
     // (a replay goes the way its recording's gearbox did: choosing reverse is the pad code's)
     let replay_way = REPLAY_WAY.load(std::sync::atomic::Ordering::Relaxed);
@@ -1309,7 +1368,8 @@ TUNEINPUT {:?} nitro {:?} steering limit {:?}", t.engine.s, t.trans.s, vt.sync_t
                 if vs.drive == 3 { vs.drive = 1; }
                 rest_z(2)
             };
-            vs.by.cg = Some(held_z * t.s.burn_weightxfer);
+            // (0x8232F8E4: on the grid - chassis +592 bit 0x2 - the share is 0.75, 0x8201CCA4, not the tuning's)
+            vs.by.cg = Some(held_z * if input.hold { 0.75 } else { t.s.burn_weightxfer });
             if vs.burn < 1.0 && grounded > 0 {
                 vs.burn = fma32(t.s.burn_incval, dt, vs.burn);
                 if vs.burn > 1.0 {
@@ -1347,7 +1407,8 @@ TUNEINPUT {:?} nitro {:?} steering limit {:?}", t.engine.s, t.trans.s, vt.sync_t
     let mut input = input;
     if vs.by.exact {
         let computer = input.ai || REPLAY_AI.load(std::sync::atomic::Ordering::Relaxed);
-        let held = (vs.gear_change.direction != 0 && vs.gear >= 2) || vs.gear == 0 || (vs.auto_brake > 0.0 && !computer);
+        let held = (vs.gear_change.direction != 0 && vs.gear >= 2) || vs.gear == 0 || (vs.auto_brake > 0.0 && (!computer || input.hold))
+            || (input.hold && vs.burn < 0.95 && !input.handbrake);
         let thr = if vs.gear < 0 { input.brake } else { input.throttle };
         let mut allowed = thr;
         if held || vs.gear == 0 || (vs.gear == 1 && vs.burn > 0.0) || vs.air_time > 0.0 {
@@ -1484,7 +1545,8 @@ TUNEINPUT {:?} nitro {:?} steering limit {:?}", t.engine.s, t.trans.s, vt.sync_t
         vs.way_after = vs.pad.pedals.way as i32;
     } else if !dbg_flag("MCLA_DBG_Z2") && replay_way == 0 && forced == 0 {
         let (thr, brk) = pad_pedals;
-        let wanted = brk > 0.1 && thr < 0.1 && fwd_speed < 1.0;
+        // (not on the grid - `hold`: see `reverse_wanted`)
+        let wanted = !input.hold && brk > 0.1 && thr < 0.1 && fwd_speed < 1.0;
         vs.way_after = if wanted && vs.gear >= 0 && fwd_speed < 0.5 {
             -1
         } else if vs.gear < 0 && ((thr > 0.1 && fwd_speed > -1.0) || fwd_speed > 0.5) && !wanted {
@@ -2368,7 +2430,7 @@ fn physics_frame(st: &mut CarState, vs: &mut VehState, p: &CarParams, vt: &VehTu
             super::exact::approach(&mut vs.cg[0], tuned[0], 0.5, dt);
         } else if vs.burn_state == 1 || vs.burn_state == 2 {
             let held = if matches!(t.drivetrain_type, 0 | 2) { p.wheel_pos[0].z } else { p.wheel_pos[2].z };
-            vs.cg = [0.0, held * t.s.burn_weightxfer];
+            vs.cg = [0.0, held * if input.hold { 0.75 } else { t.s.burn_weightxfer }];
         } else {
             vs.cg[1] += (tuned[1] - vs.cg[1]).clamp(-1.5 * dt, 1.5 * dt);
             // (the end of mcCarSim::Update, 0x823302D8: with the handbrake held a car with a
@@ -2921,13 +2983,26 @@ fn physics_frame(st: &mut CarState, vs: &mut VehState, p: &CarParams, vt: &VehTu
         let w_before = vs.w_then[i];
         vs.w_then[i] = w_static;
         // (the automatic brake replaces the pedals' torque: vehWheel 0x82565320, no BrakeCoef)
-        if hold > 0.0 && !burnout_now && !(input.ai || REPLAY_AI.load(std::sync::atomic::Ordering::Relaxed)) {
+        if hold > 0.0 && !burnout_now && (input.hold || !(input.ai || REPLAY_AI.load(std::sync::atomic::Ordering::Relaxed))) {
             // (RB2: 0x8232F2D8 stands in mcCarSim::Update AHEAD of the centre of mass's way back
             // (0x8232F64C -> 0x82565758 weighs the wheels afresh): the weight in wheel +428 is still the
             // one of the tick before. Seen where a burnout is let go at a standstill - the centre of mass
             // comes back at 1.5 m/s while the automatic brake holds. MCLA_DBG_RB2: this tick's weight.)
             let w_hold = if w_before > 0.0 && vs.by.exact && !dbg_flag("MCLA_DBG_RB2") { w_before } else { w_static };
             prepared[i].brake = wt.static_fric * w_hold * radius * hold;
+        }
+        // (the grid hold, the player's car only: both front wheels' pedal torque is ten times the full
+        // pedal's - +480 = 10 x +484 on every tick of the pre-race, a.0 k1..654 and a.2 with the throttle
+        // down - and the normal one from the GO tick on; a burnout's own braking of the held axle replaces
+        // it, a.3. The rear wheels keep the pedal's / the automatic brake's torque.)
+        // (0x8232F304: 0x82565320 with 10.0, 0x82003A8C - grip x weight (+428, the tick before's, as the
+        // automatic brake reads it) x radius x 10, no BrakeCoef; for the wheels of chassis +404's list: the
+        // wheels the drive layout as it stands does not turn - the Saleen's fronts (a.0, a.2), the R8's fronts
+        // while a burnout has put it on its rear axle (a.1 k608..616: 87 251 = 10 x 8 725) and none while it
+        // drives all four (k150). A burnout's own braking replaces it, a.3.)
+        if input.hold && !powered(i) && !burnout_now {
+            let w_lock = if w_before > 0.0 && vs.by.exact { w_before } else { w_static };
+            prepared[i].brake = ((wt.static_fric * w_lock) * radius) * 10.0;
         }
         // ---- suspension (vehWheel 0x82565858, constants from 0x82564758):
         // N = W + k (x + bump) (1 + k2 (x + bump)) + c v, v the compression's change over the tick ----
