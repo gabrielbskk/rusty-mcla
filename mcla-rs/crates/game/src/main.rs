@@ -233,6 +233,10 @@ struct App {
     /// seconds gone and the up vector of this frame
     garage_tr: Option<(garagecam::CamState, garagecam::CamState, f32)>,
     /// the parts the car in the garage was last built with: a change shows at once
+    /// the race's end: the standings form's pause camera (picked when it comes up) and the
+    /// view held once the game is paused
+    race_end_cam: Option<menu3d::PauseCam>,
+    race_end_hold: Option<(Vec3, Vec3, f32)>,
     garage_built: Option<(usize, vehicle_model::CarConfig, u8)>,
     garage_up: Vec3,
     garage_spots: hashbrown::HashMap<usize, Option<(Vec3, f32)>>,
@@ -587,6 +591,8 @@ impl App {
             garage_cam: None,
             garage_tr: None,
             garage_built: None,
+            race_end_cam: None,
+            race_end_hold: None,
             garage_up: Vec3::Y,
             garage_spots: Default::default(),
             garage_poses: None,
@@ -2698,6 +2704,25 @@ impl App {
                 }
             }
             // (test hook MCLA_SHOT_AFTER_GO=s: the screenshot once the race clock passes s seconds)
+            // (test hook MCLA_RACE_END_SHOTS=<dir>;t1,t2,...: pictures t seconds after the line,
+            // the camera logged in the car's frame - x right, y up, z rear)
+            if let (Ok(v), Some(t)) = (std::env::var("MCLA_RACE_END_SHOTS"), self.game.race_end_t) {
+                static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                let (dir, ts) = v.split_once(';').unwrap_or((".", v.as_str()));
+                let ts: Vec<f32> = ts.split(',').filter_map(|x| x.parse().ok()).collect();
+                let n = NEXT.load(std::sync::atomic::Ordering::Relaxed);
+                if let (Some(&due), Some(car)) = (ts.get(n), self.vehicles.player()) {
+                    if t >= due && self.photo_request.is_none() {
+                        NEXT.store(n + 1, std::sync::atomic::Ordering::Relaxed);
+                        let st = car.render_state(1.0);
+                        let inv = st.rot.inverse();
+                        let (e, l) = (inv * (self.chase.pos - st.pos), inv * (self.chase.look - st.pos));
+                        let f = (l - e).normalize_or(Vec3::Z);
+                        log::info!("race end shot {} at {:.3} s: eye {:.2} {:.2} {:.2} view {:.3} {:.3} {:.3} fov {:.1} scale {:.3}", n, t, e.x, e.y, e.z, f.x, f.y, f.z, self.cam.fov_y.to_degrees(), self.game.mc4_time_scale());
+                        self.photo_request = Some(format!("{}/re_{:02}_{:04}.png", dir, n, (t * 1000.0) as u32));
+                    }
+                }
+            }
             if let (Some(s), Some(r)) = (std::env::var("MCLA_SHOT_AFTER_GO").ok().and_then(|v| v.parse::<f32>().ok()), self.game.race.as_ref()) {
                 if r.countdown <= 0.0 && r.time >= s && !std::mem::replace(&mut self.shot_at_go, true) {
                     log::info!("shot at race clock {:.2} s", r.time);
@@ -4335,7 +4360,8 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                     // _marcel, _nikolai - are played by three story scripts for their own
                     // missions only. The race ends in slow motion: `race_slow_tick`)
                     if std::env::var("MCLA_NO_RACE_SLOW").is_err() {
-                        self.game.race_slow_wait = Some(0.2);
+                        self.game.race_slow_wait = Some(game::Game::RACE_END_PANEL);
+                        self.game.race_end_t = Some(0.0);
                     }
                     let district = self.game.current_race.and_then(|i| self.game.race_defs.get(i)).map(|d| d.district.clone()).unwrap_or_default();
                     let class = self.vehicles.player().and_then(|c| self.game.catalog.get(&c.model.name)).map(|c| c.class.clone()).unwrap_or_default();
@@ -4817,6 +4843,12 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                 // the garage's own cameras: the view that goes with the highlighted row
                 let mut own_view = false;
                 if self.game.mode == Mode::Garage && self.cuts.playing.is_none() && std::env::var("MCLA_NO_GARAGE_CAM").is_err() {
+                // (the race's end before its menu: the driving camera, swung to the standings form's)
+                let race_end_swing = self.game.mode == Mode::Results && self.game.replay.is_none() && self.cuts.playing.is_none() && self.game.race_end_t.map_or(false, |t| t < game::Game::RACE_END_MENU);
+                if !race_end_swing {
+                    self.race_end_cam = None;
+                    self.race_end_hold = None;
+                }
                     if self.garage_views.as_ref().map_or(true, |v| v.0 != car.model.name) {
                         let v = garagecam::Views::load(&self.opt.data_dir, &car.model.name);
                         log::info!("garage: {} camera views for {}", v.as_ref().map_or(0, |v| v.len()), car.model.name);
@@ -4994,7 +5026,7 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                     self.chase.look = look;
                     self.cam.fov_y = fov.to_radians();
                     own_view = true;
-                } else if (matches!(self.game.mode, Mode::Paused | Mode::Results) || (self.game.mode == Mode::RaceSelect && self.game.hangout_key.as_deref().map_or(false, |k| k.contains("delivery")))) && self.cuts.playing.is_none() {
+                } else if (matches!(self.game.mode, Mode::Paused) || (self.game.mode == Mode::Results && !race_end_swing) || (self.game.mode == Mode::RaceSelect && self.game.hangout_key.as_deref().map_or(false, |k| k.contains("delivery")))) && self.cuts.playing.is_none() {
                     if let Some((eye, look, fov)) = self.game.pause_cam {
                         let fwd = render_state.forward();
                         let fwd = Vec3::new(fwd.x, 0.0, fwd.z).normalize_or(Vec3::NEG_Z);
@@ -5269,6 +5301,53 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                     self.chase.look = render_state.pos + render_state.forward() * 6.0;
                 }
                 self.cam.pos = self.chase.pos;
+                // the race's end: forms 54 and 60 come up 0.2 s after the line and the pause movie
+                // takes the camera over from the driving one - the standings form's CameraIndex 2,
+                // PauseCamera3, or its mirror PauseCamera13 when a line from it to its look-at point
+                // is blocked, else PauseCamera1 (sub_82654960). The movie's weight
+                // `player0_cam_ctrl` = sin(acos(1 - temp / 100)), temp += 3 a movie frame (30 a
+                // second, approx.); the two views blended as SetPolarCam's sub_82205A18 does: the
+                // angles and the length of eye - look-at, the look-at and the lens straight. A second
+                // later the game is paused and the picture stands until the menu cuts in.
+                if race_end_swing {
+                    let t = self.game.race_end_t.unwrap_or(0.0);
+                    if let Some(h) = self.race_end_hold {
+                        (self.chase.pos, self.chase.look, self.cam.fov_y) = h;
+                    } else if t >= game::Game::RACE_END_PANEL {
+                        let fwd = render_state.forward();
+                        let fwd = Vec3::new(fwd.x, 0.0, fwd.z).normalize_or(Vec3::NEG_Z);
+                        let right = Vec3::new(-fwd.z, 0.0, fwd.x);
+                        let origin = render_state.pos + right * PAUSE_FRAME.x + Vec3::Y * PAUSE_FRAME.y - fwd * PAUSE_FRAME.z;
+                        let place = |p: Vec3| origin + right * p.x + Vec3::Y * p.y - fwd * p.z;
+                        if self.race_end_cam.is_none() {
+                            let logic = menu3d::UiLogic::load(&self.opt.data_dir);
+                            let cam = |n: usize| logic.pause_cams.get(n - 1).copied();
+                            let clear = |c: &menu3d::PauseCam| world.collider.raycast(place(c.position), (place(c.lookat) - place(c.position)).normalize_or(Vec3::Z), place(c.lookat).distance(place(c.position))).is_none();
+                            self.race_end_cam = cam(3).filter(|c| clear(c)).or_else(|| cam(13).filter(|c| clear(c))).or_else(|| cam(1));
+                        }
+                        if let Some(c) = self.race_end_cam {
+                            let frames = ((t - game::Game::RACE_END_PANEL) * 30.0).floor();
+                            let temp = (frames * 3.0).min(100.0);
+                            let k = (1.0 - temp / 100.0).clamp(-1.0, 1.0).acos().sin();
+                            let (e1, l1, f1) = (place(c.position), place(c.lookat), c.fovy.to_radians());
+                            let (e0, l0, f0) = (self.chase.pos, self.chase.look, self.cam.fov_y);
+                            let polar = |d: Vec3| (d.x.atan2(d.z), d.y.atan2(Vec3::new(d.x, 0.0, d.z).length()), d.length());
+                            let (y0, p0, r0) = polar(e0 - l0);
+                            let (y1, p1, r1) = polar(e1 - l1);
+                            let mut dy = y1 - y0;
+                            if dy > std::f32::consts::PI { dy -= std::f32::consts::TAU; }
+                            if dy < -std::f32::consts::PI { dy += std::f32::consts::TAU; }
+                            let (yaw, pitch, r) = (y0 + dy * k, p0 + (p1 - p0) * k, r0 + (r1 - r0) * k);
+                            let look = l0.lerp(l1, k);
+                            self.chase.look = look;
+                            self.chase.pos = look + Vec3::new(yaw.sin() * pitch.cos(), pitch.sin(), yaw.cos() * pitch.cos()) * r;
+                            self.cam.fov_y = f0 + (f1 - f0) * k;
+                        }
+                        if t >= game::Game::RACE_END_FREEZE {
+                            self.race_end_hold = Some((self.chase.pos, self.chase.look, self.cam.fov_y));
+                        }
+                    }
+                }
             }
         }
         // diagnostics: look at the nearest parked ("parked") or moving ("traffic") ambient car

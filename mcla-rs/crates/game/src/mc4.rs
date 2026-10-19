@@ -11262,9 +11262,23 @@ impl Game {
         self.opt_x.s23.run.as_ref().map_or(false, |r| r.phase == 2 && !r.modeless && tutorial_keys(r.form).map_or(false, |k| k.0 == title))
     }
 
+    /// The race's end after the line, in real seconds (EndOfRaceSequence and its forms, decoded
+    /// 2026-10-19 and timed against a recording of the original - CAREER_RACES.md): after
+    /// WAITUNWARPED(200) forms 60 (mcEndOfRaceForm) and 54 (mcStandingsForm, the place) come up
+    /// and the camera swings to the standings form's PauseCamera3.
+    pub const RACE_END_PANEL: f32 = 0.2;
+    /// mcEndOfRaceForm's update (sub_82674120) pauses the game when its own clock reaches 1 s.
+    pub const RACE_END_FREEZE: f32 = 1.2;
+    /// The standings panel's WAITUNWARPED(2200) ends: forms 54 and 60 close, the race-over menu.
+    pub const RACE_END_MENU: f32 = 2.4;
+
     /// The global time scale (0x827E1C34): what the simulation's time is multiplied by.
     pub fn mc4_time_scale(&self) -> f32 {
         // (the race's end: the main loop never lets the scale under 0.1 - sub_822C1FA8)
+        // (and a second after its panels came up, form 60 pauses the game: UILogic_PauseGame)
+        if self.race_end_t.map_or(false, |t| t >= Self::RACE_END_FREEZE) && self.replay.is_none() {
+            return 0.0;
+        }
         self.opt_x.s23.slow.global.clamp(0.0, 1.0).min(self.race_slow.global.clamp(0.1, 1.0))
     }
 
@@ -11280,7 +11294,11 @@ impl Game {
                 self.race_slow = SlowMo::default();
                 self.race_slow_wait = None;
             }
+            self.race_end_t = None;
             return;
+        }
+        if let Some(t) = self.race_end_t.as_mut() {
+            *t += dt;
         }
         if let Some(w) = self.race_slow_wait.as_mut() {
             *w -= dt;
@@ -16215,6 +16233,28 @@ mod tests {
         // (leaving the race: back to 1)
         g.mode = crate::game::Mode::FreeRoam;
         g.race_slow_tick(0.016);
+        assert_eq!(g.mc4_time_scale(), 1.0);
+    }
+
+    /// The race's end: the panels 0.2 s after the line, the game paused at 1.2 s (form 60's
+    /// one second), held through the menu, running again once the race is left.
+    #[test]
+    fn race_end_pause() {
+        let mut g = crate::game::Game::new(Vec::new(), 0);
+        g.mode = crate::game::Mode::Results;
+        g.race_slow_wait = Some(crate::game::Game::RACE_END_PANEL);
+        g.race_end_t = Some(0.0);
+        for _ in 0..11 {
+            g.race_slow_tick(0.1);
+        }
+        assert_eq!(g.mc4_time_scale(), 0.1);
+        g.race_slow_tick(0.1);
+        assert_eq!(g.mc4_time_scale(), 0.0);
+        g.race_slow_tick(10.0);
+        assert_eq!(g.mc4_time_scale(), 0.0);
+        g.mode = crate::game::Mode::FreeRoam;
+        g.race_slow_tick(0.016);
+        assert_eq!(g.race_end_t, None);
         assert_eq!(g.mc4_time_scale(), 1.0);
     }
 

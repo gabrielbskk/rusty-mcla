@@ -550,6 +550,8 @@ pub struct Game {
     /// on form 60, 0.2 s of real time after the end-of-race speech) and the wait before it
     pub race_slow: crate::mc4::SlowMo,
     pub race_slow_wait: Option<f32>,
+    /// real seconds since the player crossed the line (the race-end panels, `RACE_END_*`)
+    pub race_end_t: Option<f32>,
     /// the results on show are a career race's (panels, then the cruise - no menu)
     pub career_over: bool,
     /// a new career's save boxes: 0 not shown yet, 1 the ALERT is up, 2 done; and the
@@ -1091,6 +1093,9 @@ impl Game {
             save_box: 0,
             race_slow: crate::mc4::SlowMo::default(),
             race_slow_wait: None,
+            race_end_t: None,
+            career_over: false,
+            save_box: 0,
             box_sel: 0,
             tutorial_box: None,
             fresh_game: false,
@@ -2398,7 +2403,9 @@ impl Game {
         // third place and in a pink slip race. `sr_rewards` - REP EARNED: 60, no money row -
         // is a fourth place of four: 250 x 1/4 cut to tens, and no money past third)
         self.adaptive.result(place == 1, self.race_diff as i32);
-        self.place_splash = Some((place, PLACE_SPLASH_SECS));
+        // (a race's place is the standings form 54: up 0.2 s after the line, closed after its
+        // WAITUNWARPED(2200) - the splash's clock runs from the line)
+        self.place_splash = Some((place, Self::RACE_END_MENU));
         self.rb_step = None;
         log::info!("reward: place {}/{} difficulty {} class {} -> ${} rep {} (race time {:.1} s)", place, field, self.race_diff, crate::rewards::perf_class(self.player_perf()), money, rep, self.race.as_ref().map_or(0.0, |r| r.time));
         self.money += money;
@@ -11340,6 +11347,10 @@ impl Game {
             // (the movie's own rule: TIED stands over the place; DNF is the name itself, larger)
             MenuPage { layout: MenuLayout::Position { suffix: if look == 2 { String::new() } else { st(suffix, &suffix.to_uppercase()) }, look }, title: if look == 2 { st("RACE_RESULT_DNF", "DNF") } else { place.to_string() }, select: usize::MAX, ..MenuPage::default() }
         } else if let Some(page) = s19d_banner {
+        // (the race's end: nothing over the picture until WAITUNWARPED(200) is over)
+        if self.race_end_t.map_or(false, |t| t < Self::RACE_END_PANEL) && self.replay.is_none() {
+            return true;
+        }
             // (step 19d: a time trial's event results banner - form 56 - before its panel)
             page
         } else if let Some(cur) = self.replay.as_ref().and_then(|p| p.menu) {
