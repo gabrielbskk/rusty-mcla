@@ -566,6 +566,12 @@ pub struct Game {
     pub dive_k: f32,
     /// race time stepped since the last UI frame: the HUD's 3-2-1 runs on it, so it stays on the race clock
     pub ui_sim_dt: f32,
+    /// a start scene before its countdown event: no HUD (the original brings the HUD - map and 3-2-1 - up
+    /// with the countdown, over the scene's camera: work/career2/cap/d1_10.png)
+    pub scene_hud_off: bool,
+    /// the pause menu's NEXT RACE started this race: not a "first race" for the start-scene picker (the
+    /// original drew from the grid list both times: work/career2/cap/README.md n1, n3)
+    pub next_race_start: bool,
     /// the hangout pulled into, by its key in the string table (`hw_local_hangout1` ...),
     /// the difficulty chosen on its panel, and the difficulty an event was accepted at
     pub hangout_key: Option<String>,
@@ -1084,6 +1090,8 @@ impl Game {
             starter_swap: None,
             dive_k: 0.0,
             ui_sim_dt: 0.0,
+            scene_hud_off: false,
+            next_race_start: false,
             hangout_key: None,
             hangout_diff: 0,
             hangout_page: (0, 0),
@@ -2749,12 +2757,14 @@ impl Game {
             // (the race scripts: SafetyCam 1 -> the Safety list; no opponents -> grid 0, 1x1; camOnly =
             // !AllowRaceStarter; a first race = a single race or a series' first round)
             let grid = if def.safety_cam { "Safety".to_string() } else if n_opp == 0 { "1x1_Race_Grid".to_string() } else { def.grid_type.clone() };
-            let first_race = self.series.as_ref().map_or(true, |s| s.at == 0);
+            let first_race = self.series.as_ref().map_or(true, |s| s.at == 0) && !std::mem::take(&mut self.next_race_start);
             let slot1 = def.grid.get(1).map_or(def.grid[0].0, |g| g.0);
             self.prerace_args = Some((crate::prerace::PickArgs { grid, first_race, cam_only: def.no_starter, front_lr: false }, [def.grid[0].0, slot1]));
         }
-        // the player starts at the back of the field, like the original
-        let pslot = n_opp.min(def.grid.len() - 1);
+        // the race's racer list puts the player first and racer i on grid slot i (Cars_AssignIdToSlot /
+        // RaceGrid): recorded AROUND HOLLYWOOD, the player's Saleen on GridPosition 0 exactly
+        // (work/physics2/rec/a.0.bin), the three opponents on slots 1..3
+        let pslot = 0;
         let (pp, pyaw) = def.grid[pslot];
         vehicles.cars[pi].state = crate::physics::CarState::new(pp + Vec3::Y * 0.9, pyaw);
         vehicles.cars[pi].placed = false;
@@ -2766,7 +2776,7 @@ impl Game {
         // (a wager is one on one, against the car nearest to the difficulty paid for)
         let wager_model = self.wager.filter(|_| kind == RaceKind::Race).and_then(|(_, d)| models.iter().min_by_key(|m| (self.difficulty_of(&m.name) - d as i32).abs()).cloned());
         for k in 0..n_opp {
-            let (p, yaw) = def.grid[k];
+            let (p, yaw) = def.grid[(k + 1).min(def.grid.len() - 1)];
             let mut model = wager_model.clone().unwrap_or_else(|| models[(k + 1) % models.len()].clone());
             let mut color = PALETTE[(k * 3 + 1) % PALETTE.len()];
             // a named rival in his own car and paint
@@ -3451,6 +3461,7 @@ impl Game {
                         self.current_race = Some(next);
                         self.wager = None;
                         action = MenuAction::StartRace;
+                        self.next_race_start = true;
                         self.pause_page = 0;
                     }
                 }
@@ -7472,7 +7483,10 @@ impl Game {
                 // `y_replay_intro`) - and no bars.
                 let dive_name = String::new();
                 let p080_dl = self.race.as_ref().map_or(false, |r| r.kind == RaceKind::Delivery);
-                let badge_from = if self.dive_k > 0.45 && !p080_dl { Some(&dive_name) } else { self.cine.as_ref().filter(|s| !s.is_empty()) };
+                // (the fly-in has no badge - the original's opening shots, work/career2/cap/d1_03..04; it comes
+                // with the start scene's racename event)
+                let _ = (&dive_name, p080_dl);
+                let badge_from = self.cine.as_ref().filter(|s| !s.is_empty());
                 let race_badge = match (badge_from, self.race.as_ref(), self.current_race.and_then(|i| self.race_defs.get(i))) {
                     (Some(sub), Some(_), Some(d)) if !self.cine_black && self.flash_popup.is_some() && self.message_box.is_none() && self.arrest_panel.is_none() => {
                         let name = self.career.strings.get(&d.id).filter(|v| !v.contains('<')).map(|v| v.to_uppercase()).unwrap_or_else(|| sub.clone());
@@ -7520,17 +7534,9 @@ impl Game {
                         fp.hide();
                     }
                 }
-                // a race's start scene (the HUD below is not drawn while its badge or letterbox is up):
-                // the 3-2-1 comes over the scene's camera from its countdown event (GO 3 s later,
-                // prerace.rs; the "3" over the grid scene, rec/g2.png), the rest of the HUD with the cut
-                // to the game camera
-                if race_badge_shown(self.start_badge_on) || self.dive_k > 0.0 || self.cine.is_some() {
-                    if let (Some(countdown), Some(fh)) = (self.race.as_ref().map(|r| r.countdown).filter(|c| *c > 0.0 && *c <= 3.0), self.flash_hud.as_mut()) {
-                        fh.drive_replay_intro(countdown, race_dt);
-                        fh.movie.paint(ctx, &ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("flash_hud"))));
-                    }
-                }
-                if race_badge_shown(self.start_badge_on) || self.dive_k > 0.0 {
+                // a race's start scene: no HUD before its countdown event, the race HUD (map and 3-2-1)
+                // from it on over the scene's camera (GO 3 s later, prerace.rs)
+                if race_badge_shown(self.start_badge_on) || self.dive_k > 0.0 || self.scene_hud_off {
                 } else if let Some(sub) = self.cine.as_ref() {
                     // story scene: black bars, the line being spoken in the lower one
                     let screen = ctx.screen_rect();

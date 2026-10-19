@@ -161,6 +161,397 @@ impl Picker {
     }
 }
 
+/// A scene event aimed at a racer slot (kind 2: `CineScript_Events_LaunchEventOnRacerSlot`, sub_823C5220) or
+/// at the scene's speech (`playspeech`, `stopaudiostreams`), from the scene script's 7-word event records
+/// (name, kind, racer name, slot, time, duration, f3 - f3 is 0 in every race-start scene). Slot i is the race's
+/// racer list index i (`Cars_AssignIdToSlot`); `*_left` events go to slot 0, `*_right` to slot 1. `dur` 0 = no
+/// end call. Read with `work/career2/re2/evrec.py` -> `work/career2/gen_ev.py`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SlotEvent {
+    pub scene: &'static str,
+    pub event: &'static str,
+    pub slot: i32,
+    pub t: f32,
+    pub dur: f32,
+}
+
+/// The slot / speech events of a scene, in the script's order. (gesture_left / gesture_right before 1 s are
+/// moved to 1 s in a race-start scene, 0x823C5264.)
+pub fn slot_events(scene: &str) -> Vec<SlotEvent> {
+    let name = scene.rsplit('/').next().unwrap_or(scene).to_ascii_lowercase();
+    SLOT_EVENTS.iter().filter(|e| e.scene == name).map(|e| {
+        let mut e = *e;
+        if (e.event == "gesture_left" || e.event == "gesture_right") && e.t < 1.0 {
+            e.t = 1.0;
+        }
+        e
+    }).collect()
+}
+
+/// The taunt speech scenario a scene prepares (`CineScript_RequestPreraceTauntScenarioAudio`, sub_823BFC78):
+/// a name with TAUNT -> `TAUNT_PRERACE_HP` (sender slot 1, the hookman; receiver slot 0), else with PH ->
+/// `TAUNT_PRERACE_PH` (sender slot 0), else `TAUNT_PRERACE_H` (slot 1 alone). None for other scenes.
+pub fn taunt_kind(scene: &str) -> Option<&'static str> {
+    let n = scene.rsplit('/').next().unwrap_or(scene).to_ascii_uppercase();
+    if !n.contains("TAUNT") {
+        return None;
+    }
+    Some(if n.contains("HP") { "HP" } else if n.contains("PH") { "PH" } else { "H" })
+}
+
+pub const SLOT_EVENTS: [SlotEvent; 311] = [
+    SlotEvent { scene: "taunt_01", event: "gesture_left", slot: 0, t: 0.0, dur: 7.33333 },
+    SlotEvent { scene: "taunt_01", event: "gesture_right", slot: 1, t: 0.0, dur: 7.33333 },
+    SlotEvent { scene: "taunt_02", event: "gesture_left", slot: 0, t: 0.0, dur: 6.66667 },
+    SlotEvent { scene: "taunt_02", event: "gesture_right", slot: 1, t: 0.0, dur: 6.66667 },
+    SlotEvent { scene: "taunt_03", event: "gesture_left", slot: 0, t: 0.0, dur: 6.66667 },
+    SlotEvent { scene: "taunt_03", event: "gesture_right", slot: 1, t: 0.0, dur: 6.66667 },
+    SlotEvent { scene: "taunt_04", event: "gesture_left", slot: 0, t: 0.0, dur: 6.66667 },
+    SlotEvent { scene: "taunt_04", event: "gesture_right", slot: 1, t: 0.0, dur: 6.66667 },
+    SlotEvent { scene: "taunt_05", event: "gesture_left", slot: 0, t: 0.0, dur: 6.66667 },
+    SlotEvent { scene: "taunt_05", event: "gesture_right", slot: 1, t: 0.0, dur: 6.66667 },
+    SlotEvent { scene: "cut_racestart_1x8_01", event: "gesture_left", slot: 0, t: 0.0, dur: 0.0 },
+    SlotEvent { scene: "cut_racestart_1x8_01", event: "gesture_right", slot: 1, t: 0.0, dur: 0.0 },
+    SlotEvent { scene: "cut_racestart_1x8_02", event: "gesture_left", slot: 0, t: 1.0, dur: 0.0 },
+    SlotEvent { scene: "cut_racestart_1x8_02", event: "gesture_right", slot: 1, t: 4.36667, dur: 0.0 },
+    SlotEvent { scene: "cut_racestart_2x4_split_01", event: "gesture_left", slot: 0, t: 2.33333, dur: 0.0 },
+    SlotEvent { scene: "cut_racestart_2x4_split_01", event: "gesture_right", slot: 1, t: 3.7, dur: 0.0 },
+    SlotEvent { scene: "cut_racestart_2x4_split_02", event: "gesture_left", slot: 0, t: 1.33333, dur: 0.0 },
+    SlotEvent { scene: "cut_racestart_2x4_split_02", event: "gesture_right", slot: 1, t: 5.33333, dur: 0.0 },
+    SlotEvent { scene: "cut_racestart_3x3_01", event: "gesture_left", slot: 0, t: 1.0, dur: 0.0 },
+    SlotEvent { scene: "cut_racestart_3x3_01", event: "gesture_right", slot: 1, t: 1.0, dur: 0.0 },
+    SlotEvent { scene: "cut_racestart_3x3_02", event: "gesture_left", slot: 0, t: 4.7, dur: 0.0 },
+    SlotEvent { scene: "cut_racestart_3x3_02", event: "gesture_right", slot: 1, t: 6.33333, dur: 0.0 },
+    SlotEvent { scene: "cut_racestart_3x3_03", event: "gesture_left", slot: 0, t: 3.0, dur: 0.0 },
+    SlotEvent { scene: "cut_racestart_3x3_03", event: "gesture_right", slot: 1, t: 4.03333, dur: 0.0 },
+    SlotEvent { scene: "cut_racestart_3x3_04", event: "gesture_right", slot: 1, t: 4.0, dur: 0.0 },
+    SlotEvent { scene: "cut_racestart_3x3_04", event: "gesture_left", slot: 0, t: 5.0, dur: 0.0 },
+    SlotEvent { scene: "cut_racestart_3x3_split_01", event: "gesture_right", slot: 1, t: 4.03333, dur: 0.0 },
+    SlotEvent { scene: "cut_racestart_3x3_split_01", event: "gesture_left", slot: 0, t: 5.66667, dur: 0.0 },
+    SlotEvent { scene: "cut_racestart_3x3_split_02", event: "gesture_left", slot: 0, t: 1.66667, dur: 0.0 },
+    SlotEvent { scene: "cut_racestart_3x3_split_02", event: "gesture_right", slot: 1, t: 2.33333, dur: 0.0 },
+    SlotEvent { scene: "cut_racestart_safety_1", event: "window_down_left", slot: 0, t: 0.0, dur: 0.0 },
+    SlotEvent { scene: "cut_racestart_safety_1", event: "playspeech", slot: -1, t: 0.66667, dur: 0.0 },
+    SlotEvent { scene: "cut_racestart_safety_1", event: "gesture_left", slot: 0, t: 1.0, dur: 0.0 },
+    SlotEvent { scene: "cut_racestart_safety_1", event: "gesture_listen_right", slot: 1, t: 1.33333, dur: 0.0 },
+    SlotEvent { scene: "cut_racestart_safety_1", event: "window_up_left", slot: 0, t: 6.0, dur: 0.0 },
+    SlotEvent { scene: "cut_racestart_taunt_hk_01", event: "gesture_right", slot: 1, t: 1.66667, dur: 0.0 },
+    SlotEvent { scene: "cut_racestart_taunt_hk_plyr_01", event: "gesture_right", slot: 1, t: 1.0, dur: 0.0 },
+    SlotEvent { scene: "cut_racestart_taunt_hk_plyr_01", event: "gesture_left", slot: 0, t: 5.66667, dur: 0.0 },
+    SlotEvent { scene: "cut_racestart_taunt_hk_plyr_02", event: "gesture_right", slot: 1, t: 2.66667, dur: 0.0 },
+    SlotEvent { scene: "cut_racestart_taunt_hk_plyr_02", event: "gesture_left", slot: 0, t: 7.0, dur: 0.0 },
+    SlotEvent { scene: "cut_racestart_taunt_plyr_hk_02", event: "gesture_left", slot: 0, t: 6.0, dur: 0.0 },
+    SlotEvent { scene: "cut_racestart_taunt_plyr_hk_02", event: "gesture_right", slot: 1, t: 6.33333, dur: 0.0 },
+    SlotEvent { scene: "cut_racestart_taunt_plyr_hk_01", event: "gesture_right", slot: 1, t: 3.0, dur: 0.0 },
+    SlotEvent { scene: "cut_racestart_taunt_plyr_hk_01", event: "gesture_left", slot: 0, t: 7.0, dur: 0.0 },
+    SlotEvent { scene: "cut_racestarter_1x8_01", event: "gesture_left", slot: 0, t: 3.0, dur: 0.0 },
+    SlotEvent { scene: "cut_racestarter_1x8_01", event: "gesture_right", slot: 1, t: 4.03333, dur: 0.0 },
+    SlotEvent { scene: "cut_racestarter_1x8_02", event: "gesture_left", slot: 0, t: 1.0, dur: 0.0 },
+    SlotEvent { scene: "cut_racestarter_1x8_02", event: "gesture_right", slot: 1, t: 8.33333, dur: 0.0 },
+    SlotEvent { scene: "cut_racestarter_2x4_01", event: "gesture_left", slot: 0, t: 1.0, dur: 0.0 },
+    SlotEvent { scene: "cut_racestarter_2x4_01", event: "gesture_right", slot: 1, t: 1.66667, dur: 0.0 },
+    SlotEvent { scene: "cut_racestarter_2x4_02", event: "gesture_right", slot: 1, t: 1.66667, dur: 0.0 },
+    SlotEvent { scene: "cut_racestarter_2x4_02", event: "gesture_left", slot: 0, t: 5.5, dur: 0.0 },
+    SlotEvent { scene: "cut_racestarter_2x4_03", event: "gesture_left", slot: 0, t: 5.66667, dur: 0.0 },
+    SlotEvent { scene: "cut_racestarter_2x4_03", event: "gesture_right", slot: 1, t: 5.66667, dur: 0.0 },
+    SlotEvent { scene: "cut_racestarter_2x4_04", event: "gesture_left", slot: 0, t: 5.0, dur: 0.0 },
+    SlotEvent { scene: "cut_racestarter_2x4_04", event: "gesture_right", slot: 1, t: 6.66667, dur: 0.0 },
+    SlotEvent { scene: "cut_racestarter_2x4_split_01", event: "gesture_left", slot: 0, t: 1.0, dur: 0.0 },
+    SlotEvent { scene: "cut_racestarter_2x4_split_01", event: "gesture_right", slot: 1, t: 2.66667, dur: 0.0 },
+    SlotEvent { scene: "cut_racestarter_2x4_split_02", event: "gesture_left", slot: 0, t: 2.83333, dur: 0.0 },
+    SlotEvent { scene: "cut_racestarter_2x4_split_02", event: "gesture_right", slot: 1, t: 5.76667, dur: 0.0 },
+    SlotEvent { scene: "cut_racestarter_3x3_01", event: "gesture_right", slot: 1, t: 3.0, dur: 0.0 },
+    SlotEvent { scene: "cut_racestarter_3x3_01", event: "gesture_left", slot: 0, t: 7.16667, dur: 0.0 },
+    SlotEvent { scene: "cut_racestarter_3x3_02", event: "gesture_right", slot: 1, t: 4.33333, dur: 0.0 },
+    SlotEvent { scene: "cut_racestarter_3x3_02", event: "gesture_left", slot: 0, t: 6.33333, dur: 0.0 },
+    SlotEvent { scene: "cut_racestarter_3x3_03", event: "gesture_left", slot: 0, t: 2.03333, dur: 0.0 },
+    SlotEvent { scene: "cut_racestarter_3x3_03", event: "gesture_right", slot: 1, t: 2.03333, dur: 0.0 },
+    SlotEvent { scene: "cut_racestarter_3x3_04", event: "gesture_left", slot: 0, t: 5.7, dur: 0.0 },
+    SlotEvent { scene: "cut_racestarter_3x3_04", event: "gesture_right", slot: 1, t: 5.7, dur: 0.0 },
+    SlotEvent { scene: "cut_racestarter_3x3_05", event: "gesture_left", slot: 0, t: 4.36667, dur: 0.0 },
+    SlotEvent { scene: "cut_racestarter_3x3_05", event: "gesture_right", slot: 1, t: 4.36667, dur: 0.0 },
+    SlotEvent { scene: "cut_racestarter_3x3_06", event: "gesture_left", slot: 0, t: 4.03333, dur: 0.0 },
+    SlotEvent { scene: "cut_racestarter_3x3_06", event: "gesture_right", slot: 1, t: 4.03333, dur: 0.0 },
+    SlotEvent { scene: "cut_racestarter_3x3_split_01", event: "gesture_left", slot: 0, t: 1.66667, dur: 0.0 },
+    SlotEvent { scene: "cut_racestarter_3x3_split_01", event: "gesture_right", slot: 1, t: 1.66667, dur: 0.0 },
+    SlotEvent { scene: "cut_racestarter_3x3_split_02", event: "gesture_left", slot: 0, t: 1.0, dur: 0.0 },
+    SlotEvent { scene: "cut_racestarter_3x3_split_02", event: "gesture_right", slot: 1, t: 1.0, dur: 0.0 },
+    SlotEvent { scene: "cut_racestarter_4x2_01", event: "gesture_left", slot: 0, t: 1.0, dur: 0.0 },
+    SlotEvent { scene: "cut_racestarter_4x2_01", event: "gesture_right", slot: 1, t: 1.0, dur: 0.0 },
+    SlotEvent { scene: "cut_racestarter_4x2_02", event: "gesture_left", slot: 0, t: 4.8, dur: 0.0 },
+    SlotEvent { scene: "cut_racestarter_4x2_02", event: "gesture_right", slot: 1, t: 4.8, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_delivery_1x1_01", event: "gesture_neutral", slot: 0, t: 2.33333, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_delivery_1x1_02", event: "gesture_neutral", slot: 0, t: 2.0, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_delivery_1x1_03", event: "gesture_neutral", slot: 0, t: 2.16667, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_grid_1x1_01", event: "gesture_neutral", slot: 0, t: 3.5, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_grid_1x1_02", event: "gesture_neutral", slot: 0, t: 1.66667, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_grid_1x1_03", event: "gesture_neutral", slot: 0, t: 1.33333, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_grid_1x8_07", event: "gesture_right", slot: 1, t: 0.0, dur: 6.26667 },
+    SlotEvent { scene: "gen_prerace_grid_1x8_07", event: "gesture_left", slot: 0, t: 4.0, dur: 2.26667 },
+    SlotEvent { scene: "gen_prerace_grid_2x4_01", event: "gesture_listen_right", slot: 1, t: 0.0, dur: 5.16667 },
+    SlotEvent { scene: "gen_prerace_grid_2x4_01", event: "gesture_listen_left", slot: 0, t: 0.0, dur: 5.16667 },
+    SlotEvent { scene: "gen_prerace_grid_2x4_02", event: "gesture_listen_right", slot: 1, t: 0.0, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_grid_2x4_02", event: "window_down_left", slot: 0, t: 0.0, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_grid_2x4_02", event: "gesture_thm_dwn_lft", slot: 0, t: 1.5, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_grid_2x4_02", event: "window_up_left", slot: 0, t: 5.33333, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_grid_2x4_03", event: "gesture_listen_left", slot: 0, t: 0.0, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_grid_2x4_03", event: "gesture_listen_right", slot: 1, t: 0.0, dur: 3.66667 },
+    SlotEvent { scene: "gen_prerace_grid_2x4_03", event: "gesture_thm_dwn_rgt", slot: 1, t: 3.5, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_grid_2x4_04", event: "gesture_listen_left", slot: 0, t: 0.0, dur: 5.66667 },
+    SlotEvent { scene: "gen_prerace_grid_2x4_04", event: "gesture_listen_right", slot: 1, t: 0.0, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_grid_2x4_05", event: "gesture_listen_left", slot: 0, t: 0.0, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_grid_2x4_05", event: "gesture_listen_right", slot: 1, t: 0.66667, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_grid_2x4_06", event: "gesture_listen_left", slot: 0, t: 0.0, dur: 5.33333 },
+    SlotEvent { scene: "gen_prerace_grid_2x4_06", event: "gesture_listen_right", slot: 1, t: 0.0, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_grid_2x4_07", event: "gesture_listen_left", slot: 0, t: 0.0, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_grid_2x4_07", event: "gesture_listen_right", slot: 1, t: 0.0, dur: 3.86667 },
+    SlotEvent { scene: "gen_prerace_grid_2x4_07", event: "gesture_thm_dwn_rgt", slot: 1, t: 3.9, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_grid_2x4_split_02", event: "gesture_listen_left", slot: 0, t: 0.0, dur: 4.6 },
+    SlotEvent { scene: "gen_prerace_grid_2x4_split_02", event: "gesture_thm_dwn_rgt", slot: 1, t: 0.23333, dur: 1.66667 },
+    SlotEvent { scene: "gen_prerace_grid_2x4_split_02", event: "gesture_listen_right", slot: 1, t: 1.93333, dur: 2.66667 },
+    SlotEvent { scene: "gen_prerace_grid_2x4_split_03", event: "gesture_left", slot: 0, t: 0.0, dur: 8.0 },
+    SlotEvent { scene: "gen_prerace_grid_2x4_split_03", event: "gesture_right", slot: 1, t: 0.0, dur: 8.0 },
+    SlotEvent { scene: "gen_prerace_grid_2x4_split_04", event: "gesture_left", slot: 0, t: 0.0, dur: 9.1 },
+    SlotEvent { scene: "gen_prerace_grid_2x4_split_04", event: "gesture_right", slot: 1, t: 0.0, dur: 9.1 },
+    SlotEvent { scene: "gen_prerace_grid_2x4_split_05", event: "window_down_left", slot: 0, t: 0.0, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_grid_2x4_split_05", event: "gesture_thm_dwn_lft", slot: 0, t: 0.5, dur: 2.6 },
+    SlotEvent { scene: "gen_prerace_grid_2x4_split_05", event: "gesture_listen_right", slot: 1, t: 0.66667, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_grid_2x4_split_05", event: "gesture_listen_left", slot: 0, t: 3.13333, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_grid_2x4_split_05", event: "window_up_left", slot: 0, t: 5.66667, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_grid_2x4_split_06", event: "gesture_listen_right", slot: 1, t: 0.0, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_grid_2x4_split_06", event: "gesture_thm_dwn_lft", slot: 0, t: 0.5, dur: 2.6 },
+    SlotEvent { scene: "gen_prerace_grid_2x4_split_06", event: "gesture_listen_left", slot: 0, t: 3.13333, dur: 2.53333 },
+    SlotEvent { scene: "gen_prerace_grid_2x4_split_07", event: "gesture_right", slot: 1, t: 1.0, dur: 5.13333 },
+    SlotEvent { scene: "gen_prerace_grid_2x4_split_07", event: "gesture_left", slot: 0, t: 2.5, dur: 3.63333 },
+    SlotEvent { scene: "gen_prerace_grid_2x4_split_08", event: "gesture_listen_right", slot: 1, t: 0.0, dur: 2.46667 },
+    SlotEvent { scene: "gen_prerace_grid_2x4_split_08", event: "gesture_listen_left", slot: 0, t: 1.0, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_grid_2x4_split_08", event: "gesture_thm_dwn_rgt", slot: 1, t: 3.16667, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_grid_3x3_02", event: "gesture_listen_right", slot: 1, t: 1.0, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_grid_3x3_02", event: "gesture_listen_left", slot: 0, t: 1.66667, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_grid_3x3_03", event: "gesture_listen_right", slot: 1, t: 0.0, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_grid_3x3_03", event: "gesture_neutral", slot: 0, t: 1.16667, dur: 1.4 },
+    SlotEvent { scene: "gen_prerace_grid_3x3_03", event: "gesture_listen_left", slot: 0, t: 2.6, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_grid_3x3_04", event: "gesture_listen_left", slot: 0, t: 0.0, dur: 2.8 },
+    SlotEvent { scene: "gen_prerace_grid_3x3_04", event: "gesture_listen_right", slot: 1, t: 1.0, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_grid_3x3_04", event: "gesture_thm_dwn_lft", slot: 0, t: 2.83333, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_grid_3x3_05", event: "gesture_listen_left", slot: 0, t: 0.66667, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_grid_3x3_05", event: "gesture_thm_dwn_rgt", slot: 1, t: 1.0, dur: 1.33333 },
+    SlotEvent { scene: "gen_prerace_grid_3x3_05", event: "gesture_listen_right", slot: 1, t: 2.36667, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_grid_3x3_06", event: "gesture_listen_left", slot: 0, t: 0.66667, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_grid_3x3_06", event: "gesture_thm_dwn_rgt", slot: 1, t: 2.0, dur: 1.93333 },
+    SlotEvent { scene: "gen_prerace_grid_3x3_06", event: "gesture_listen_right", slot: 1, t: 3.96667, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_grid_3x3_07", event: "gesture_listen_right", slot: 1, t: 0.0, dur: 3.66667 },
+    SlotEvent { scene: "gen_prerace_grid_3x3_07", event: "gesture_listen_left", slot: 0, t: 2.83333, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_grid_3x3_07", event: "gesture_neutral", slot: 1, t: 3.83333, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_grid_3x3_08", event: "gesture_listen_left", slot: 0, t: 0.0, dur: 6.83333 },
+    SlotEvent { scene: "gen_prerace_grid_3x3_08", event: "gesture_listen_right", slot: 1, t: 0.0, dur: 3.66667 },
+    SlotEvent { scene: "gen_prerace_grid_3x3_08", event: "gesture_thm_dwn_rgt", slot: 1, t: 4.03333, dur: 2.8 },
+    SlotEvent { scene: "gen_prerace_grid_4x2_01", event: "gesture_right", slot: 1, t: 1.0, dur: 10.0 },
+    SlotEvent { scene: "gen_prerace_grid_4x2_01", event: "gesture_left", slot: 0, t: 2.83333, dur: 8.16667 },
+    SlotEvent { scene: "gen_prerace_grid_4x2_02", event: "gesture_neutral", slot: 0, t: 0.0, dur: 7.6 },
+    SlotEvent { scene: "gen_prerace_grid_4x2_02", event: "gesture_neutral", slot: 1, t: 0.0, dur: 7.6 },
+    SlotEvent { scene: "gen_prerace_grid_4x2_03", event: "gesture_neutral", slot: 0, t: 0.0, dur: 8.0 },
+    SlotEvent { scene: "gen_prerace_grid_4x2_03", event: "gesture_neutral", slot: 1, t: 0.0, dur: 8.0 },
+    SlotEvent { scene: "gen_prerace_grid_4x2_04", event: "gesture_neutral", slot: 0, t: 0.0, dur: 9.1 },
+    SlotEvent { scene: "gen_prerace_grid_4x2_04", event: "gesture_neutral", slot: 1, t: 0.0, dur: 9.1 },
+    SlotEvent { scene: "gen_prerace_grid_4x2_05", event: "gesture_neutral", slot: 0, t: 0.0, dur: 7.0 },
+    SlotEvent { scene: "gen_prerace_grid_4x2_05", event: "gesture_neutral", slot: 1, t: 0.0, dur: 7.0 },
+    SlotEvent { scene: "gen_prerace_grid_4x2_06", event: "gesture_neutral", slot: 1, t: 2.0, dur: 4.8 },
+    SlotEvent { scene: "gen_prerace_grid_4x2_06", event: "gesture_neutral", slot: 0, t: 4.0, dur: 2.8 },
+    SlotEvent { scene: "gen_prerace_grid_4x2_07", event: "gesture_neutral", slot: 1, t: 1.0, dur: 5.13333 },
+    SlotEvent { scene: "gen_prerace_grid_4x2_07", event: "gesture_neutral", slot: 0, t: 2.5, dur: 3.63333 },
+    SlotEvent { scene: "gen_prerace_grid_4x2_08", event: "gesture_neutral", slot: 0, t: 2.66667, dur: 4.16667 },
+    SlotEvent { scene: "gen_prerace_grid_4x2_08", event: "gesture_neutral", slot: 1, t: 3.66667, dur: 3.16667 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_01", event: "gesture_listen_left", slot: 0, t: 0.0, dur: 6.63333 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_01", event: "window_down_left", slot: 0, t: 0.0, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_01", event: "gesture_neutral", slot: 1, t: 0.83333, dur: 2.63333 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_01", event: "gesture_listen_right", slot: 1, t: 3.5, dur: 8.73333 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_01", event: "gesture_thm_dwn_lft", slot: 0, t: 6.66667, dur: 5.56667 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_01", event: "window_up_left", slot: 0, t: 9.73333, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_01", event: "stopaudiostreams", slot: -1, t: 13.2, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_02", event: "gesture_listen_right", slot: 1, t: 0.0, dur: 2.46667 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_02", event: "window_down_right", slot: 1, t: 0.0, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_02", event: "gesture_listen_left", slot: 0, t: 1.33333, dur: 7.63333 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_02", event: "gesture_thm_dwn_rgt", slot: 1, t: 3.56667, dur: 5.4 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_02", event: "window_up_right", slot: 1, t: 6.83333, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_02", event: "stopaudiostreams", slot: -1, t: 9.96667, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_03", event: "window_down_left", slot: 0, t: 0.0, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_03", event: "gesture_listen_right", slot: 1, t: 0.33333, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_03", event: "gesture_thm_dwn_lft", slot: 0, t: 1.66667, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_03", event: "window_up_left", slot: 1, t: 3.23333, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_03", event: "stopaudiostreams", slot: -1, t: 6.8, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_04", event: "window_down_right", slot: 1, t: 0.0, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_04", event: "gesture_listen_left", slot: 0, t: 0.33333, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_04", event: "gesture_thm_dwn_rgt", slot: 1, t: 1.2, dur: 2.93333 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_04", event: "gesture_listen_right", slot: 1, t: 4.16667, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_04", event: "window_up_right", slot: 1, t: 4.2, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_04", event: "stopaudiostreams", slot: -1, t: 8.9, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_05", event: "window_down_left", slot: 0, t: 0.0, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_05", event: "gesture_listen_right", slot: 1, t: 0.33333, dur: 4.0 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_05", event: "gesture_thm_dwn_lft", slot: 0, t: 2.33333, dur: 2.3 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_05", event: "gesture_neutral", slot: 1, t: 4.36667, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_05", event: "gesture_listen_left", slot: 0, t: 4.66667, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_05", event: "window_up_left", slot: 0, t: 6.5, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_05", event: "stopaudiostreams", slot: -1, t: 11.4, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_06", event: "gesture_listen_left", slot: 0, t: 0.0, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_06", event: "gesture_thm_dwn_rgt", slot: 1, t: 2.5, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_06", event: "stopaudiostreams", slot: -1, t: 7.7, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_07", event: "gesture_listen_left", slot: 0, t: 1.0, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_07", event: "gesture_thm_dwn_rgt", slot: 1, t: 6.33333, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_07", event: "stopaudiostreams", slot: -1, t: 10.2333, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_08", event: "gesture_listen_left", slot: 0, t: 0.0, dur: 5.8 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_08", event: "gesture_listen_right", slot: 1, t: 0.0, dur: 5.8 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_08", event: "stopaudiostreams", slot: -1, t: 6.8, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_09", event: "gesture_neutral", slot: 1, t: 0.0, dur: 3.63333 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_09", event: "gesture_listen_left", slot: 0, t: 1.0, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_09", event: "gesture_listen_right", slot: 1, t: 3.66667, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_09", event: "stopaudiostreams", slot: -1, t: 10.2333, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_10", event: "gesture_listen_left", slot: 0, t: 0.0, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_10", event: "gesture_listen_right", slot: 1, t: 1.0, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_10", event: "stopaudiostreams", slot: -1, t: 7.3, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_11", event: "gesture_listen_right", slot: 1, t: 0.0, dur: 9.13333 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_11", event: "gesture_listen_left", slot: 0, t: 1.0, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_11", event: "gesture_thm_dwn_rgt", slot: 1, t: 9.16667, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_starter_2x4_11", event: "stopaudiostreams", slot: -1, t: 15.4333, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_starter_3x3_01", event: "gesture_left", slot: 0, t: 0.83333, dur: 9.36667 },
+    SlotEvent { scene: "gen_prerace_starter_3x3_01", event: "gesture_right", slot: 1, t: 0.83333, dur: 9.36667 },
+    SlotEvent { scene: "gen_prerace_starter_3x3_02", event: "gesture_left", slot: 0, t: 0.83333, dur: 6.16667 },
+    SlotEvent { scene: "gen_prerace_starter_3x3_02", event: "gesture_right", slot: 1, t: 0.83333, dur: 6.16667 },
+    SlotEvent { scene: "gen_prerace_starter_3x3_03", event: "gesture_left", slot: 0, t: 0.83333, dur: 5.06667 },
+    SlotEvent { scene: "gen_prerace_starter_3x3_03", event: "gesture_right", slot: 1, t: 0.83333, dur: 5.06667 },
+    SlotEvent { scene: "gen_prerace_starter_3x3_04", event: "gesture_left", slot: 0, t: 0.83333, dur: 5.33333 },
+    SlotEvent { scene: "gen_prerace_starter_3x3_04", event: "gesture_right", slot: 1, t: 0.83333, dur: 5.33333 },
+    SlotEvent { scene: "gen_prerace_starter_3x3_05", event: "gesture_left", slot: 0, t: 0.83333, dur: 7.66667 },
+    SlotEvent { scene: "gen_prerace_starter_3x3_05", event: "gesture_right", slot: 1, t: 0.83333, dur: 7.66667 },
+    SlotEvent { scene: "gen_prerace_starter_3x3_06", event: "gesture_left", slot: 0, t: 0.83333, dur: 3.86667 },
+    SlotEvent { scene: "gen_prerace_starter_3x3_06", event: "gesture_right", slot: 1, t: 0.83333, dur: 3.86667 },
+    SlotEvent { scene: "gen_prerace_starter_3x3_07", event: "gesture_left", slot: 0, t: 0.83333, dur: 6.5 },
+    SlotEvent { scene: "gen_prerace_starter_3x3_07", event: "gesture_right", slot: 1, t: 0.83333, dur: 6.5 },
+    SlotEvent { scene: "gen_prerace_starter_3x3_08", event: "gesture_left", slot: 0, t: 0.83333, dur: 3.83333 },
+    SlotEvent { scene: "gen_prerace_starter_3x3_08", event: "gesture_right", slot: 1, t: 0.83333, dur: 3.83333 },
+    SlotEvent { scene: "gen_prerace_starter_3x3_09", event: "gesture_left", slot: 0, t: 0.83333, dur: 6.33333 },
+    SlotEvent { scene: "gen_prerace_starter_3x3_09", event: "gesture_right", slot: 1, t: 0.83333, dur: 6.33333 },
+    SlotEvent { scene: "gen_prerace_starter_3x3_10", event: "gesture_left", slot: 0, t: 0.83333, dur: 3.46667 },
+    SlotEvent { scene: "gen_prerace_starter_3x3_10", event: "gesture_right", slot: 1, t: 0.83333, dur: 3.46667 },
+    SlotEvent { scene: "gen_prerace_starter_4x2_01", event: "gesture_left", slot: 0, t: 0.83333, dur: 9.36667 },
+    SlotEvent { scene: "gen_prerace_starter_4x2_01", event: "gesture_right", slot: 1, t: 0.83333, dur: 9.36667 },
+    SlotEvent { scene: "gen_prerace_starter_4x2_02", event: "gesture_left", slot: 0, t: 0.83333, dur: 6.16667 },
+    SlotEvent { scene: "gen_prerace_starter_4x2_02", event: "gesture_right", slot: 1, t: 0.83333, dur: 6.16667 },
+    SlotEvent { scene: "gen_prerace_starter_4x2_03", event: "gesture_left", slot: 0, t: 0.83333, dur: 5.06667 },
+    SlotEvent { scene: "gen_prerace_starter_4x2_03", event: "gesture_right", slot: 1, t: 0.83333, dur: 5.06667 },
+    SlotEvent { scene: "gen_prerace_starter_4x2_04", event: "gesture_left", slot: 0, t: 0.83333, dur: 5.33333 },
+    SlotEvent { scene: "gen_prerace_starter_4x2_04", event: "gesture_right", slot: 1, t: 0.83333, dur: 5.33333 },
+    SlotEvent { scene: "gen_prerace_starter_4x2_05", event: "gesture_left", slot: 0, t: 0.83333, dur: 7.66667 },
+    SlotEvent { scene: "gen_prerace_starter_4x2_05", event: "gesture_right", slot: 1, t: 0.83333, dur: 7.66667 },
+    SlotEvent { scene: "gen_prerace_starter_4x2_06", event: "gesture_left", slot: 0, t: 0.83333, dur: 3.86667 },
+    SlotEvent { scene: "gen_prerace_starter_4x2_06", event: "gesture_right", slot: 1, t: 0.83333, dur: 3.86667 },
+    SlotEvent { scene: "gen_prerace_starter_4x2_07", event: "gesture_left", slot: 0, t: 0.83333, dur: 6.5 },
+    SlotEvent { scene: "gen_prerace_starter_4x2_07", event: "gesture_right", slot: 1, t: 0.83333, dur: 6.5 },
+    SlotEvent { scene: "gen_prerace_starter_4x2_08", event: "gesture_left", slot: 0, t: 0.83333, dur: 3.83333 },
+    SlotEvent { scene: "gen_prerace_starter_4x2_08", event: "gesture_right", slot: 1, t: 0.83333, dur: 3.83333 },
+    SlotEvent { scene: "gen_prerace_starter_4x2_09", event: "gesture_left", slot: 0, t: 0.83333, dur: 6.33333 },
+    SlotEvent { scene: "gen_prerace_starter_4x2_09", event: "gesture_right", slot: 1, t: 0.83333, dur: 6.33333 },
+    SlotEvent { scene: "gen_prerace_starter_4x2_10", event: "gesture_left", slot: 0, t: 0.83333, dur: 3.46667 },
+    SlotEvent { scene: "gen_prerace_starter_4x2_10", event: "gesture_right", slot: 1, t: 0.83333, dur: 3.46667 },
+    SlotEvent { scene: "gen_prerace_taunt_01", event: "gesture_right", slot: 1, t: 2.1, dur: 4.9 },
+    SlotEvent { scene: "gen_prerace_taunt_01", event: "gesture_left", slot: 0, t: 3.3, dur: 3.7 },
+    SlotEvent { scene: "gen_prerace_taunt_02", event: "gesture_left", slot: 0, t: 1.2, dur: 4.8 },
+    SlotEvent { scene: "gen_prerace_taunt_02", event: "gesture_right", slot: 1, t: 2.73333, dur: 3.26667 },
+    SlotEvent { scene: "gen_prerace_taunt_03", event: "gesture_right", slot: 1, t: 1.83333, dur: 3.16667 },
+    SlotEvent { scene: "gen_prerace_taunt_03", event: "gesture_left", slot: 0, t: 3.3, dur: 1.7 },
+    SlotEvent { scene: "gen_prerace_taunt_07", event: "gesture_left", slot: 0, t: 0.0, dur: 8.0 },
+    SlotEvent { scene: "gen_prerace_taunt_07", event: "gesture_right", slot: 1, t: 2.6, dur: 5.4 },
+    SlotEvent { scene: "gen_prerace_taunt_09", event: "gesture_right", slot: 1, t: 0.0, dur: 9.0 },
+    SlotEvent { scene: "gen_prerace_taunt_09", event: "gesture_left", slot: 0, t: 3.66667, dur: 5.33333 },
+    SlotEvent { scene: "gen_prerace_taunt_hp_01", event: "gesture_listen_left", slot: 0, t: 0.0, dur: 3.33333 },
+    SlotEvent { scene: "gen_prerace_taunt_hp_01", event: "window_down_left", slot: 0, t: 0.0, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_taunt_hp_01", event: "playspeech", slot: -1, t: 1.0, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_taunt_hp_01", event: "gesture_talk_right", slot: 1, t: 1.0, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_taunt_hp_01", event: "gesture_talk_left", slot: 0, t: 4.0, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_taunt_hp_01", event: "window_up_left", slot: 0, t: 7.33333, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_taunt_hp_02", event: "gesture_talk_right", slot: 1, t: 0.0, dur: 5.0 },
+    SlotEvent { scene: "gen_prerace_taunt_hp_02", event: "gesture_listen_left", slot: 0, t: 0.0, dur: 4.33333 },
+    SlotEvent { scene: "gen_prerace_taunt_hp_02", event: "window_down_left", slot: 0, t: 0.0, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_taunt_hp_02", event: "playspeech", slot: -1, t: 0.66667, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_taunt_hp_02", event: "gesture_talk_left", slot: 0, t: 4.36667, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_taunt_hp_02", event: "gesture_listen_right", slot: 1, t: 5.16667, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_taunt_hp_02", event: "window_up_left", slot: 0, t: 7.66667, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_taunt_hp_03", event: "window_down_left", slot: 0, t: 0.0, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_taunt_hp_03", event: "gesture_talk_right", slot: 1, t: 0.66667, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_taunt_hp_03", event: "gesture_listen_left", slot: 0, t: 0.66667, dur: 3.73333 },
+    SlotEvent { scene: "gen_prerace_taunt_hp_03", event: "playspeech", slot: -1, t: 1.0, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_taunt_hp_03", event: "gesture_talk_left", slot: 0, t: 4.43333, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_taunt_hp_03", event: "window_up_left", slot: 0, t: 8.63333, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_taunt_h_01", event: "gesture_listen_left", slot: 0, t: 0.0, dur: 6.0 },
+    SlotEvent { scene: "gen_prerace_taunt_h_01", event: "gesture_talk_right", slot: 1, t: 0.0, dur: 6.0 },
+    SlotEvent { scene: "gen_prerace_taunt_h_01", event: "playspeech", slot: -1, t: 0.0, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_taunt_ph_01", event: "gesture_talk_left", slot: 0, t: 0.0, dur: 4.13333 },
+    SlotEvent { scene: "gen_prerace_taunt_ph_01", event: "gesture_listen_right", slot: 1, t: 1.0, dur: 3.1 },
+    SlotEvent { scene: "gen_prerace_taunt_ph_01", event: "playspeech", slot: -1, t: 1.0, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_taunt_ph_01", event: "gesture_talk_right", slot: 1, t: 4.13333, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_taunt_ph_01", event: "gesture_listen_left", slot: 0, t: 4.16667, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_taunt_ph_02", event: "gesture_talk_left", slot: 0, t: 0.0, dur: 5.13333 },
+    SlotEvent { scene: "gen_prerace_taunt_ph_02", event: "gesture_listen_right", slot: 1, t: 0.0, dur: 3.36667 },
+    SlotEvent { scene: "gen_prerace_taunt_ph_02", event: "playspeech", slot: -1, t: 1.0, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_taunt_ph_02", event: "gesture_talk_right", slot: 1, t: 3.5, dur: 0.0 },
+    SlotEvent { scene: "gen_prerace_taunt_ph_02", event: "gesture_listen_left", slot: 0, t: 5.16667, dur: 0.0 },
+    SlotEvent { scene: "sc_gen_prerace_grid_1x1_01", event: "gesture_neutral", slot: 0, t: 1.33333, dur: 0.0 },
+    SlotEvent { scene: "sc_gen_prerace_grid_2x4_01", event: "gesture_listen_left", slot: 0, t: 0.0, dur: 0.0 },
+    SlotEvent { scene: "sc_gen_prerace_grid_2x4_01", event: "gesture_talk_right", slot: 1, t: 0.0, dur: 1.8 },
+    SlotEvent { scene: "sc_gen_prerace_grid_2x4_01", event: "gesture_listen_right", slot: 1, t: 3.0, dur: 0.0 },
+    SlotEvent { scene: "sc_gen_prerace_grid_2x4_02", event: "gesture_listen_left", slot: 0, t: 0.0, dur: 0.0 },
+    SlotEvent { scene: "sc_gen_prerace_grid_2x4_02", event: "gesture_talk_right", slot: 1, t: 0.0, dur: 1.8 },
+    SlotEvent { scene: "sc_gen_prerace_grid_2x4_02", event: "gesture_listen_right", slot: 1, t: 3.0, dur: 0.0 },
+    SlotEvent { scene: "sc_gen_prerace_grid_2x4_03", event: "gesture_listen_left", slot: 0, t: 0.0, dur: 0.0 },
+    SlotEvent { scene: "sc_gen_prerace_grid_2x4_03", event: "gesture_talk_right", slot: 1, t: 0.0, dur: 1.8 },
+    SlotEvent { scene: "sc_gen_prerace_grid_2x4_03", event: "gesture_listen_right", slot: 1, t: 3.0, dur: 0.0 },
+    SlotEvent { scene: "sc_gen_prerace_grid_2x4_split_01", event: "gesture_listen_left", slot: 0, t: 0.0, dur: 0.0 },
+    SlotEvent { scene: "sc_gen_prerace_grid_2x4_split_01", event: "gesture_talk_right", slot: 1, t: 0.0, dur: 1.8 },
+    SlotEvent { scene: "sc_gen_prerace_grid_2x4_split_01", event: "gesture_listen_right", slot: 1, t: 3.0, dur: 0.0 },
+    SlotEvent { scene: "sc_gen_prerace_grid_2x4_split_02", event: "gesture_listen_left", slot: 0, t: 0.0, dur: 0.0 },
+    SlotEvent { scene: "sc_gen_prerace_grid_2x4_split_02", event: "gesture_talk_right", slot: 1, t: 0.0, dur: 1.8 },
+    SlotEvent { scene: "sc_gen_prerace_grid_2x4_split_02", event: "gesture_listen_right", slot: 1, t: 3.0, dur: 0.0 },
+];
+
+/// A start scene's racer events in flight (main.rs `prerace_acts_*`).
+pub struct Acts {
+    pub scene: String,
+    pub events: Vec<SlotEvent>,
+    pub fired: Vec<bool>,
+    /// the scene's clock and the clip's length
+    pub t: f32,
+    pub duration: f32,
+    /// slot i -> the car of the race's racer i
+    pub racers: Vec<usize>,
+    pub ends: Vec<(usize, f32)>,
+    /// the taunt speech was prepared
+    pub taunt: bool,
+}
+
+/// The speech profile (GH_01 .., SH_01 ..) of a driver's character set (`tune/audio/CareerVoices.xml` and
+/// `SC_CareerVoices.xml`: `<Voice name="DRV_MB_007_SET" ProfileName="GH_01" ...>`); the in-car set
+/// `drv_mb_007_lod02_set` is the same character.
+pub fn voice_of(data_dir: &str, set: &str) -> Option<String> {
+    static MAP: std::sync::OnceLock<std::collections::HashMap<String, String>> = std::sync::OnceLock::new();
+    let map = MAP.get_or_init(|| {
+        let mut m = std::collections::HashMap::new();
+        for f in ["CareerVoices.xml", "SC_CareerVoices.xml"] {
+            let t = std::fs::read_to_string(std::path::Path::new(data_dir).join("tune/audio").join(f)).unwrap_or_default();
+            for line in t.lines() {
+                let get = |k: &str| line.split(&format!("{k}=\"")).nth(1).and_then(|r| r.split('"').next()).map(|v| v.to_string());
+                if let (Some(n), Some(p)) = (get("name"), get("ProfileName")) {
+                    if n.starts_with("DRV_") || n.starts_with("MEC_") {
+                        m.entry(n.to_ascii_uppercase()).or_insert(p);
+                    }
+                }
+            }
+        }
+        m
+    });
+    let key = set.to_ascii_uppercase().replace("_LOD02_", "_").replace("_LOD2_", "_");
+    map.get(&key).filter(|p| !p.starts_with("PLAYER") && !p.starts_with("MISSING")).cloned()
+}
+
 pub const PRERACE_EVENTS: [PreraceEvents; 82] = [
     PreraceEvents { scene: "gen_prerace_grid_1x1_01", racename: 1.8, cut: 6.3, countdown: 4.33333 },
     PreraceEvents { scene: "gen_prerace_grid_1x1_02", racename: 1.3, cut: 5.66667, countdown: 3.7 },
@@ -262,6 +653,13 @@ mod tests {
         assert_eq!(events("racestart/SC_gen_prerace_grid_1x1_01").unwrap().countdown, 4.0);
         assert_eq!(events("racestart/gen_prerace_grid_4x2_01").unwrap().cut, 8.0);
         assert!(events("racestart/gen_prerace_delivery_1x1_01").is_none());
+        // (the taunt HP_01's racer events: slot 0 listens and rolls its left window, slot 1 talks first)
+        let ev = slot_events("racestart/gen_prerace_taunt_HP_01");
+        assert_eq!(ev.iter().map(|e| (e.event, e.slot)).collect::<Vec<_>>(), vec![("gesture_listen_left", 0), ("window_down_left", 0), ("playspeech", -1), ("gesture_talk_right", 1), ("gesture_talk_left", 0), ("window_up_left", 0)]);
+        assert_eq!((ev[0].t, ev[0].dur), (0.0, 3.33333));
+        assert_eq!(taunt_kind("racestart/gen_prerace_taunt_PH_02"), Some("PH"));
+        assert_eq!(taunt_kind("racestart/gen_prerace_taunt_H_01"), Some("H"));
+        assert_eq!(taunt_kind("racestart/gen_prerace_starter_2x4_01"), None);
         // (the grid table: a 4x2 grid plays the 3x3 grid scenes and the 2x4 starter scenes, never the 4x2 ones)
         let tbl = "Grid\t1x1_Race_Grid\t0\n{\n\tCutscene\tgen_prerace_grid_1x1_01_generated\n}\nGrid\t4x2_Race_Grid\t4\n{\n\tCutscene game/CineScripts/generated/RaceStart/sc_gen_prerace_grid_2x4_01_generated\n\tCutscene\tgen_prerace_starter_2x4_01_generated\n\tCutscene\tgen_prerace_starter_2x4_02_generated\n}\nGrid\tTaunt\t7\n{\n\tCutscene\tgen_prerace_taunt_HP_01_generated\n}\n";
         let mut p = Picker::new(GridTable::parse(tbl), 7);

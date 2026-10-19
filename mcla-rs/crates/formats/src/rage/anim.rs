@@ -187,6 +187,25 @@ pub fn animation_named(rd: &Rd, o: usize) -> Option<Animation> {
     Some(Animation { name, frames, duration, looped: rd.u16(o + 4) & 1 != 0, tracks })
 }
 
+/// The animation called exactly `name` inside a resource whose animations carry plain names
+/// (a vehicle's base fragment `.r63`: `win_l_open`, `win_r_open`, `door_l_open`, `tach` ...),
+/// found by the name pointer at its `+1c`.
+pub fn animation_by_name(res: &Resource, name: &str) -> Option<Animation> {
+    let rd = Rd::new(res);
+    let mut o = 0x1c;
+    while o + 0x14 + 4 <= res.virtual_size {
+        if let Some(np) = rd.ptr(o) {
+            if np + name.len() < res.virtual_size && rd.u8(np + name.len()) == 0 && rd.cstr(np) == name {
+                if let Some(a) = animation_named(&rd, o - 0x1c) {
+                    return Some(a);
+                }
+            }
+        }
+        o += 4;
+    }
+    None
+}
+
 /// Every animation embedded in a resource (found by scanning the virtual segment).
 pub fn find_animations(res: &Resource) -> Vec<Animation> {
     let rd = Rd::new(res);
@@ -250,6 +269,34 @@ impl TrackData {
                 a.lerp(b, f - i as f32).normalize()
             }
             _ => Quat::IDENTITY,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The side windows' clips of a car's base fragment (DB9): 21 frames over 0.667 s, a
+    /// translation and a rotation track on the window bone (tag 0x4137 left, 0xd554 right),
+    /// starting at the bone's rest place; the glass ends 0.32 m lower.
+    #[test]
+    fn db9_window_clips() {
+        let root = std::env::var("MCLA_DATA_DIR").unwrap_or_else(|_| "D:/MCLA/extracted/cache".into());
+        let Ok(d) = std::fs::read(std::path::Path::new(&root).join("resources/vehicle/vpd_am_db9_08/0x0de3ddb3.r63")) else { return };
+        let u = |o: usize| u32::from_le_bytes(d[o..o + 4].try_into().unwrap());
+        let data = d[16..].to_vec();
+        let vs = (u(12) as usize).min(data.len());
+        let res = crate::rsc::Resource { rtype: u(4), flags: u(8), virtual_size: vs, physical_size: data.len() - vs, data };
+        let sk = super::super::skeleton::Skeleton::parse(&res).unwrap().unwrap();
+        for (name, tag) in [("win_l_open", 0x4137u16), ("win_r_open", 0xd554)] {
+            let a = super::animation_by_name(&res, name).unwrap();
+            assert_eq!((a.frames, (a.duration * 1000.0).round() as i32, a.tracks.len()), (21, 667, 2));
+            assert!(a.tracks.iter().all(|t| t.bone_id == tag));
+            let t = a.track(super::KIND_TRANSLATION, tag).unwrap();
+            let b = &sk.bones[sk.bone_by_tag(tag).unwrap()];
+            assert!((t.data.vec(0.0) - b.local.w_axis.truncate()).length() < 1e-3);
+            assert!((t.data.vec(0.0).y - t.data.vec(20.0).y - 0.320).abs() < 0.002);
+            let r0 = a.track(super::KIND_ROTATION, tag).unwrap().data.rot(0.0);
+            assert!(r0.angle_between(glam::Quat::from_mat4(&b.local)) < 1e-3);
         }
     }
 }

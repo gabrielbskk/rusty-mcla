@@ -26,6 +26,8 @@ pub struct CarPart {
     pub meshes: Vec<(Mesh, u16)>,
     /// per-mesh bone transform inside the fragment (from the fragment's own skeleton)
     pub mesh_bone: Vec<Mat4>,
+    /// per-mesh tag of that bone (the window glass rides on `win_l_anim` / `win_r_anim`)
+    pub mesh_tag: Vec<u16>,
     pub tris: usize,
     pub min: Vec3,
     pub max: Vec3,
@@ -66,6 +68,53 @@ pub struct CarAsset {
     pub aitune: Option<std::sync::Arc<mcla_formats::rage::aitune::AiTunes>>,
     /// the body's collision hull as the fragment file has it
     pub hull: Option<mcla_formats::rage::bound::Hull>,
+    /// the side windows' roll-down clips (`win_l_open`, `win_r_open` of the base fragment), left
+    /// then right
+    pub windows: [Option<WindowClip>; 2],
+}
+
+/// A side window's clip as the base fragment holds it: `win_l_open` / `win_r_open`, a plain
+/// crAnimation (21 frames, 0.667 s on the DB9) with a translation and a rotation track on one
+/// bone - `win_l_anim` (tag 0x4137) / `win_r_anim` (0xd554), the bone the glass mesh is bound
+/// to. The car's anim object binds it (sub_8233D908 / sub_823404E0) and the window controller
+/// sets the player to clamp(time, 0, duration) (sub_8233BEC0).
+#[derive(Debug, Clone)]
+pub struct WindowClip {
+    pub tag: u16,
+    pub duration: f32,
+    pub anim: mcla_formats::rage::anim::Animation,
+    /// the bone's parent in car space and the bone's own rest (bind) matrix in car space
+    pub parent_world: Mat4,
+    pub rest_world: Mat4,
+    pub rest_local: Mat4,
+}
+
+impl WindowClip {
+    pub fn load(res: &mcla_formats::rsc::Resource, sk: &Skeleton, name: &str) -> Option<WindowClip> {
+        let anim = mcla_formats::rage::anim::animation_by_name(res, name)?;
+        let tag = anim.tracks.first()?.bone_id;
+        let bi = sk.bone_by_tag(tag)?;
+        let b = &sk.bones[bi];
+        let parent_world = sk.bones.get(b.parent).map_or(Mat4::IDENTITY, |p| p.world);
+        Some(WindowClip { tag, duration: anim.duration, parent_world, rest_world: b.world, rest_local: b.local, anim })
+    }
+
+    /// The bone's local matrix at a clip time (clamped to the clip, never wrapped).
+    pub fn local_at(&self, time: f32) -> Mat4 {
+        use mcla_formats::rage::anim::{KIND_ROTATION, KIND_TRANSLATION};
+        let last = (self.anim.frames.max(1) - 1) as f32;
+        let f = if self.duration > 0.0 { (time / self.duration * last).clamp(0.0, last) } else { 0.0 };
+        let (_, rest_r, rest_t) = self.rest_local.to_scale_rotation_translation();
+        let t = self.anim.track(KIND_TRANSLATION, self.tag).map_or(rest_t, |tr| tr.data.vec(f));
+        let r = self.anim.track(KIND_ROTATION, self.tag).map_or(rest_r, |tr| tr.data.rot(f));
+        Mat4::from_rotation_translation(r, t)
+    }
+
+    /// What the bone's motion does to the glass, in car space: the meshes are baked at the
+    /// rest pose, so this maps the rest pose to the pose at `time`.
+    pub fn delta(&self, time: f32) -> Mat4 {
+        self.parent_world * self.local_at(time) * self.rest_world.inverse()
+    }
 }
 
 /// Slot classification used to pick the hinge bone for a part.
@@ -632,11 +681,13 @@ pub fn load_car(assets: &Assets, car_dir: &Path) -> Result<CarAsset> {
             let nbones = frag_sk.as_ref().map(|s| s.bones.len()).unwrap_or(0);
             let mut meshes = Vec::new();
             let mut mesh_bone = Vec::new();
+            let mut mesh_tag = Vec::new();
             let mut mn = Vec3::splat(f32::INFINITY);
             let mut mx = Vec3::splat(f32::NEG_INFINITY);
             let mut tris = 0;
             for m in d.models {
                 let bm = frag_sk.as_ref().and_then(|s| s.bones.get(m.bone as usize)).map(|b| b.world).unwrap_or(Mat4::IDENTITY);
+                let btag = frag_sk.as_ref().and_then(|s| s.bones.get(m.bone as usize)).map_or(0, |b| b.tag);
                 for (mesh, si) in m.parts {
                     let (a, b) = mesh.bbox();
                     let (a, b) = if bm == Mat4::IDENTITY {
@@ -657,6 +708,7 @@ pub fn load_car(assets: &Assets, car_dir: &Path) -> Result<CarAsset> {
                     tris += mesh.indices.len() / 3;
                     meshes.push((mesh, si));
                     mesh_bone.push(bm);
+                    mesh_tag.push(btag);
                 }
             }
             if meshes.is_empty() {
@@ -668,7 +720,7 @@ pub fn load_car(assets: &Assets, car_dir: &Path) -> Result<CarAsset> {
             let is_base = BASE_FRAGMENTS.contains(&fname.as_str());
             let stock = (!is_anim || is_base) && (is_base || names.iter().any(|n| n.ends_with("_stk") || n.to_ascii_lowercase().ends_with("_dub")) || BASE_PARTS.contains(&primary.as_str()));
             let sockets: Vec<(String, Mat4)> = frag_sk.as_ref().map(|s| s.bones.iter().filter(|b| { let n = b.name.to_ascii_lowercase(); n.starts_with("exh_primary") || n.starts_with("exh_secondary") }).map(|b| (b.name.to_ascii_lowercase(), b.world)).collect()).unwrap_or_default();
-            Some(CarPart { file: p.clone(), names, primary: if is_base { format!("body_{}", p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()) } else { primary }, stock, meshes, mesh_bone, tris, min: mn, max: mx, transform: Mat4::IDENTITY, placed: true, is_base, bones: nbones, from_parent: parent_files.contains(p), sockets })
+            Some(CarPart { file: p.clone(), names, primary: if is_base { format!("body_{}", p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()) } else { primary }, stock, meshes, mesh_bone, mesh_tag, tris, min: mn, max: mx, transform: Mat4::IDENTITY, placed: true, is_base, bones: nbones, from_parent: parent_files.contains(p), sockets })
         })
         .collect();
     // skeleton: the LOD0 base fragment; otherwise the part file with the most bone matrices
@@ -689,6 +741,27 @@ pub fn load_car(assets: &Assets, car_dir: &Path) -> Result<CarAsset> {
                 if sk.bones.len() >= 8 && skeleton.as_ref().map_or(true, |s| sk.bones.len() > s.bones.len()) {
                     skeleton = Some(sk);
                 }
+            }
+        }
+    }
+    // (the side windows' clips: in every base fragment; the LOD0 one first)
+    let mut windows: [Option<WindowClip>; 2] = [None, None];
+    if let Some(sk) = skeleton.as_ref() {
+        for f in BASE_FRAGMENTS.iter().rev() {
+            if windows.iter().all(|w| w.is_some()) {
+                break;
+            }
+            let Some(p) = r63.iter().find(|p| p.file_name().map_or(false, |n| n.to_string_lossy().eq_ignore_ascii_case(f))) else { continue };
+            let Ok(res) = load_resource_file(p) else { continue };
+            for (k, n) in ["win_l_open", "win_r_open"].iter().enumerate() {
+                if windows[k].is_none() {
+                    windows[k] = WindowClip::load(&res, sk, n);
+                }
+            }
+        }
+        for (k, w) in windows.iter().enumerate() {
+            if let Some(w) = w {
+                log::debug!("car {}: window {} clip {:.3} s, {} frames, bone tag {:#06x}, glass drops {:.3}", name, k, w.duration, w.anim.frames, w.tag, (w.delta(w.duration).transform_point3(w.rest_world.w_axis.truncate()) - w.rest_world.w_axis.truncate()).length());
             }
         }
     }
@@ -837,7 +910,7 @@ pub fn load_car(assets: &Assets, car_dir: &Path) -> Result<CarAsset> {
         max = max.max(p.max);
     }
     log::info!("car {}: {} shaders, {} textures, {} parts ({} stock)", name, shaders.len(), textures.len(), parts.len(), parts.iter().filter(|p| p.stock).count());
-    Ok(CarAsset { name, shaders, shaders_parent, textures, parts, min, max, skeleton, hubs, bike, tune, simtune, fit, aitune, hull })
+    Ok(CarAsset { name, shaders, shaders_parent, textures, parts, min, max, skeleton, hubs, bike, tune, simtune, fit, aitune, hull, windows })
 }
 
 /// Display name of a part from its internal names, e.g. "exstPipe05_Borla_single_round"

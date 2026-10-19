@@ -504,10 +504,11 @@ pub fn run(gpu: &Gpu, enc: &mut wgpu::CommandEncoder, vehicles: &crate::vehicles
             pass.set_pipeline(if glass { &s.stealth_glass } else { &s.stealth_solid });
             for c in vehicles.cars.iter().filter(|c| c.pu_stealth) {
                 pass.set_bind_group(2, &c.binding.bg, &[]);
-                for b in &c.model.batches {
+                for (bi, b) in c.model.batches.iter().enumerate() {
                     if b.mode.blended() != glass {
                         continue;
                     }
+                    pass.set_bind_group(2, c.batch_object(bi), &[]);
                     pass.set_vertex_buffer(0, b.vb.slice(..));
                     pass.set_index_buffer(b.ib.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..b.count, 0, 0..1);

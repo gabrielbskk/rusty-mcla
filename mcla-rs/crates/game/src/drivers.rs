@@ -35,6 +35,72 @@ struct Rig {
     steer: Clip,
     idle_stop: Option<Clip>,
     reverse: Option<Clip>,
+    /// the pack's gesture clips by their name after the car prefix ("drv_gest_listen_lft", "drv_win",
+    /// "drv_gest_jawflap"); the car's own first, the shared Challenger ones otherwise
+    gestures: HashMap<String, Clip>,
+}
+
+/// The gesture a scene event asks of a driver (racer+684; the event ids of table 0x827EAD60).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gesture {
+    Neutral,
+    Left,
+    Right,
+    TalkLeft,
+    TalkRight,
+    Mild,
+    Win,
+    ListenLeft,
+    ListenRight,
+    ThumbDownLeft,
+    ThumbDownRight,
+}
+
+impl Gesture {
+    /// From a scene event's name (the first entry of the event table the name contains).
+    pub fn from_event(name: &str) -> Option<Gesture> {
+        let n = name.to_ascii_lowercase();
+        // (table order: neutral, left, right, talk_left, talk_right, mild, win, listen_left, listen_right,
+        // thm_dwn_lft, thm_dwn_rgt - "gesture_talk_left" contains "left"; the original's first match is by
+        // the full event names, so the longer names are tested first here)
+        Some(match n.trim_start_matches("gesture_") {
+            "neutral" => Gesture::Neutral,
+            "left" => Gesture::Left,
+            "right" => Gesture::Right,
+            "talk_left" => Gesture::TalkLeft,
+            "talk_right" => Gesture::TalkRight,
+            "mild" => Gesture::Mild,
+            "win" => Gesture::Win,
+            "listen_left" => Gesture::ListenLeft,
+            "listen_right" => Gesture::ListenRight,
+            "thm_dwn_lft" => Gesture::ThumbDownLeft,
+            "thm_dwn_rgt" => Gesture::ThumbDownRight,
+            _ => return None,
+        })
+    }
+}
+
+/// A gesture being played (the driver graph's "gesture switch" state, sub_823B3D70).
+#[derive(Clone)]
+struct Playing {
+    clip: String,
+    t: f32,
+    /// the event's end time from now (its end call sets the gesture back to none), else infinite
+    left: f32,
+}
+
+/// Per driver: the gesture's round-robin counters (ctx+68..+84), what plays, the jaw flap.
+#[derive(Default, Clone)]
+struct Acting {
+    rr: [usize; 5],
+    playing: Option<Playing>,
+    /// a gesture asked for, its clip chosen when the driver is next posed
+    asked: Option<(Gesture, f32, bool)>,
+    /// fading out of a gesture that ended: (clip, frame, weight)
+    leaving: Option<(String, f32, f32)>,
+    jaw: bool,
+    jaw_k: f32,
+    jaw_t: f32,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -62,6 +128,62 @@ pub struct Drivers {
     pub headless: bool,
     time: f32,
     frame: u32,
+    acting: HashMap<usize, Acting>,
+    /// the character set each seat was last drawn with (its voice: CareerVoices.xml)
+    pub set_of: HashMap<usize, String>,
+}
+
+/// The neutral / left / right / talk round robins (tables 0x827EA5F4, 0x827EA608, 0x827EA61C, 0x827EA630,
+/// 0x827EA640).
+const RR_NEUTRAL: [&str; 5] = ["drv_gest_mirror", "drv_win", "drv_gest_rspnd_lft", "drv_gest_rspnd_rgt", "drv_gest_fidget_01"];
+const RR_LEFT: [&str; 5] = ["drv_gest_mild_lft_01", "drv_gest_agro_lft_01", "drv_gest_thm_dwn_lft", "drv_gest_thm_up_lft", "drv_gest_cas_lft_01"];
+const RR_RIGHT: [&str; 5] = ["drv_gest_mild_rgt_01", "drv_gest_agro_rgt_01", "drv_gest_thm_dwn_rgt", "drv_gest_thm_up_rgt", "drv_gest_cas_rgt_01"];
+const RR_TALK_LEFT: [&str; 4] = ["drv_gest_cas_lft_01", "drv_gest_agro_lft_01", "drv_gest_mild_lft_01", "drv_gest_rspnd_lft"];
+const RR_TALK_RIGHT: [&str; 4] = ["drv_gest_cas_rgt_01", "drv_gest_agro_rgt_01", "drv_gest_mild_rgt_01", "drv_gest_rspnd_rgt"];
+/// a gesture blends in over 0.25 s (sub_823A5C10); the way back to driving is not read - the same 0.25 s
+const GESTURE_BLEND: f32 = 0.25;
+
+/// The clip a gesture plays (sub_823B3D70); `human`: the neutral round robin skips `_rspnd_rgt` for the human
+/// player and `_rspnd_lft` for the others.
+fn gesture_clip(g: Gesture, rr: &mut [usize; 5], human: bool) -> String {
+    let mut next = |k: usize, list: &[&str]| -> String {
+        let c = list[rr[k] % list.len()];
+        rr[k] += 1;
+        c.to_string()
+    };
+    match g {
+        Gesture::Neutral => loop {
+            let c = next(0, &RR_NEUTRAL);
+            if (human && c == "drv_gest_rspnd_rgt") || (!human && c == "drv_gest_rspnd_lft") {
+                continue;
+            }
+            break c;
+        },
+        Gesture::Left => next(1, &RR_LEFT),
+        Gesture::Right => next(2, &RR_RIGHT),
+        Gesture::TalkLeft => next(3, &RR_TALK_LEFT),
+        Gesture::TalkRight => next(4, &RR_TALK_RIGHT),
+        // (mild and win pick between two; the selector is not read - the first)
+        Gesture::Mild => "drv_gest_mild_lft_01".into(),
+        Gesture::Win => "drv_win".into(),
+        Gesture::ListenLeft => "drv_gest_listen_lft".into(),
+        Gesture::ListenRight => "drv_gest_listen_rgt".into(),
+        Gesture::ThumbDownLeft => "drv_gest_thm_dwn_lft".into(),
+        Gesture::ThumbDownRight => "drv_gest_thm_dwn_rgt".into(),
+    }
+}
+
+/// Blend `b` over `a` only on the bones `clip` animates (an overlay such as the jaw flap).
+fn overlay(a: &mut [(Quat, Vec3)], b: &[(Quat, Vec3)], clip: &Clip, k: f32) {
+    for i in 0..a.len().min(b.len()) {
+        if clip.rot.get(i).map_or(false, |r| r.is_some()) {
+            let fr = if a[i].0.dot(b[i].0) < 0.0 { -b[i].0 } else { b[i].0 };
+            a[i].0 = a[i].0.lerp(fr, k).normalize();
+        }
+        if clip.pos.get(i).map_or(false, |p| p.is_some()) {
+            a[i].1 = a[i].1.lerp(b[i].1, k);
+        }
+    }
 }
 
 /// "vp_frd_mustang_06_dub" -> "frd_mustang_06"; DLC cars keep their "vpd_" prefix.
@@ -190,7 +312,18 @@ impl Drivers {
                     None
                 };
                 let steer = clip(&["drv_steer_sweep", "drv_low_lean_sweep", "drv_idle_stp_sweep"])?;
-                Some(Rig { steer, idle_stop: clip(&["drv_idle_stp"]), reverse: clip(&["drv_rev"]), model })
+                // the gestures the scenes ask for (case blind by name after the car prefix, sub_823B7D68)
+                let mut gestures = HashMap::new();
+                let mut names: Vec<&(usize, String)> = entries.iter().filter(|(_, n)| { let l = n.to_ascii_lowercase(); l.contains("_drv_gest_") || l.ends_with("_drv_win") || l.ends_with("_drv_win_02") }).collect();
+                names.sort_by_key(|(_, n)| n.to_ascii_lowercase().starts_with(&key.0));
+                for (o, n) in names {
+                    let l = n.to_ascii_lowercase();
+                    let Some(i) = l.find("drv_") else { continue };
+                    if let Some(a) = animation_named(&rd, *o) {
+                        gestures.insert(l[i..].to_string(), Clip::bind(&Arc::new(a), &model.ids, false, false));
+                    }
+                }
+                Some(Rig { steer, idle_stop: clip(&["drv_idle_stp"]), reverse: clip(&["drv_rev"]), model, gestures })
             })();
             if rig.is_none() {
                 log::warn!("drivers: no animations for {}", car);
@@ -198,6 +331,29 @@ impl Drivers {
             self.rigs.insert(key.clone(), rig);
         }
         self.rigs[&key].is_some()
+    }
+
+    /// A scene's gesture event for the driver of seat `id` (racer+684). Lost when a gesture is still playing
+    /// (the "gesture switch" exit writes "none"). `dur` > 0: the event's end call stops it then.
+    pub fn gesture(&mut self, id: usize, g: Gesture, dur: f32, human: bool) {
+        let a = self.acting.entry(id).or_default();
+        if a.playing.is_none() && a.asked.is_none() {
+            a.asked = Some((g, if dur > 0.0 { dur } else { f32::INFINITY }, human));
+        }
+    }
+
+    /// The jaw flap while the driver's speech line plays (racer+688; `DRV_GEST_JAWFLAP` in / out over 0.25 s).
+    pub fn jaw(&mut self, id: usize, on: bool) {
+        self.acting.entry(id).or_default().jaw = on;
+    }
+
+    /// Scene over: no gestures, no jaw flap.
+    pub fn stop_acting(&mut self) {
+        for a in self.acting.values_mut() {
+            a.playing = None;
+            a.asked = None;
+            a.jaw = false;
+        }
     }
 
     /// Pose and skin the drivers of the cars near the camera.
@@ -215,6 +371,7 @@ impl Drivers {
                 continue;
             }
             let Some(si) = self.pick_set(s) else { continue };
+            self.set_of.insert(s.id, self.sets[si].0.clone());
             if !self.rig(gpu, s.car, si) {
                 continue;
             }
@@ -243,6 +400,78 @@ impl Drivers {
                 if p.reverse > 0.01 {
                     rev.local(&rig.model.bones, rev.last_frame(), &mut other);
                     blend_pose(&mut local, &other, p.reverse);
+                }
+            }
+            // a scene's gesture over the driving pose, and the jaw flap over that
+            if let Some(a) = self.acting.get_mut(&s.id) {
+                if let Some((g, left, human)) = a.asked.take() {
+                    let name = gesture_clip(g, &mut a.rr, human);
+                    if rig.gestures.contains_key(&name) {
+                        a.playing = Some(Playing { clip: name, t: 0.0, left });
+                        a.leaving = None;
+                    }
+                }
+                let mut over = false;
+                if let Some(pl) = a.playing.as_mut() {
+                    if let Some(c) = rig.gestures.get(&pl.clip) {
+                        pl.t += dt;
+                        pl.left -= dt;
+                        let f = c.frame(pl.t, false);
+                        c.local(&rig.model.bones, f, &mut other);
+                        // (the gesture clips animate the arms, head and upper body only: laid over the
+                        // driving pose on the bones they move)
+                        overlay(&mut local, &other, c, (pl.t / GESTURE_BLEND).min(1.0));
+                        over = pl.t >= c.anim.duration || pl.left <= 0.0;
+                        if over {
+                            a.leaving = Some((pl.clip.clone(), f, 1.0));
+                        }
+                    } else {
+                        over = true;
+                    }
+                }
+                if over {
+                    a.playing = None;
+                }
+                if a.playing.is_none() {
+                    if let Some((name, f, w)) = a.leaving.as_mut() {
+                        *w -= dt / GESTURE_BLEND;
+                        if let Some(c) = rig.gestures.get(name.as_str()).filter(|_| *w > 0.0) {
+                            c.local(&rig.model.bones, *f, &mut other);
+                            overlay(&mut local, &other, c, *w);
+                        }
+                    }
+                    if a.leaving.as_ref().map_or(false, |l| l.2 <= 0.0) {
+                        a.leaving = None;
+                    }
+                }
+                a.jaw_k = (a.jaw_k + (if a.jaw { dt } else { -dt }) / GESTURE_BLEND).clamp(0.0, 1.0);
+                if a.jaw {
+                    a.jaw_t += dt;
+                }
+                if let (true, Some(c), Some(head)) = (a.jaw_k > 0.0, rig.gestures.get("drv_gest_jawflap"), rig.model.head) {
+                    // (the shared jaw flap clip is the Challenger's whole driver; laid over the bones
+                    // below the head only - the jaw. The original's overlay mask is not read.)
+                    c.local(&rig.model.bones, c.frame(a.jaw_t, true), &mut other);
+                    let bones = &rig.model.bones;
+                    let below = |mut i: usize| -> bool {
+                        while let Some(p) = bones.get(i).and_then(|b| b.parent) {
+                            if p == head {
+                                return true;
+                            }
+                            if p == i {
+                                break;
+                            }
+                            i = p;
+                        }
+                        false
+                    };
+                    let mut masked = local.clone();
+                    overlay(&mut masked, &other, c, a.jaw_k);
+                    for i in 0..local.len() {
+                        if below(i) {
+                            local[i] = masked[i];
+                        }
+                    }
                 }
             }
             // (the cockpit view shows the arms and the wheel, not the driver's own head -

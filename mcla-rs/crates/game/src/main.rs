@@ -284,6 +284,13 @@ struct App {
     shot_at_go: bool,
     /// the original's start-scene picker (its shuffle bags last the session)
     prerace_picker: Option<prerace::Picker>,
+    /// the start scene's events on the racers (prerace.rs `slot_events`): its script runs to the clip's end
+    /// after the cut to the game camera
+    prerace_acts: Option<prerace::Acts>,
+    /// the scene the last start played, and a RESTART asked: the original replays it without a new pick (no
+    /// bag cursor moves over six restarts of three races, work/career2/cap/README.md)
+    prerace_last: Option<(Option<usize>, String)>,
+    prerace_replay: bool,
     /// seconds without input on the main menu (the attract movie starts after a while)
     idle: f32,
     /// start-line camera waiting for the grid's surroundings: frames waited
@@ -407,6 +414,98 @@ struct App {
 }
 
 impl App {
+    /// A start scene begins (`BeginDescription` / `EndDescriptionAndStartClock`): its racer events armed, a
+    /// taunt scene's speech prepared - the hookman (slot 1) speaks in the voice of his driver's character
+    /// (CareerVoices.xml); when it is prepared, slot 0's left and slot 1's right windows go down at once.
+    fn prerace_acts_begin(&mut self, scene: &str) {
+        let events = prerace::slot_events(scene);
+        let duration = self.cine.playing.as_ref().map_or(0.0, |sc| sc.duration);
+        let racers = self.game.race.as_ref().map(|r| r.participants.clone()).unwrap_or_default();
+        let mut taunt = false;
+        if let (Some(kind), Some(&hook)) = (prerace::taunt_kind(scene), racers.get(1)) {
+            let set = self.drivers.set_of.get(&hook).cloned().unwrap_or_default();
+            let voice = prerace::voice_of(&self.opt.data_dir, &set).unwrap_or_default();
+            taunt = !voice.is_empty() && self.speech.prepare_taunt(kind, &voice);
+            log::info!("prerace scene {}: taunt {} hookman car {} set {} voice {:?} prepared {}", scene, kind, hook, set, voice, taunt);
+        }
+        self.prerace_acts = Some(prerace::Acts { scene: scene.to_string(), fired: vec![false; events.len()], events, t: 0.0, duration, racers, ends: Vec::new(), taunt });
+        if taunt {
+            self.prerace_window(0, false, true);
+            self.prerace_window(1, true, true);
+        }
+    }
+
+    /// The window of the racer in scene slot `slot` (the car's `win_l_open` / `win_r_open`).
+    fn prerace_window(&mut self, slot: usize, right: bool, open: bool) {
+        let Some(&ci) = self.prerace_acts.as_ref().and_then(|a| a.racers.get(slot)) else { return };
+        log::info!("prerace scene: car {} {} window {}", ci, if right { "right" } else { "left" }, if open { "down" } else { "up" });
+        self.vehicles.window(ci, right, open);
+    }
+
+    /// Fire the start scene's racer events as its clock passes them; the jaw flap follows the speech lines; at
+    /// the clip's end `FinishScene` rolls the two windows up.
+    fn prerace_acts_tick(&mut self, dt: f32) {
+        let Some(mut a) = self.prerace_acts.take() else { return };
+        if self.game.race.is_none() {
+            self.drivers.stop_acting();
+            return;
+        }
+        // (after the cut the scene's script runs on to the clip's end)
+        if !(self.cine_prerace && self.cine.playing.is_some()) {
+            a.t += dt;
+        }
+        let mut windows: Vec<(usize, bool, bool)> = Vec::new();
+        for i in 0..a.events.len() {
+            let e = a.events[i];
+            if a.fired[i] || e.t > a.t {
+                continue;
+            }
+            a.fired[i] = true;
+            let car = usize::try_from(e.slot).ok().and_then(|s| a.racers.get(s).copied());
+            match e.event {
+                "playspeech" => {
+                    if a.taunt {
+                        self.speech.play_taunt();
+                    }
+                }
+                // (the stream player's four slots: the starter scenes' own dialogue stream)
+                "stopaudiostreams" => {}
+                "window_down_left" | "window_down_right" | "window_up_left" | "window_up_right" => {
+                    if let Ok(slot) = usize::try_from(e.slot) {
+                        windows.push((slot, e.event.ends_with("right"), e.event.contains("down")));
+                    }
+                }
+                name => {
+                    if let (Some(g), Some(ci)) = (drivers::Gesture::from_event(name), car) {
+                        let human = self.vehicles.cars.get(ci).map_or(false, |c| c.is_player);
+                        self.drivers.gesture(ci, g, e.dur, human);
+                    }
+                }
+            }
+        }
+        // the speakers' jaws: the player's line - slot 0, the hookman's - slot 1
+        let line = self.speech.line();
+        for (slot, player) in [(0usize, true), (1usize, false)] {
+            if let Some(&ci) = a.racers.get(slot) {
+                self.drivers.jaw(ci, line == Some(player) && a.taunt);
+            }
+        }
+        let over = a.t >= a.duration;
+        let racers_n = a.racers.len();
+        self.prerace_acts = Some(a);
+        for (slot, right, open) in windows {
+            self.prerace_window(slot, right, open);
+        }
+        if over {
+            // (FinishScene, sub_823BEF90 mode 1: slot 0's left and slot 1's right windows up)
+            if racers_n > 0 {
+                self.prerace_window(0, false, false);
+                self.prerace_window(1, true, false);
+            }
+            self.prerace_acts = None;
+        }
+    }
+
     fn new(opt: Options) -> App {
         let orbit = opt.orbit;
         let mut cam = Camera::default();
@@ -514,6 +613,9 @@ impl App {
             cine_caption: None,
             shot_at_go: false,
             prerace_picker: None,
+            prerace_acts: None,
+            prerace_last: None,
+            prerace_replay: false,
             idle: 0.0,
             prerace_wait: 0,
             dive_at: None,
@@ -2313,10 +2415,15 @@ impl App {
                 // (test hooks: MCLA_PRERACE=n plays the grid's n-th scene, MCLA_PRERACE_TAUNT=n the n-th taunt)
                 let forced = std::env::var("MCLA_PRERACE").ok().and_then(|v| v.parse::<usize>().ok()).map(|n| (picker.list(&args.grid), n))
                     .or_else(|| std::env::var("MCLA_PRERACE_TAUNT").ok().and_then(|v| v.parse::<usize>().ok()).map(|n| (picker.list("Taunt"), n)));
-                let chosen = match forced {
-                    Some((l, n)) => l.get(n % l.len().max(1)).cloned(),
-                    None => picker.pick(&args),
+                let replay = std::mem::take(&mut self.prerace_replay).then(|| self.prerace_last.clone()).flatten().filter(|l| l.0 == self.game.current_race).map(|l| l.1);
+                let chosen = match (forced, replay) {
+                    (Some((l, n)), _) => l.get(n % l.len().max(1)).cloned(),
+                    (None, Some(again)) => Some(again),
+                    (None, None) => picker.pick(&args),
                 };
+                if let Some(c) = chosen.as_ref() {
+                    self.prerace_last = Some((self.game.current_race, c.clone()));
+                }
                 log::info!("prerace pick: {:?} -> {:?}", args, chosen);
                 let mut scenes: Vec<String> = chosen.into_iter().filter(|s| !self.cine.scenes(s).is_empty()).collect();
                 let pick = 0usize;
@@ -2334,6 +2441,7 @@ impl App {
                 if !scenes.is_empty() && std::env::var("MCLA_NO_CINE").is_err() && self.cuts.playing.is_none() && self.cine.start(&mut gpu, &scenes[pick % scenes.len()], origin) {
                     self.cine_free = true;
                     self.cine_prerace = true;
+                    self.prerace_acts_begin(&p080_sc);
                     self.cine_caption = self.game.race.as_ref().map(|r| r.name.to_uppercase().replace('_', " "));
                     // (p080: the walk to the delivery car has no badge - walkthrough 2:44:20; the intro
                     // shows it at its racename event only)
@@ -2376,11 +2484,14 @@ impl App {
                         }
                         self.cine_caption = (t >= e.racename && t < e.racename + e.racename_len).then(|| self.game.race.as_ref().map(|r| r.name.to_uppercase().replace('_', " ")).unwrap_or_default());
                     }
-                    // a grid / starter / taunt scene: GO 3 s after its countdown event (prerace.rs)
+                    // a grid / starter / taunt scene: GO 3 s after its countdown event, the badge from its
+                    // racename event for 2 s (as the delivery intros), no HUD before the countdown (prerace.rs)
                     if let Some(e) = self.cine.playing.as_ref().filter(|_| self.cine_prerace).and_then(|sc| prerace::events(&sc.name)) {
                         if let Some(r) = self.game.race.as_mut() {
                             r.countdown = (e.go() - t).max(0.0);
                         }
+                        self.cine_caption = (e.racename >= 0.0 && t >= e.racename && t < e.racename + 2.0).then(|| self.game.race.as_ref().map(|r| r.name.to_uppercase().replace('_', " ")).unwrap_or_default());
+                        self.game.scene_hud_off = t < e.countdown;
                     }
                     // (test hook MCLA_CINE_OVERLAP=1: a start scene's people standing inside a racer's car -
                     // root within 1.0 m of its sides and 2.4 m of its centre along it, a typical car)
@@ -2397,6 +2508,11 @@ impl App {
                                     log::info!("cine overlap: t {:.2} {} in car {} ({}) along {:.2} side {:.2}", t, label, ci, if c.is_player { "player" } else { c.model.name.as_str() }, along, side);
                                 }
                             }
+                        }
+                    }
+                    if self.cine_prerace {
+                        if let Some(a) = self.prerace_acts.as_mut() {
+                            a.t = t;
                         }
                     }
                     // the cars are where the scene puts them
@@ -2439,7 +2555,9 @@ impl App {
                             }
                         }
                     }
-                    // over: the scene's extra cars leave with it
+                    // over: the scene's extra cars leave with it; a start scene's people stay on to the
+                    // clip's end (its script runs on after the cut)
+                    let linger = self.cine_prerace && self.game.race.is_some();
                     self.cine_free = false;
                     self.cine_prerace = false;
                     self.cine_results = false;
@@ -2447,10 +2565,17 @@ impl App {
                     if let Some(a) = self.cine_after.take() {
                         self.pending_action = a;
                     }
-                    self.cine.stop();
+                    if linger {
+                        self.cine.release();
+                    } else {
+                        self.cine.stop();
+                    }
                     self.vehicles.cars.retain(|c| !c.driver.starts_with("cine:"));
                 }
             }
+        }
+        if self.game.race.is_none() {
+            self.cine.drop_linger();
         }
         // ---- the overhead map's script triggers (rule_frame.md 9.2). A red light race's start
         // script sets the race clock to -4 s once its start scene is over and sends the HUD mapGoBig
@@ -3002,6 +3127,9 @@ impl App {
             let ready = self.vehicles.player().map_or(true, |c| world.ready_at(c.state.pos));
             race_finished = self.game.update_race(&mut self.vehicles, sim_dt, ready);
             self.game.ui_sim_dt += sim_dt;
+            if !(self.cine_prerace && self.cine.playing.is_some()) {
+                self.game.scene_hud_off = false;
+            }
             // (the original places the racers 0.8 s before its start scene begins - the player's engine
             // starts with the scene, grid_hold_rule.md 1; the port's dive in front of the scene stands for
             // the arrival, so the racers are held with no pedals until 0.8 s before its end)
@@ -4380,6 +4508,8 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
             }
         }
         let rain_snd = self.rain_amount();
+        // (the start scene's events on the racers: gestures, windows, the taunt's speech and jaws)
+        self.prerace_acts_tick(dt);
         if let Some(a) = self.audio.as_mut() {
             let fwd = self.cam.forward();
             let right = Vec3::new(-fwd.z, 0.0, fwd.x).normalize_or(Vec3::X);
@@ -7057,6 +7187,7 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                 // (p080: delivery_hangout_core plays the walk to the car only when the panel is
                 // accepted; a restart or the next delivery goes straight to the intro)
                 let p080_again = action == MenuAction::RestartRace || self.game.race.as_ref().map_or(false, |r| r.kind == game::RaceKind::Delivery);
+                self.prerace_replay = action == MenuAction::RestartRace;
                 self.delivery_intro = None;
                 self.delivery_tail = None;
                 // (RESTART SERIES from a race's pause: its first race again, the tally at nought)

@@ -14,8 +14,14 @@ use std::path::Path;
 enum Step {
     /// `voice`: the profile whose banks say it (GH_01 ...), None - any
     Play { asset: String, player: bool, voice: Option<String> },
+    /// a clip by its full name (the taunts' special-case assets): from `voice`'s banks, or the player's
+    Clip { name: String, player: bool, voice: Option<String> },
     Wait(f32),
 }
+
+/// The bank that holds the player's replies to every hookman's pre-race taunt (`PRERACE_TAUNT_HP_*` /
+/// `_PH_*` receiver / sender lines of the player).
+const PLAYER_TAUNT_BANK: &str = "0x0624a35b";
 
 #[derive(Default)]
 pub struct Speech {
@@ -29,6 +35,12 @@ pub struct Speech {
     queue: VecDeque<Step>,
     wait: f32,
     rng: u32,
+    /// the line playing now: (the player's, seconds left) - the speakers' jaw flap
+    line: Option<(bool, f32)>,
+    /// the pre-race taunt counters (sub_826C2B18 starts them at random): H 1..12, the HP / PH letter A..F
+    taunt_h: u32,
+    taunt_l: u32,
+    taunt_ready: Vec<Step>,
 }
 
 fn attr<'a>(s: &'a str, name: &str) -> Option<&'a str> {
@@ -169,6 +181,81 @@ impl Speech {
         self.queue.clear();
     }
 
+    /// Whose line is playing: Some(true) the player's, Some(false) the other speaker's.
+    pub fn line(&self) -> Option<bool> {
+        self.line.map(|l| l.0)
+    }
+
+    fn clip_in(&self, name: &str, player: bool, voice: Option<&str>) -> Option<String> {
+        let c = self.clips.get(&joaat(name))?;
+        let bank_of = |k: &String| k.rsplit_once('/').map(|x| x.0.to_string()).unwrap_or_default();
+        if player {
+            return c.iter().find(|k| bank_of(k).ends_with(PLAYER_TAUNT_BANK)).cloned();
+        }
+        let vb = self.voice_banks.get(voice?)?;
+        c.iter().find(|k| vb.contains(&bank_of(k))).cloned()
+    }
+
+    /// Prepare a pre-race taunt (`CineScript_RequestPreraceTauntScenarioAudio`, scenario `TAUNT_PRERACE_<kind>`:
+    /// HP = the hookman, 0.6 s, the player's reply; PH = the player first; H = the hookman alone). The asset
+    /// names are the special cases of sub_826C3000: H `PRERACE_TAUNT_H_<NN>` (NN 1..12 in turn), HP / PH
+    /// `PRERACE_TAUNT_<kind>_<hookman's profile>_<A..F in turn>_01` for both lines. False when the hookman has
+    /// no voice for it (the scenario is then not prepared: no windows, no speech).
+    pub fn prepare_taunt(&mut self, kind: &str, hookman: &str) -> bool {
+        let voice = hookman.to_ascii_uppercase();
+        if self.taunt_h == 0 {
+            self.rng = self.rng.wrapping_mul(1664525).wrapping_add(1013904223);
+            self.taunt_h = 1 + (self.rng >> 16) % 12;
+            self.rng = self.rng.wrapping_mul(1664525).wrapping_add(1013904223);
+            self.taunt_l = (self.rng >> 16) % 6;
+        }
+        let steps = match kind {
+            "H" => {
+                let name = format!("PRERACE_TAUNT_H_{:02}", self.taunt_h);
+                vec![Step::Clip { name, player: false, voice: Some(voice.clone()) }]
+            }
+            "HP" | "PH" => {
+                let name = format!("PRERACE_TAUNT_{kind}_{voice}_{}_01", (b'A' + self.taunt_l as u8) as char);
+                let hook = Step::Clip { name: name.clone(), player: false, voice: Some(voice.clone()) };
+                let me = Step::Clip { name, player: true, voice: None };
+                if kind == "HP" { vec![hook, Step::Wait(0.6), me] } else { vec![me, Step::Wait(0.6), hook] }
+            }
+            _ => return false,
+        };
+        let ok = steps.iter().all(|st| match st {
+            Step::Clip { name, player, voice } => self.clip_in(name, *player, voice.as_deref()).is_some(),
+            _ => true,
+        });
+        if !ok {
+            for st in &steps {
+                if let Step::Clip { name, player, .. } = st {
+                    log::info!("speech: taunt clip {} player {}: {:?} voice banks {:?}", name, player, self.clips.get(&joaat(name)), self.voice_banks.get(&voice));
+                }
+            }
+            log::info!("speech: taunt {} for {} not on the disc", kind, voice);
+            return false;
+        }
+        if kind == "H" {
+            self.taunt_h = self.taunt_h % 12 + 1;
+        } else {
+            self.taunt_l = (self.taunt_l + 1) % 6;
+        }
+        self.taunt_ready = steps;
+        true
+    }
+
+    /// `playspeech`: say the prepared taunt.
+    pub fn play_taunt(&mut self) -> bool {
+        let steps = std::mem::take(&mut self.taunt_ready);
+        if steps.is_empty() {
+            return false;
+        }
+        self.queue.clear();
+        self.wait = 0.0;
+        self.queue.extend(steps);
+        true
+    }
+
     fn resolve(&mut self, asset: &str, player: bool, voice: Option<&str>) -> Option<String> {
         // numbered takes of the same line
         let mut takes: Vec<&Vec<String>> = Vec::new();
@@ -200,6 +287,12 @@ impl Speech {
 
     pub fn update(&mut self, a: &mut Audio, dt: f32) {
         self.wait -= dt;
+        if let Some(l) = self.line.as_mut() {
+            l.1 -= dt;
+            if l.1 <= 0.0 {
+                self.line = None;
+            }
+        }
         while self.wait <= 0.0 {
             let Some(step) = self.queue.pop_front() else {
                 self.wait = 0.0;
@@ -207,6 +300,16 @@ impl Speech {
             };
             match step {
                 Step::Wait(t) => self.wait = t,
+                Step::Clip { name, player, voice } => {
+                    let Some(key) = self.clip_in(&name, player, voice.as_deref()) else { continue };
+                    let dur = a.clip(&key).map_or(0.0, |c| c.data.len() as f32 / c.rate.max(1) as f32);
+                    if dur > 0.0 {
+                        log::info!("speech: taunt line {} ({}) -> {} ({:.1} s)", name, if player { "player" } else { "hookman" }, key, dur);
+                        a.play(&key, 1.0);
+                        self.wait = dur;
+                        self.line = Some((player, dur));
+                    }
+                }
                 Step::Play { asset, player, voice } => {
                     let Some(key) = self.resolve(&asset, player, voice.as_deref()) else { continue };
                     let dur = a.clip(&key).map_or(0.0, |c| c.data.len() as f32 / c.rate.max(1) as f32);

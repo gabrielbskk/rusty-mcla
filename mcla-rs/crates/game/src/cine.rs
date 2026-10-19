@@ -63,6 +63,10 @@ pub struct Cine {
     ambient: Vec<Actor>,
     ambient_name: String,
     clock: f32,
+    /// a start scene after its cut to the game camera: its script runs on to the clip's end, so its people
+    /// stay where they are and go on moving (work/career2/cap/README.md, finding 5: the starter is still in
+    /// the game view for a few seconds after the cut)
+    linger: Option<Scene>,
 }
 
 /// The car movers that stand for the player's own car.
@@ -269,6 +273,22 @@ impl Cine {
 
     pub fn tick(&mut self, dt: f32) {
         self.clock += dt;
+        if let Some(sc) = self.linger.as_mut() {
+            sc.t += dt;
+            if sc.t >= sc.duration {
+                self.linger = None;
+            }
+        }
+    }
+
+    /// The scene hands the camera back to the game but its people play on to the clip's end.
+    pub fn release(&mut self) {
+        self.linger = self.playing.take().filter(|sc| !sc.actors.is_empty() && sc.t < sc.duration);
+    }
+
+    /// The lingering people go too (the race is over or another scene begins).
+    pub fn drop_linger(&mut self) {
+        self.linger = None;
     }
 
     /// The labels of a scene's car movers.
@@ -374,10 +394,7 @@ impl Cine {
             let (mt, mr) = a.clip.mover(f);
             self.buf.emit(&a.model, 0, &local, Mat4::from_rotation_translation(mr, mt));
         }
-        let Some(sc) = self.playing.as_ref() else {
-            self.buf.upload(gpu);
-            return;
-        };
+        for sc in self.playing.iter().chain(self.linger.iter()) {
         for a in &sc.actors {
             let f = a.clip.anim.frame_at(sc.t);
             a.clip.local(&a.model.bones, f, &mut local);
@@ -398,6 +415,7 @@ impl Cine {
             }
             let (mt, mr) = a.clip.mover(f);
             self.buf.emit(&a.model, 0, &local, sc.origin * Mat4::from_rotation_translation(mr, mt));
+        }
         }
         self.buf.upload(gpu);
     }

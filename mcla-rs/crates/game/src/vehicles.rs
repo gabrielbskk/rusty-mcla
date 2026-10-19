@@ -69,6 +69,11 @@ pub struct CarModel {
     pub variant_labels: Vec<(Slot, Vec<String>)>,
     /// extra garage rows with a placed fragment on this car
     pub extra_variants: std::collections::HashSet<(String, usize)>,
+    /// per batch: 0, or 1 / 2 for the left / right side window's glass (drawn with the car's
+    /// window object, `CarInstance::window_bindings`)
+    pub batch_window: Vec<u8>,
+    /// the side windows' clips (left, right), where the base fragment has them
+    pub windows: [Option<vehicle_model::WindowClip>; 2],
 }
 
 pub struct WheelModel {
@@ -257,6 +262,72 @@ pub struct CarInstance {
     pub pu_mirror: f32,
     /// step 19g: Stealth - the car is drawn by pu_fx.rs with PS_Stealth instead of its own look
     pub pu_stealth: bool,
+    /// the side windows' objects (left, right): the body's, moved by the window's clip; empty
+    /// when the model has no window clips
+    pub window_bindings: Vec<ObjectBinding>,
+    /// the side windows' controllers (left, right)
+    pub windows: [WindowCtl; 2],
+}
+
+/// A side window's controller as the original's (vtable 0x82046958; open sub_8233C3B8, close
+/// sub_8233C438, update sub_8233BEC0): `state` 1 closed (up), 2 open (down), 3 opening,
+/// 4 closing; `time` runs at rate 0.5 (0x823409C8) over the clip, so rolling down takes twice
+/// the clip's length; the clip is played at clamp(time, 0, duration).
+#[derive(Debug, Clone, Copy)]
+pub struct WindowCtl {
+    pub state: u8,
+    pub time: f32,
+}
+
+impl Default for WindowCtl {
+    fn default() -> Self {
+        WindowCtl { state: 1, time: 0.0 }
+    }
+}
+
+impl WindowCtl {
+    pub const RATE: f32 = 0.5;
+
+    /// `open` only from closed, `close` only from fully open (an up request while the window is
+    /// still going down is dropped, as the original's)
+    pub fn request(&mut self, open: bool, duration: f32) {
+        match (open, self.state) {
+            (true, 1) => {
+                self.state = 3;
+                self.time = 0.0;
+            }
+            (false, 2) => {
+                self.state = 4;
+                self.time = duration;
+            }
+            _ => {}
+        }
+    }
+
+    /// (the original holds the time while the window motor's sound is being prepared, +72;
+    /// the port has no such wait)
+    pub fn update(&mut self, dt: f32, duration: f32) {
+        match self.state {
+            3 => {
+                self.time += Self::RATE * dt;
+                if self.time >= duration {
+                    self.state = 2;
+                }
+            }
+            4 => {
+                self.time -= Self::RATE * dt;
+                if self.time < 0.0 {
+                    self.state = 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The clip time the player is set to.
+    pub fn clip_time(&self, duration: f32) -> f32 {
+        self.time.clamp(0.0, duration)
+    }
 }
 
 /// What a set-up file paints on a car that is not the player's, as the renderer takes it
@@ -1070,8 +1141,10 @@ impl Vehicles {
                 // (render only, blade round - PS_CarbonFiber's NormalSampler, the weave's normal map, rides as the CarbonFiber
                 // meshes' second texture; city.wgsl reads it in the carbon branch. MCLA_CARBON_OLD=1: none)
                 let (s2, k1) = if sname.eq_ignore_ascii_case("CarbonFiber") && !car_is_ambient && std::env::var("MCLA_CARBON_OLD").is_err() { carbon_weave(gpu, world) } else { (s2, k1) };
-                // meshes sharing textures and material mode are merged into one draw
-                let acc = merged.entry((k0, k1, mode as u32)).or_insert_with(|| MergeAcc { verts: Vec::new(), indices: Vec::new(), d, s2, sname: sname.to_string(), mode, min: Vec3::splat(f32::INFINITY), max: Vec3::splat(f32::NEG_INFINITY) });
+                // meshes sharing textures and material mode are merged into one draw (the side
+                // windows' glass apart, by side: it moves with its bone)
+                let win_side = if part.is_base { car.windows.iter().position(|w| w.as_ref().map_or(false, |w| part.mesh_tag.get(mi) == Some(&w.tag))).map_or(0, |k| k as u32 + 1) } else { 0 };
+                let acc = merged.entry((k0, k1, mode as u32 | win_side << 16)).or_insert_with(|| MergeAcc { verts: Vec::new(), indices: Vec::new(), d, s2, sname: sname.to_string(), mode, min: Vec3::splat(f32::INFINITY), max: Vec3::splat(f32::NEG_INFINITY) });
                 // (the glass over a lamp is its lens: red over the tail lamps, clear elsewhere -
                 // the game tints it from a table per lamp, BumpedTintColors)
                 let pn = part.primary.to_ascii_lowercase();
@@ -1218,6 +1291,7 @@ impl Vehicles {
             }
         }
         let mut keys: Vec<(u32, u32, u32)> = merged.keys().copied().collect();
+        let mut batch_window: Vec<u8> = Vec::new();
         keys.sort_by_key(|k| (k.2, k.0, k.1));
         if std::env::var("MCLA_WHEEL_DUMP").is_ok() {
             if let Some(h) = car.hubs {
@@ -1255,6 +1329,10 @@ impl Vehicles {
             let bind = gpu.texture_bind_group(&acc.d, &acc.s2, k.0, k.1);
             let vb = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&acc.verts), usage: wgpu::BufferUsages::VERTEX });
             let ib = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&acc.indices), usage: wgpu::BufferUsages::INDEX });
+            if k.2 >> 16 != 0 {
+                log::debug!("car {}: window {} batch shader {} tris {}", car.name, k.2 >> 16, acc.sname, acc.indices.len() / 3);
+            }
+            batch_window.push((k.2 >> 16) as u8);
             batches.push(GpuBatch { shader: acc.sname, vb, ib, count: acc.indices.len() as u32, bind, mode: acc.mode, min: acc.min, max: acc.max });
         }
         let mut params = car_params(&car);
@@ -1332,7 +1410,7 @@ impl Vehicles {
             }
         };
         let lamps: Vec<(u8, Vec3)> = lamp_acc.iter().map(|((id, _), (sum, n))| (*id as u8, *sum / (*n).max(1) as f32)).collect();
-        let m = Arc::new(CarModel { name: car.name.clone(), lamps, glow_bones, batches, params, params_mods, simtunes, aitunes: car.aitune.clone(), rest_height: car.hubs.map(|h| (h[0].y + h[2].y) * 0.5), wheels, brakes, brake_dir, rim_dir, rim_ratio, bike: car.bike, min: car.min, max: car.max, cfg: cfg.clone(), variants, variant_labels, extra_variants });
+        let m = Arc::new(CarModel { name: car.name.clone(), lamps, glow_bones, batches, params, params_mods, simtunes, aitunes: car.aitune.clone(), rest_height: car.hubs.map(|h| (h[0].y + h[2].y) * 0.5), wheels, brakes, brake_dir, rim_dir, rim_ratio, bike: car.bike, min: car.min, max: car.max, cfg: cfg.clone(), variants, variant_labels, extra_variants, batch_window, windows: car.windows.clone() });
         self.models.push(m.clone());
         if self.wheels.is_none() {
             self.wheels = load_wheels(gpu, world).map(Arc::new);
@@ -1472,6 +1550,7 @@ impl Vehicles {
         let binding = gpu.new_object(&ObjectUniform::default());
         let wheel_bindings = (0..4).map(|_| gpu.new_object(&ObjectUniform::default())).collect();
         let caliper_bindings = (0..4).map(|_| gpu.new_object(&ObjectUniform::default())).collect();
+        let window_bindings = if model.windows.iter().any(|w| w.is_some()) { (0..2).map(|_| gpu.new_object(&ObjectUniform::default())).collect() } else { Vec::new() };
         let mut ai = None;
         if !is_player {
             let mut d = AiDriver::new(self.rng ^ 0x9e3779b9);
@@ -1480,7 +1559,7 @@ impl Vehicles {
             d.target_speed = 17.88 * (0.86 + self.rand() * 0.14);
             ai = Some(d);
         }
-        self.cars.push(CarInstance { sst: 0.0, model, binding, wheel_bindings, caliper_bindings, state: CarState::new(pos, yaw), input: CarInput::default(), color, ai, placed: false, is_player, wheels: None, lean: 0.0, perf: 0.0, tuned: None, cop: false, stunned: 0.0, parked: None, settle: 0.0, racer: false, pinned: false, boost: 0.0, driver: String::new(), plate_text: String::new(), plate: None, vinyl_name: String::new(), vinyl: None, vinyl_done: false, setup: None, pose_history: Default::default(), inflict: 1.0, goon: false, look: None, brake: None, dressed: false, driver_set: String::new(), pu_ctl: 0, pu_ghost: false, pu_mirror: 0.0, pu_stealth: false });
+        self.cars.push(CarInstance { sst: 0.0, model, binding, wheel_bindings, caliper_bindings, state: CarState::new(pos, yaw), input: CarInput::default(), color, ai, placed: false, is_player, wheels: None, lean: 0.0, perf: 0.0, tuned: None, cop: false, stunned: 0.0, parked: None, settle: 0.0, racer: false, pinned: false, boost: 0.0, driver: String::new(), plate_text: String::new(), plate: None, vinyl_name: String::new(), vinyl: None, vinyl_done: false, setup: None, pose_history: Default::default(), inflict: 1.0, goon: false, look: None, brake: None, dressed: false, driver_set: String::new(), pu_ctl: 0, pu_ghost: false, pu_mirror: 0.0, pu_stealth: false, window_bindings, windows: Default::default() });
         self.cars.len() - 1
     }
 
@@ -1990,6 +2069,19 @@ if keep || c.state.pos.distance(center) < 450.0 {
     /// Physics + AI for every car.
     pub fn update(&mut self, world: &World, player_input: CarInput, dt: f32) {
         self.clock += dt;
+        // (test hook: MCLA_WINDOW_TEST=1 rolls the player's side windows down)
+        static WINDOW_TEST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let window_test = *WINDOW_TEST.get_or_init(|| std::env::var("MCLA_WINDOW_TEST").is_ok_and(|v| v == "1"));
+        for c in self.cars.iter_mut() {
+            for k in 0..2 {
+                if let Some(clip) = c.model.windows[k].as_ref() {
+                    if window_test && c.is_player {
+                        c.windows[k].request(true, clip.duration);
+                    }
+                    c.windows[k].update(dt, clip.duration);
+                }
+            }
+        }
         let n = self.cars.len();
         // AI inputs (with simple car-ahead avoidance)
         let positions: Vec<(Vec3, Vec3, f32)> = self.cars.iter().map(|c| (c.state.pos, c.state.forward(), c.state.speed())).collect();
@@ -2556,7 +2648,14 @@ if keep || c.state.pos.distance(center) < 450.0 {
                 (false, Some(l)) => (l.paint_type.min(5), l.color2, l.tint, l.interior, l.area_a, l.area_b),
                 (false, None) => (3, [0.0; 4], [0.0; 4], [[0.0; 4]; 5], [[0.0; 4]; 5], [[0.0; 4]; 5]),
             };
-            gpu.update_object(&c.binding, &ObjectUniform { model: m.to_cols_array_2d(), color: c.color, params: [lights, c.input.brake, c.state.damage, siren + reversing + 16.0 + 32.0 * s19d_look.0 as f32], dents: if c.state.damage > 0.0 { c.state.dents } else { [[0.0; 4]; 6] }, color2: s19d_look.1, tint: s19d_look.2, interior: s19d_look.3, fade_min: c.model.min.extend(c.pu_mirror).to_array(), fade_size: (c.model.max - c.model.min).max(Vec3::splat(0.01)).extend(0.0).to_array(), fill: car_fill, lamp_a: lamp_rows.0, lamp_b: lamp_rows.1, area_a: s19d_look.4, area_b: s19d_look.5 });
+            let body_u = ObjectUniform { model: m.to_cols_array_2d(), color: c.color, params: [lights, c.input.brake, c.state.damage, siren + reversing + 16.0 + 32.0 * s19d_look.0 as f32], dents: if c.state.damage > 0.0 { c.state.dents } else { [[0.0; 4]; 6] }, color2: s19d_look.1, tint: s19d_look.2, interior: s19d_look.3, fade_min: c.model.min.extend(c.pu_mirror).to_array(), fade_size: (c.model.max - c.model.min).max(Vec3::splat(0.01)).extend(0.0).to_array(), fill: car_fill, lamp_a: lamp_rows.0, lamp_b: lamp_rows.1, area_a: s19d_look.4, area_b: s19d_look.5 };
+            gpu.update_object(&c.binding, &body_u);
+            // (the side windows: the body's object moved by the window bone's clip)
+            for (k, wb) in c.window_bindings.iter().enumerate() {
+                let Some(clip) = c.model.windows[k].as_ref() else { continue };
+                let wm = m * clip.delta(c.windows[k].clip_time(clip.duration));
+                gpu.update_object(wb, &ObjectUniform { model: wm.to_cols_array_2d(), ..body_u });
+            }
             for (i, b) in c.wheel_bindings.iter().enumerate() {
                 let left = i % 2 == 0;
                 let steer = Quat::from_rotation_y(-pose.steer[i]);
@@ -2789,10 +2888,11 @@ if keep || c.state.pos.distance(center) < 450.0 {
                         continue;
                     }
                     pass.set_pipeline(pl);
-                    for b in &c.model.batches {
+                    for (bi, b) in c.model.batches.iter().enumerate() {
                         if b.mode != MatMode::CarGlass || b.shader.to_ascii_lowercase().contains("bumped") {
                             continue;
                         }
+                        pass.set_bind_group(3, c.batch_object(bi), &[]);
                         pass.set_bind_group(1, b.bind.as_ref(), &[]);
                         pass.set_bind_group(2, &gpu.mat_bgs[&(b.mode as u32)], &[]);
                         pass.set_vertex_buffer(0, b.vb.slice(..));
@@ -2803,7 +2903,7 @@ if keep || c.state.pos.distance(center) < 450.0 {
                 }
                 pass.set_pipeline(&gpu.pipeline_blend);
             }
-            for b in &c.model.batches {
+            for (bi, b) in c.model.batches.iter().enumerate() {
                 if b.mode.blended() != blend_pass {
                     continue;
                 }
@@ -2818,6 +2918,7 @@ if keep || c.state.pos.distance(center) < 450.0 {
                         _ => &b.bind,
                     },
                 };
+                pass.set_bind_group(3, c.batch_object(bi), &[]);
                 pass.set_bind_group(1, bind.as_ref(), &[]);
                 pass.set_bind_group(2, &gpu.mat_bgs[&(b.mode as u32)], &[]);
                 pass.set_vertex_buffer(0, b.vb.slice(..));
@@ -2863,6 +2964,41 @@ if keep || c.state.pos.distance(center) < 450.0 {
     }
 }
 
+impl CarInstance {
+    /// The object (group 3) a batch of the car's model is drawn with: the body's, or a side
+    /// window's for that window's glass.
+    pub fn batch_object(&self, bi: usize) -> &wgpu::BindGroup {
+        match self.model.batch_window.get(bi).copied().unwrap_or(0) {
+            0 => &self.binding.bg,
+            k => self.window_bindings.get(k as usize - 1).map_or(&self.binding.bg, |b| &b.bg),
+        }
+    }
+}
+
+impl Vehicles {
+    /// Roll a side window of a car down (`open`) or up, as the original's window controller:
+    /// down only from fully up, up only from fully down; it moves at half the clip's rate (the
+    /// DB9's 0.667 s clip takes 1.33 s). Nothing happens on a car whose model has no clip.
+    pub fn window(&mut self, car: usize, right: bool, open: bool) {
+        let Some(c) = self.cars.get_mut(car) else { return };
+        let k = right as usize;
+        if let Some(clip) = c.model.windows[k].as_ref() {
+            let d = clip.duration;
+            c.windows[k].request(open, d);
+        }
+    }
+
+    /// How far down a side window is: 0 up (closed) .. 1 fully down (open).
+    pub fn window_open(&self, car: usize, right: bool) -> f32 {
+        let Some(c) = self.cars.get(car) else { return 0.0 };
+        let k = right as usize;
+        match c.model.windows[k].as_ref() {
+            Some(clip) if clip.duration > 0.0 => c.windows[k].clip_time(clip.duration) / clip.duration,
+            _ => 0.0,
+        }
+    }
+}
+
 impl Vehicles {
     /// The cars' windows into a shadow pass (the caller's pipeline stays): the original's shadow passes draw
     /// every mesh of the car with VS_CarShadowDepthLocal, the six CarGlass meshes among them - the cabin lies
@@ -2880,10 +3016,11 @@ impl Vehicles {
                 }
             }
             pass.set_bind_group(3, &c.binding.bg, &[]);
-            for b in &c.model.batches {
+            for (bi, b) in c.model.batches.iter().enumerate() {
                 if b.mode != MatMode::CarGlass || b.shader.to_ascii_lowercase().contains("bumped") {
                     continue;
                 }
+                pass.set_bind_group(3, c.batch_object(bi), &[]);
                 pass.set_bind_group(1, b.bind.as_ref(), &[]);
                 pass.set_bind_group(2, &gpu.mat_bgs[&(b.mode as u32)], &[]);
                 pass.set_vertex_buffer(0, b.vb.slice(..));
@@ -2932,10 +3069,11 @@ impl Vehicles {
                 }
             }
             pass.set_bind_group(3, &c.binding.bg, &[]);
-            for b in &c.model.batches {
+            for (bi, b) in c.model.batches.iter().enumerate() {
                 if !b.mode.blended() {
                     continue;
                 }
+                pass.set_bind_group(3, c.batch_object(bi), &[]);
                 pass.set_bind_group(1, b.bind.as_ref(), &[]);
                 pass.set_bind_group(2, &gpu.mat_bgs[&(b.mode as u32)], &[]);
                 pass.set_vertex_buffer(0, b.vb.slice(..));
