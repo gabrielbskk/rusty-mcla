@@ -2719,4 +2719,16 @@ impl Frustum {
         }
         true
     }
+    #[cfg(test)]
+    pub fn from_planes(planes: [Vec4; 6]) -> Frustum {
+        Frustum { planes }
+    }
+    /// False when the sphere lies entirely outside one plane.
+    pub fn intersects_sphere(&self, c: Vec3, r: f32) -> bool {
+        self.planes.iter().all(|p| !(p.truncate().dot(c) + p.w < -r))
+    }
+    /// True when every point lies outside the same plane.
+    pub fn points_outside(&self, pts: &[Vec3]) -> bool {
+        self.planes.iter().any(|p| pts.iter().all(|v| p.truncate().dot(*v) + p.w < 0.0))
+    }
 }

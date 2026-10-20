@@ -2,25 +2,33 @@
 //!
 //! The file lists 5614 closed polyhedra ("Type box": mostly 8-vertex boxes, some prisms with
 //! more corners) that stand inside the city's buildings. The rule below is the original's, read
-//! from the recompiled executable (work/map/lod_rule.md, "Occlusion culling in the port"):
+//! from the recompiled executable (docs/MAP.md, "Occluder selection"):
 //!
-//! * per view, the occluders whose bounding-sphere centre is within 40 m of the camera in the
-//!   ground plane are candidates (none at all when the camera is above y = 1000); at most 64
-//!   volumes are kept per view;
-//! * a candidate that is outside the view frustum is skipped;
+//! * at load every occluder gets a box (its vertices' bounds, sub_82173E20) and a kd-tree is
+//!   built over the boxes (sub_82173D60 / 82173900: split the node's bounds at the middle of its
+//!   longest axis, partition the boxes by centre, leaves of at most 2);
+//! * per view, the tree is walked (sub_82173728 / 82173290) with the box eye +-400 m (y +-10400):
+//!   the range is 0x82007A48 = 40.0 times the scale 0x827D2958, which the city sets to 10.0
+//!   (sub_822C2EA8). The first 128 occluders whose box overlaps it are the candidates of the main
+//!   view (512 for the pedestrian spawner's view), in the walk's order: a node's child on the side
+//!   of the query centre first. None at all when the camera is above y = 1000;
+//! * a candidate is skipped when its bounding sphere is outside the view frustum or lies its
+//!   radius behind every plane of a volume already taken (sub_82175238), when its sphere centre
+//!   is more than 400 m from the camera in the ground plane, or when all its vertices are outside
+//!   one frustum plane (sub_825F32F8); at most 64 volumes are kept per view;
 //! * its volume is a set of at most 16 planes: the planes of the polygons that face the camera
-//!   (`n . (eye - v) >= 1e-6`) and, for every edge between a facing and a non-facing polygon,
-//!   the plane through the camera and that edge. No facing polygon (camera inside) or more
-//!   than 16 planes: the occluder is not used;
+//!   (`n . (eye - v) >= 1e-6`), moved 5 m into the occluder (0x82838724 = -5.0, also set by the
+//!   city), and, for every edge between a facing and a non-facing polygon, the plane through the
+//!   camera and that edge. No facing polygon (camera inside) or more than 16 planes: the occluder
+//!   is not used;
 //! * something is hidden when it lies behind every plane of one volume.
 //!
-//! What is the port's own: the candidates are taken nearest first (the original walks the
-//! result of a spatial query), a non-convex or open polyhedron is dropped at load (the plane
-//! set is only a correct occlusion volume for a convex body), an axis-aligned box is tested by
-//! its farthest corner per plane (the original tests spheres and boxes the same way), and the
-//! test keeps a 2 cm margin. The original's two savings - leaving out silhouette edges that are
-//! outside the frustum and dropping occluders hidden by other occluders - are not done; both
-//! only reduce work.
+//! What is the port's own: a non-convex or open polyhedron is dropped at load (the plane set is
+//! only a correct occlusion volume for a convex body; it still takes its place in the tree and
+//! among the candidates), an axis-aligned box is tested by its farthest corner per plane (the
+//! original tests spheres and boxes the same way), the test keeps a 2 cm margin, and the frustum
+//! is the port's own view's. The original's leaving out of silhouette edges that are outside the
+//! frustum (at most 2 per volume) is not done; it only changes what is outside the view.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
@@ -29,9 +37,22 @@ use glam::{DMat3, DVec3, Mat4, Vec3, Vec4};
 
 use crate::render::Frustum;
 
-/// Ground-plane distance from the camera to an occluder's sphere centre within which it is used
-/// (0x82007A48 = 40.0, times the scale 0x827D2958 = 1.0).
+/// Ground-plane distance from the camera to an occluder's sphere centre within which it is used,
+/// before the scale (0x82007A48 = 40.0).
 pub(crate) const RANGE: f32 = 40.0;
+/// The range scale 0x827D2958: 1.0 in the image, set to 10.0 (from 0x82003A8C) by the city's
+/// init sub_822C2EA8; the running original reads 10.0.
+pub(crate) const RANGE_SCALE: f32 = 10.0;
+/// How far the facing planes are moved into the occluder in the main views (0x82838724 = -5.0,
+/// set by sub_822C2EA8 next to the scale; sub_82171D38). The spawner's view does not move them.
+const PUSH: f32 = 5.0;
+/// Extra height of the tree query box above and below the range (0x8200733C).
+const QUERY_Y: f32 = 10000.0;
+/// Candidates of a main view (sub_825F3720) and of the spawner's view (sub_825F3178).
+const MAIN_CANDIDATES: usize = 128;
+const AROUND_CANDIDATES: usize = 512;
+/// A node with fewer occluders than this is a leaf (sub_82173E20 passes 2, plus one).
+const LEAF_BELOW: usize = 3;
 /// No occluders above this camera height (0x82002C64).
 const MAX_CAM_Y: f32 = 1000.0;
 /// Volumes per view (the view's list holds 64).
@@ -50,8 +71,6 @@ struct Face {
 
 struct Occluder {
     centre: Vec3,
-    min: Vec3,
-    max: Vec3,
     /// mean of the vertices, strictly inside the body
     inside: Vec3,
     verts: Vec<Vec3>,
@@ -60,9 +79,33 @@ struct Occluder {
     edges: Vec<(u16, u16, u16, u16)>,
 }
 
+/// One occluder of the file as the original keeps it: bounding sphere, box from the vertices
+/// (centre and half size, as sub_82173E20 stores them) and its body when it is convex.
+struct Entry {
+    centre: Vec3,
+    radius: f32,
+    box_c: Vec3,
+    box_e: Vec3,
+    body: Option<u32>,
+}
+
+/// A kd-tree node (12 bytes in the original: child pointer | axis, then two floats).
+#[derive(Clone, Copy)]
+enum Node {
+    /// `lo` = smallest box minimum of the right child on `axis`, `hi` = largest box maximum of the
+    /// left child; the children are `left` and `left + 1`.
+    Inner { axis: u8, lo: f32, hi: f32, left: u32 },
+    /// `order[start .. start + count]`
+    Leaf { start: u32, count: u32 },
+}
+
 /// The occluders of the city, loaded once.
 pub struct Occluders {
     list: Vec<Occluder>,
+    entries: Vec<Entry>,
+    nodes: Vec<Node>,
+    /// occluder indices in the tree's leaf order
+    order: Vec<u32>,
     /// polyhedra in the file, including the ones dropped as not convex / not closed
     pub in_file: usize,
 }
@@ -70,6 +113,8 @@ pub struct Occluders {
 /// The occlusion volumes of one view (one frame, one camera).
 pub struct Selected {
     volumes: Vec<Vec<Vec4>>,
+    /// the occluder (index in the file) of each volume
+    ids: Vec<u32>,
 }
 
 struct Tokens<'a> {
@@ -125,6 +170,7 @@ impl Occluders {
         }
         let count = t.counted("Occluders")?;
         let mut list = Vec::with_capacity(count);
+        let mut entries = Vec::with_capacity(count);
         for _ in 0..count {
             t.expect("Occluder")?;
             let _index: u32 = t.num()?;
@@ -135,7 +181,7 @@ impl Occluders {
             let _name = t.next()?;
             t.expect("BoundingSphere")?;
             let centre = Vec3::new(t.num()?, t.num()?, t.num()?);
-            let _radius: f32 = t.num()?;
+            let radius: f32 = t.num()?;
             let nv = t.counted("Vertices")?;
             let mut verts = Vec::with_capacity(nv);
             for _ in 0..nv {
@@ -169,15 +215,25 @@ impl Occluders {
             }
             t.expect("}")?;
             t.expect("}")?;
-            if kind != "box" {
-                continue;
+            // the box sub_82173E20 makes: bounds of the vertices, centre and half size
+            let mut mn = Vec3::splat(f32::MAX);
+            let mut mx = Vec3::splat(-f32::MAX);
+            for v in &verts {
+                mn = mn.min(*v);
+                mx = mx.max(*v);
             }
-            if let Some(o) = Occluder::build(centre, verts, &polys) {
-                list.push(o);
+            let mut entry = Entry { centre, radius, box_c: (mx + mn) * 0.5, box_e: (mx - mn) * 0.5, body: None };
+            if kind == "box" {
+                if let Some(o) = Occluder::build(centre, verts, &polys) {
+                    entry.body = Some(list.len() as u32);
+                    list.push(o);
+                }
             }
+            entries.push(entry);
         }
         t.expect("}")?;
-        Ok(Occluders { list, in_file: count })
+        let (nodes, order) = build_tree(&entries);
+        Ok(Occluders { list, entries, nodes, order, in_file: count })
     }
 
     pub fn load(data_dir: &str) -> Option<Occluders> {
@@ -213,56 +269,212 @@ impl Occluders {
         }
     }
 
-    /// The occlusion volumes for a camera at `eye`.
+    /// The occlusion volumes for a camera at `eye` (sub_825F3720).
     pub fn select_at(&self, eye: Vec3, frustum: &Frustum) -> Selected {
-        let mut volumes = Vec::new();
+        let mut sel = Selected::none();
         if !(eye.y <= MAX_CAM_Y) || !eye.is_finite() {
-            return Selected { volumes };
+            return sel;
         }
-        let mut near: Vec<(f32, &Occluder)> = Vec::new();
-        for o in &self.list {
-            let dx = o.centre.x - eye.x;
-            let dz = o.centre.z - eye.z;
-            let d2 = dx * dx + dz * dz;
-            if d2 <= RANGE * RANGE {
-                near.push((d2, o));
-            }
-        }
-        near.sort_by(|a, b| a.0.total_cmp(&b.0));
-        for (_, o) in near {
-            if volumes.len() >= MAX_VOLUMES {
+        let range = RANGE * RANGE_SCALE;
+        for i in self.query(eye, range, MAIN_CANDIDATES) {
+            if sel.volumes.len() >= MAX_VOLUMES {
                 break;
             }
-            if !frustum.intersects_aabb(o.min, o.max) {
+            let e = &self.entries[i as usize];
+            // sub_82175238: outside the frustum, or hidden by a volume already taken
+            if !frustum.intersects_sphere(e.centre, e.radius) || sel.hides_sphere(e.centre, e.radius) {
                 continue;
             }
-            if let Some(v) = o.volume(eye) {
-                volumes.push(v);
+            let Some(b) = e.body else { continue };
+            let o = &self.list[b as usize];
+            // sub_825F32F8
+            if !o.in_range(eye, range) || frustum.points_outside(&o.verts) {
+                continue;
+            }
+            if let Some(v) = o.volume(eye, PUSH) {
+                sel.volumes.push(v);
+                sel.ids.push(i);
             }
         }
-        Selected { volumes }
+        sel
     }
 
     /// The volumes of a view without a frustum (the pedestrian spawner's view 2, built in
-    /// sub_822C1FA8 by sub_825F2E10): occluders whose centre is within `range` in the ground
-    /// plane, at most 64 volumes; nearest first (the original's query order is not decoded).
+    /// sub_822C1FA8 by sub_825F3178 / 825F2E10): the tree's first 512 candidates within `range`,
+    /// at most 64 volumes, the facing planes not moved.
     pub fn select_around(&self, eye: Vec3, range: f32) -> Selected {
-        let mut volumes = Vec::new();
+        let mut sel = Selected::none();
         if !(eye.y <= MAX_CAM_Y) || !eye.is_finite() {
-            return Selected { volumes };
+            return sel;
         }
-        let mut near: Vec<(f32, &Occluder)> = self.list.iter().map(|o| ((o.centre.x - eye.x).powi(2) + (o.centre.z - eye.z).powi(2), o)).filter(|n| n.0 <= range * range).collect();
-        near.sort_by(|a, b| a.0.total_cmp(&b.0));
-        for (_, o) in near {
-            if volumes.len() >= MAX_VOLUMES {
+        for i in self.query(eye, range, AROUND_CANDIDATES) {
+            if sel.volumes.len() >= MAX_VOLUMES {
                 break;
             }
-            if let Some(v) = o.volume(eye) {
-                volumes.push(v);
+            let Some(b) = self.entries[i as usize].body else { continue };
+            let o = &self.list[b as usize];
+            if !o.in_range(eye, range) {
+                continue;
+            }
+            if let Some(v) = o.volume(eye, 0.0) {
+                sel.volumes.push(v);
+                sel.ids.push(i);
             }
         }
-        Selected { volumes }
+        sel
     }
+
+    /// The occluders whose box overlaps the box `eye` +- `range` (y +- `range` + 10000), in the
+    /// order of the original's tree walk (sub_82173728 / 82173290 with the callback
+    /// sub_82172FC0), at most `cap`.
+    fn query(&self, eye: Vec3, range: f32, cap: usize) -> Vec<u32> {
+        let mut out = Vec::new();
+        if self.nodes.is_empty() || cap == 0 {
+            return out;
+        }
+        let mut qmin = eye - Vec3::splat(range);
+        let mut qmax = eye + Vec3::splat(range);
+        qmin.y -= QUERY_Y;
+        qmax.y += QUERY_Y;
+        let q = (qmin + qmax) * 0.5;
+        let mut stack: Vec<u32> = Vec::new();
+        let mut node = 0u32;
+        loop {
+            match self.nodes[node as usize] {
+                Node::Leaf { start, count } => {
+                    for &i in &self.order[start as usize..(start + count) as usize] {
+                        let e = &self.entries[i as usize];
+                        let (bmin, bmax) = (e.box_c - e.box_e, e.box_c + e.box_e);
+                        if !(qmin.cmpgt(bmax).any() || bmin.cmpgt(qmax).any()) {
+                            out.push(i);
+                        }
+                        if out.len() >= cap {
+                            return out;
+                        }
+                    }
+                    match stack.pop() {
+                        Some(n) => node = n,
+                        None => return out,
+                    }
+                }
+                Node::Inner { axis, lo, hi, left } => {
+                    let a = axis as usize;
+                    let need_left = qmin[a] <= hi;
+                    let need_right = qmax[a] > lo;
+                    // the child on the query centre's side first; one of the two is entered
+                    // even when neither is needed, as in the original
+                    let left_first = need_left && q[a] <= (lo + hi) * 0.5;
+                    let (first, second) = if left_first { (left, left + 1) } else { (left + 1, left) };
+                    if need_left && need_right {
+                        stack.push(second);
+                    }
+                    node = first;
+                }
+            }
+        }
+    }
+}
+
+/// The original's kd-tree over the occluder boxes (sub_82173CB0 / 82173900); returns the nodes
+/// (root first) and the occluder indices in leaf order.
+fn build_tree(entries: &[Entry]) -> (Vec<Node>, Vec<u32>) {
+    let mut order: Vec<u32> = (0..entries.len() as u32).collect();
+    if entries.is_empty() {
+        return (Vec::new(), order);
+    }
+    let bmin_of = |i: u32| entries[i as usize].box_c - entries[i as usize].box_e;
+    let bmax_of = |i: u32| entries[i as usize].box_c + entries[i as usize].box_e;
+    // bounds of the boxes of a range (sub_82173600)
+    let bounds = |order: &[u32]| {
+        let (mut mn, mut mx) = (Vec3::splat(f32::MAX), Vec3::splat(-f32::MAX));
+        for &i in order {
+            mn = mn.min(bmin_of(i));
+            mx = mx.max(bmax_of(i));
+        }
+        (mn, mx)
+    };
+    // the longest axis; ties go to the later one
+    let axis_of = |mn: Vec3, mx: Vec3| {
+        let d = mx - mn;
+        if d.x > d.y {
+            if d.x > d.z { 0 } else { 2 }
+        } else if d.y > d.z {
+            1
+        } else {
+            2
+        }
+    };
+    // std::partition by box centre < split (sub_82173688 with sub_821731E0)
+    let partition = |order: &mut [u32], axis: usize, split: f32| {
+        let below = |i: u32| ((bmin_of(i) + bmax_of(i)) * 0.5)[axis] < split;
+        let (mut f, mut l) = (0usize, order.len());
+        loop {
+            if f == l {
+                return f;
+            }
+            if below(order[f]) {
+                f += 1;
+                continue;
+            }
+            loop {
+                l -= 1;
+                if f == l {
+                    return f;
+                }
+                if below(order[l]) {
+                    break;
+                }
+            }
+            order.swap(f, l);
+            f += 1;
+        }
+    };
+    let mut nodes = vec![Node::Leaf { start: 0, count: 0 }];
+    let (mn, mx) = bounds(&order);
+    // (node, begin, end, bounds min, bounds max); the left child first, the right one waits
+    let mut stack: Vec<(usize, usize, usize, Vec3, Vec3)> = Vec::new();
+    let mut cur = (0usize, 0usize, order.len(), mn, mx);
+    loop {
+        let (node, begin, end, mut mn, mut mx) = cur;
+        if end - begin < LEAF_BELOW {
+            nodes[node] = Node::Leaf { start: begin as u32, count: (end - begin) as u32 };
+            match stack.pop() {
+                Some(c) => {
+                    cur = c;
+                    continue;
+                }
+                None => break,
+            }
+        }
+        let mut axis = axis_of(mn, mx);
+        let mut split = (mn[axis] + mx[axis]) * 0.5;
+        let mut mid = begin + partition(&mut order[begin..end], axis, split);
+        if mid == begin || mid == end {
+            // all on one side: split the boxes' own bounds instead
+            (mn, mx) = bounds(&order[begin..end]);
+            axis = axis_of(mn, mx);
+            split = (mn[axis] + mx[axis]) * 0.5;
+            mid = begin + partition(&mut order[begin..end], axis, split);
+        }
+        if mid == begin {
+            mid += 1;
+        } else if mid == end {
+            mid -= 1;
+        }
+        // sub_82173490 / 82173420: the left boxes' largest maximum, the right boxes' smallest minimum
+        let hi = order[begin..mid].iter().map(|&i| bmax_of(i)[axis]).fold(f32::NEG_INFINITY, |a, b| if a < b { b } else { a });
+        let lo = order[mid..end].iter().map(|&i| bmin_of(i)[axis]).fold(f32::INFINITY, |a, b| if b < a { b } else { a });
+        let left = nodes.len();
+        nodes.push(Node::Leaf { start: 0, count: 0 });
+        nodes.push(Node::Leaf { start: 0, count: 0 });
+        nodes[node] = Node::Inner { axis: axis as u8, lo, hi, left: left as u32 };
+        let (mut lmax, mut rmin) = (mx, mn);
+        lmax[axis] = split;
+        rmin[axis] = split;
+        stack.push((left + 1, mid, end, rmin, mx));
+        cur = (left, begin, mid, mn, lmax);
+    }
+    (nodes, order)
 }
 
 impl Occluder {
@@ -332,11 +544,18 @@ impl Occluder {
             }
             edges.push((a, b, f[0], f[1]));
         }
-        Some(Occluder { centre, min, max, inside, verts, faces, edges })
+        Some(Occluder { centre, inside, verts, faces, edges })
     }
 
-    /// The planes behind which nothing can be seen from `eye` (`n . p + d <= 0` behind).
-    fn volume(&self, eye: Vec3) -> Option<Vec<Vec4>> {
+    /// Sphere centre within `range` of the camera in the ground plane (sub_825F32F8 / 825F2E10).
+    fn in_range(&self, eye: Vec3, range: f32) -> bool {
+        let (dx, dz) = (self.centre.x - eye.x, self.centre.z - eye.z);
+        !(dx * dx + dz * dz > range * range)
+    }
+
+    /// The planes behind which nothing can be seen from `eye` (`n . p + d <= 0` behind); the
+    /// facing planes moved `push` metres into the body.
+    fn volume(&self, eye: Vec3, push: f32) -> Option<Vec<Vec4>> {
         let mut facing = [false; 64];
         if self.faces.len() > facing.len() {
             return None;
@@ -345,7 +564,7 @@ impl Occluder {
         for (i, f) in self.faces.iter().enumerate() {
             if f.plane.truncate().dot(eye) + f.plane.w >= FACING_EPS {
                 facing[i] = true;
-                planes.push(f.plane);
+                planes.push(f.plane + Vec4::new(0.0, 0.0, 0.0, push));
             }
         }
         if planes.is_empty() {
@@ -383,7 +602,7 @@ impl Occluder {
 
 impl Selected {
     pub fn none() -> Selected {
-        Selected { volumes: Vec::new() }
+        Selected { volumes: Vec::new(), ids: Vec::new() }
     }
 
     pub fn len(&self) -> usize {
@@ -527,8 +746,9 @@ mod tests {
         let s = wall_view(EYE);
         assert_eq!(s.len(), 1);
         assert!(s.hides_aabb(Vec3::new(20.0, 1.0, -1.0), Vec3::new(22.0, 3.0, 1.0)));
-        // inside the wall and behind it
-        assert!(s.hides_aabb(Vec3::new(11.0, 1.0, -1.0), Vec3::new(20.0, 3.0, 1.0)));
+        // 5 m or more behind the front face (the face plane is moved 5 m in)
+        assert!(s.hides_aabb(Vec3::new(15.1, 1.0, -1.0), Vec3::new(20.0, 3.0, 1.0)));
+        assert!(!s.hides_aabb(Vec3::new(14.9, 1.0, -1.0), Vec3::new(20.0, 3.0, 1.0)));
         // far behind, wide, still inside the shadow
         assert!(s.hides_aabb(Vec3::new(100.0, 0.5, -40.0), Vec3::new(110.0, 30.0, 40.0)));
     }
@@ -556,7 +776,7 @@ mod tests {
         // a sector: hidden only as a whole
         let back = (Vec3::new(20.0, 1.0, -1.0), Vec3::new(22.0, 3.0, 1.0));
         let front = (Vec3::new(9.5, 1.0, -1.0), Vec3::new(9.9, 3.0, 1.0));
-        assert!(s.hides_all([back, (Vec3::new(11.0, 1.0, 1.0), Vec3::new(12.5, 2.0, 2.0))].into_iter()));
+        assert!(s.hides_all([back, (Vec3::new(16.0, 1.0, 1.0), Vec3::new(17.5, 2.0, 2.0))].into_iter()));
         assert!(!s.hides_all([back, front].into_iter()));
         assert!(!s.hides_all(std::iter::empty()));
     }
@@ -566,8 +786,10 @@ mod tests {
         let s = wall_view(Vec3::new(11.0, 2.0, 0.0));
         assert_eq!(s.len(), 0);
         assert!(!s.hides_aabb(Vec3::new(20.0, 1.0, -1.0), Vec3::new(22.0, 3.0, 1.0)));
-        // more than 40 m from the occluder's centre
-        let s = wall_view(Vec3::new(-30.0, 2.0, 0.0));
+        // more than 400 m from the occluder's centre
+        let s = wall_view(Vec3::new(-380.0, 2.0, 0.0));
+        assert_eq!(s.len(), 1);
+        let s = wall_view(Vec3::new(-400.0, 2.0, 0.0));
         assert_eq!(s.len(), 0);
         // looking away: the occluder is outside the frustum
         let o = Occluders::parse(&box_text(&[WALL])).unwrap();
@@ -664,7 +886,105 @@ mod tests {
         assert_eq!(o.in_file, 5614);
         println!("city.occluder: {} of {} usable", o.len(), o.in_file);
         assert!(o.len() > 5000);
-        let most = o.list.iter().map(|a| o.list.iter().filter(|b| (b.centre.x - a.centre.x).hypot(b.centre.z - a.centre.z) <= RANGE).count()).max().unwrap();
-        println!("most occluder centres within {RANGE} m of one: {most}");
+        let range = RANGE * RANGE_SCALE;
+        let most = o.list.iter().map(|a| o.list.iter().filter(|b| (b.centre.x - a.centre.x).hypot(b.centre.z - a.centre.z) <= range).count()).max().unwrap();
+        println!("most occluder centres within {range} m of one: {most}");
+        // the tree holds every occluder once, in leaves of at most 2
+        let mut seen = o.order.clone();
+        seen.sort();
+        assert!(seen.iter().enumerate().all(|(k, &i)| k as u32 == i) && seen.len() == o.in_file);
+        assert!(o.nodes.iter().all(|n| !matches!(n, Node::Leaf { count, .. } if *count > 2)));
+        // the walk finds what overlaps (it may miss a box only in the original's corner case
+        // of a gap between two children), in the walk's order
+        let mut missed = 0;
+        for (k, e) in o.entries.iter().enumerate().step_by(97) {
+            let eye = e.centre + Vec3::new(13.0, 1.5, -7.0);
+            let (qmin, qmax) = (eye - Vec3::new(range, range + QUERY_Y, range), eye + Vec3::new(range, range + QUERY_Y, range));
+            let want: Vec<u32> = (0..o.entries.len() as u32)
+                .filter(|&i| {
+                    let b = &o.entries[i as usize];
+                    !(qmin.cmpgt(b.box_c + b.box_e).any() || (b.box_c - b.box_e).cmpgt(qmax).any())
+                })
+                .collect();
+            let mut got = o.query(eye, range, usize::MAX);
+            assert!(got.iter().all(|i| want.contains(i)), "eye {k}");
+            missed += want.len() - got.len();
+            got.sort();
+            got.dedup();
+            assert_eq!(got.len(), o.query(eye, range, usize::MAX).len());
+        }
+        println!("tree: {} nodes, missed {missed}", o.nodes.len());
+        // the same tree as the running original's (dumped from its memory by
+        // work/occl10/livetree.py: preorder, "N axis lo hi" / "L items")
+        let Ok(live) = std::fs::read_to_string("D:/MCLA/work/occl10/live_tree.txt") else { return };
+        let mut mine = Vec::new();
+        let mut stack = vec![0u32];
+        while let Some(n) = stack.pop() {
+            match o.nodes[n as usize] {
+                Node::Inner { axis, lo, hi, left } => {
+                    mine.push(format!("N {axis} {lo} {hi}"));
+                    stack.push(left + 1);
+                    stack.push(left);
+                }
+                Node::Leaf { start, count } => {
+                    let items: Vec<String> = o.order[start as usize..(start + count) as usize].iter().map(|i| i.to_string()).collect();
+                    mine.push(format!("L {}", items.join(" ")));
+                }
+            }
+        }
+        let live: Vec<&str> = live.lines().collect();
+        assert_eq!(live.len(), mine.len());
+        for (k, (a, b)) in live.iter().zip(&mine).enumerate() {
+            let (pa, pb): (Vec<&str>, Vec<&str>) = (a.split(' ').collect(), b.split(' ').collect());
+            let same = pa.len() == pb.len()
+                && pa.iter().zip(&pb).all(|(x, y)| x == y || matches!((x.parse::<f32>(), y.parse::<f32>()), (Ok(u), Ok(v)) if u == v));
+            assert!(same, "node {k}: original `{a}`, port `{b}`");
+        }
+        println!("tree identical to the original's ({} nodes)", live.len());
+    }
+
+    /// The volumes the running original chose (work/occl10/livecap.py: its main view 0 with the
+    /// eye and frustum planes, and the spawner's view 2), against the port's choice.
+    #[test]
+    fn live_views() {
+        let Ok(text) = std::fs::read_to_string("D:/MCLA/extracted/cache/city/sc/city.occluder") else { return };
+        let Ok(live) = std::fs::read_to_string("D:/MCLA/work/occl10/live_views.txt") else { return };
+        let o = Occluders::parse(&text).unwrap();
+        for line in live.lines() {
+            let parts: Vec<&str> = line.split(" | ").collect();
+            let head: Vec<f32> = parts[0].split(' ').skip(1).map(|x| x.parse().unwrap()).collect();
+            let pl: Vec<f32> = parts[1].split(' ').map(|x| x.parse().unwrap()).collect();
+            let want: Vec<u32> = parts[2].split(' ').filter(|x| !x.is_empty()).map(|x| x.parse().unwrap()).collect();
+            let eye = Vec3::new(head[1], head[2], head[3]);
+            let sel = if head[0] == 0.0 {
+                // planes 0, 1 sides, 2 near, 4, 5 top and bottom, 6 far; the original's are
+                // positive outside (sub_82175238), the port's positive inside
+                let planes = [0, 1, 2, 4, 5, 6].map(|j| -Vec4::new(pl[4 * j], pl[4 * j + 1], pl[4 * j + 2], pl[4 * j + 3]));
+                o.select_at(eye, &Frustum::from_planes(planes))
+            } else {
+                o.select_around(eye, RANGE * RANGE_SCALE)
+            };
+            if head[0] == 0.0 {
+                let t = std::time::Instant::now();
+                let plane = |j: usize| -Vec4::new(pl[4 * j], pl[4 * j + 1], pl[4 * j + 2], pl[4 * j + 3]);
+                let f = Frustum::from_planes([0, 1, 2, 4, 5, 6].map(plane));
+                for _ in 0..200 {
+                    std::hint::black_box(o.select_at(eye, &f));
+                }
+                println!("select_at: {:.1} us", t.elapsed().as_secs_f64() * 1e6 / 200.0);
+            }
+            let dropped: Vec<u32> = want.iter().copied().filter(|&i| o.entries[i as usize].body.is_none()).collect();
+            println!("view {} at {eye}: original {} volumes, port {}; not convex in the port: {dropped:?}", head[0], want.len(), sel.ids.len());
+            println!("  original {want:?}
+  port     {:?}", sel.ids);
+            // the port drops the non-convex ones (they may hide a later candidate's sphere in the
+            // original; not in these views), and fills the slots they took with later candidates
+            let kept: Vec<u32> = want.iter().copied().filter(|i| !dropped.contains(i)).collect();
+            if want.len() < MAX_VOLUMES {
+                assert_eq!(sel.ids, kept);
+            } else {
+                assert_eq!(sel.ids[..kept.len()], kept[..]);
+            }
+        }
     }
 }
