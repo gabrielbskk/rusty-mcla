@@ -1,5 +1,10 @@
 # Rusty MCLA
 
+![Lines of code](https://tokei.rs/b1/github/holdmysocks/rusty-mcla?category=code)
+![License](https://img.shields.io/github/license/holdmysocks/rusty-mcla)
+![Status](https://img.shields.io/badge/status-early%20development-orange)
+![Platform](https://img.shields.io/badge/platform-Windows-blue)
+
 An unofficial PC port of *Midnight Club: Los Angeles* (Complete Edition), written in Rust.
 
 ![The Rusty MCLA launcher, ready to play](assets/launcher-home.png)
