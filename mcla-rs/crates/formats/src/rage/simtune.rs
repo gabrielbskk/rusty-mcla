@@ -253,6 +253,10 @@ pub struct SimTunes {
     /// mcCarModelTune's FenderEdgeFront / FenderEdgeRear (+88, +96): where the outer face of
     /// the tyres comes to, front and rear, each for the stock body and the wide one
     pub fender_edge: [[f32; 2]; 2],
+    /// mcCarModelTune's cFrontBumperMovement, cRearBumperMovement (+184, +188: 0 NoMovement,
+    /// 1 AllowLoose, 2 AllowBroken), cHoodMovement, cTrunkMovement (+192, +196: 0 NoMovement,
+    /// 1 NormalMovement, 2 ReverseMovement) - sub_823404E0 @82340DB8; None without a vehModel
+    pub part_movement: Option<[u32; 4]>,
 }
 
 /// What a car's set-up makes of its wheels (`SimTunes::fit`), front and rear.
@@ -326,6 +330,7 @@ impl SimTunes {
             let (nm, ty) = (rd.cstr(np), rd.cstr(tp));
             if ty == "vehModel" {
                 out.fender_edge = [[rd.f32(c + 88), rd.f32(c + 92)], [rd.f32(c + 96), rd.f32(c + 100)]];
+                out.part_movement = Some([rd.u32(c + 184), rd.u32(c + 188), rd.u32(c + 192), rd.u32(c + 196)]);
                 continue;
             }
             let set = if nm.ends_with("_mods") { &mut out.mods } else { &mut out.base };
@@ -441,3 +446,38 @@ mod fit_tests {
     }
 }
 
+
+#[cfg(test)]
+mod movement_tests {
+    /// (diagnostic: MCLA_MOVEMENT_DIR=<extracted vehicle dir> lists every car's part movement
+    /// settings, mcCarModelTune +184..+196)
+    #[test]
+    fn part_movement_settings_are_enums() {
+        let Ok(dir) = std::env::var("MCLA_MOVEMENT_DIR") else { return };
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            for f in std::fs::read_dir(e.path()).into_iter().flatten().flatten() {
+                if f.path().extension().map_or(true, |x| x != "r50") {
+                    continue;
+                }
+                let Ok(d) = std::fs::read(f.path()) else { continue };
+                // (the cache's own wrapping, as the game's load_resource_file reads it)
+                let res = if d.len() > 16 && &d[0..4] == b"MCLR" {
+                    let w = |k: usize| u32::from_le_bytes(d[k..k + 4].try_into().unwrap());
+                    let data = d[16..].to_vec();
+                    let vs = (w(12) as usize).min(data.len());
+                    crate::rsc::Resource { rtype: w(4), flags: w(8), virtual_size: vs, physical_size: data.len() - vs, data }
+                } else {
+                    let Ok(r) = crate::rsc::Resource::parse(&d) else { continue };
+                    r
+                };
+                if let Some(t) = super::SimTunes::parse(&res) {
+                    let m = t.part_movement;
+                    println!("{} {:?} damage max {} med {} (base) {} (mods)", e.file_name().to_string_lossy(), m, t.base.damage.max_damage, t.base.damage.med_damage, t.mods.damage.max_damage);
+                    if let Some(m) = m {
+                        assert!(m.iter().all(|v| *v <= 2), "{m:?}");
+                    }
+                }
+            }
+        }
+    }
+}
