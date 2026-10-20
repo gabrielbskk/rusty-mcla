@@ -38,11 +38,14 @@ pub struct Req {
     pub doppler: f32,
     /// one of the player vehicle's sounds (the mixer's time-slow applies)
     pub player: bool,
+    /// start offset (P+36): milliseconds, or percent of each wave's duration when `start_pct` (P+70 bit 0x40)
+    pub start_ms: f32,
+    pub start_pct: f32,
 }
 
 impl Default for Req {
     fn default() -> Self {
-        Req { pos: None, volume: 0.0, pitch: 0, pan: -1, doppler: 1.0, player: false }
+        Req { pos: None, volume: 0.0, pitch: 0, pan: -1, doppler: 1.0, player: false, start_ms: 0.0, start_pct: 0.0 }
     }
 }
 
@@ -102,6 +105,8 @@ struct Ctx {
     mask: u8,
     /// tristate 1 (positional) as inherited: 0 off, 1 on, 2 unset
     positional: u8,
+    /// the request's start offset in percent of the wave
+    start_pct: f32,
 }
 
 #[derive(PartialEq, Clone, Copy, Debug)]
@@ -169,11 +174,51 @@ pub struct SoundLib {
     next: u64,
     next_voice: u64,
     pub listener: (Vec3, Vec3, Vec3),
-    /// the port's output reference: the original's MUSIC category level is the port's music at its default
-    /// slider (0.35), so the balance between music and the sound objects is the original's (approximate:
-    /// the original's absolute output level and its volume sliders are not decoded)
-    pub out_gain: f32,
+    /// categories.dat, and the run-time controllers on its categories (dB by category hash): the five volume
+    /// sliders and the camera table (docs/reference/audio/VOLUME_RULE.md). A voice at 0 dB in all reaches full scale.
+    cat_dat: Dat,
+    sliders: std::collections::HashMap<u32, f32>,
+    camera: std::collections::HashMap<u32, f32>,
+    /// ramped category controllers (category hash -> current dB, target dB, dB per second): the weather mix
+    ramps: std::collections::HashMap<u32, (f32, f32, f32)>,
+    /// (mode, bike) the camera table was last applied for
+    cam_mode: Option<(i32, bool)>,
+    /// dynamic mixer scenes (game.dat type 23): name hash -> state
+    scenes: HashMap<u32, Scene>,
+    /// MANAGER_OPPONENT_GAINS: the racers' presence, dB on its categories (applied at once, every frame)
+    presence: (Vec<u32>, f32),
+    presence_db: f32,
+    /// the scenes on at the end of the last update (the blocking test)
+    scenes_on_hint: std::collections::HashSet<u32>,
 }
+
+/// A dynamic mixer scene (game.dat `DYNAMIC_MIXER_*`, type 23: +14 enter, +18 exit, +22 loop, +26 stream sound, +30
+/// fade in s, +34 fade out s, +38 flags, +39 time, +43 blocking scene, +47 count, 14-byte records {category, s16 mB,
+/// f32 x, u16 LPF, u16 HPF}; `reference/audio/MIXER_SCENES_RULE.md`). A record's gain moves linearly from 1 to
+/// `1 + (dB2lin - 1) x strength` over the fade.
+struct Scene {
+    enter: u32,
+    exit: u32,
+    looped: u32,
+    stream: u32,
+    fade_in: f32,
+    fade_out: f32,
+    /// 0x1 continuous (no fade, the strength re-applied every frame), 0x2 auto-stop after `time`, 0x8 exclusive
+    flags: u8,
+    time: f32,
+    block: u32,
+    recs: Vec<(u32, f32)>,
+    on: bool,
+    strength: f32,
+    elapsed: f32,
+    /// 0..1: the fade
+    level: f32,
+    /// the enter, loop and stream sounds' slots
+    playing: [Option<Handle>; 3],
+}
+
+/// The volume sliders' categories (sub_821E7770 0x821E7A4C): effects, music, voice, player vehicle, cutscene.
+pub const SLIDER_CATEGORIES: [&str; 5] = ["SFX", "MUSIC", "SPEECH", "PLAYER_VEHICLES", "CUTSCENES"];
 
 /// Voice id bit for the player vehicle's sounds: the mixer's time-slow (Zone, race end) applies to them.
 pub const SLOWED: u64 = 1 << 40;
@@ -190,7 +235,6 @@ impl SoundLib {
         let game = Dat::load(&cfg.join("game.dat"))?;
         let curves = crv.objects.iter().filter_map(|(n, _, _)| crv.get_name(n).map(|o| (joaat(n), Curve::parse(o)))).collect();
         let cats: HashMap<u32, Category> = audcfg::resolve_categories(&cat).into_iter().collect();
-        let out_gain = 0.35 / db2lin(cats.get(&joaat("MUSIC")).map_or(0.0, |c| c.volume));
         // bank folders: each part of the bank's path by name, or by its hash where the archive lost the name
         let mut bank_dir = HashMap::new();
         for b in &snd.banks {
@@ -222,7 +266,15 @@ impl SoundLib {
             next: 1,
             next_voice: 0,
             listener: (Vec3::ZERO, Vec3::X, Vec3::NEG_Z),
-            out_gain,
+            cat_dat: cat,
+            sliders: Default::default(),
+            camera: Default::default(),
+            ramps: Default::default(),
+            cam_mode: None,
+            scenes: HashMap::new(),
+            presence: (Vec::new(), 0.0),
+            presence_db: 0.0,
+            scenes_on_hint: Default::default(),
         })
     }
 
@@ -242,6 +294,271 @@ impl SoundLib {
     pub fn category(&self, name: &str) -> Option<Category> {
         self.cats.get(&joaat(name)).copied()
     }
+    /// The five AUDIO OPTIONS sliders, 0..10 each (effects, music, voice, player vehicle, cutscene): gain = value x 0.1
+    /// on the slider's category (sub_8264C2E0, sub_8238C090), as dB (-100 at 0).
+    pub fn set_sliders(&mut self, values: [u8; 5]) {
+        let mut changed = false;
+        for (name, v) in SLIDER_CATEGORIES.iter().zip(values) {
+            let db = lin2db((v.min(10) as f32 * 0.1).clamp(0.0, 1.0));
+            if self.sliders.insert(joaat(name), db) != Some(db) {
+                changed = true;
+            }
+        }
+        if changed {
+            self.resolve();
+        }
+    }
+
+    /// The audio camera mode (sub_821ED418 with game.dat MANAGER_CAMERA): 0 bumper, 1 driver, 2 near, 3 medium, 4 far,
+    /// 5 cinematic, 6 other cameras, -1 / 7 none; `bike` picks the bike groups of modes 0 / 1. Volumes only (the
+    /// table's LPF / HPF are not applied by the port's mixer).
+    pub fn set_camera_mode(&mut self, mode: i32, bike: bool) {
+        if self.cam_mode == Some((mode, bike)) {
+            return;
+        }
+        self.cam_mode = Some((mode, bike));
+        self.camera.clear();
+        let group = match (mode, bike) {
+            (0, false) => Some(0),
+            (0, true) => Some(1),
+            (1, false) => Some(2),
+            (1, true) => Some(3),
+            (2..=6, _) => Some(mode as usize + 2),
+            _ => None,
+        };
+        if let (Some(g), Some(o)) = (group, self.game.get_name("MANAGER_CAMERA")) {
+            let mut at = 19;
+            while at + 58 <= o.len() {
+                let h = u32::from_be_bytes(o[at..at + 4].try_into().unwrap());
+                let mb = i16::from_be_bytes(o[at + 4 + 6 * g..at + 6 + 6 * g].try_into().unwrap());
+                self.camera.insert(h, mb as f32 * 0.01);
+                at += 58;
+            }
+        }
+        self.resolve();
+    }
+
+    /// Turn a dynamic mixer scene on (strength 1) or off (with its exit sound) by name, as a fixed slot: starting a
+    /// running scene does nothing.
+    pub fn scene(&mut self, name: &str, on: bool) {
+        self.scene_at(name, on, 1.0);
+    }
+
+    /// The same with a strength (0..1); a continuous scene (flag 0x1) takes a new strength while it runs.
+    pub fn scene_at(&mut self, name: &str, on: bool, strength: f32) {
+        let h = joaat(name);
+        if !self.scenes.contains_key(&h) {
+            if !on {
+                return;
+            }
+            let Some(o) = self.game.get(h).filter(|o| o.first() == Some(&23)).map(|o| o.to_vec()) else { return };
+            let u32at = |at: usize| o.get(at..at + 4).map(|b| u32::from_be_bytes(b.try_into().unwrap())).unwrap_or(0);
+            let n = o.get(47).copied().unwrap_or(0) as usize;
+            let recs = (0..n).map(|i| (u32at(48 + 14 * i), i16::from_be_bytes([o[52 + 14 * i], o[53 + 14 * i]]) as f32 * 0.01)).collect();
+            let null = joaat("NULL_SOUND");
+            let snd = |at: usize| Some(u32at(at)).filter(|h| *h != 0 && *h != null).unwrap_or(NONE);
+            self.scenes.insert(
+                h,
+                Scene {
+                    enter: snd(14),
+                    exit: snd(18),
+                    looped: snd(22),
+                    stream: snd(26),
+                    fade_in: f32::from_bits(u32at(30)),
+                    fade_out: f32::from_bits(u32at(34)),
+                    flags: o.get(38).copied().unwrap_or(0),
+                    time: f32::from_bits(u32at(39)),
+                    block: u32at(43),
+                    recs,
+                    on: false,
+                    strength: 1.0,
+                    elapsed: 0.0,
+                    level: 0.0,
+                    playing: [None; 3],
+                },
+            );
+        }
+        if on {
+            self.scene_start(h, strength);
+        } else {
+            self.scene_stop(h, true);
+        }
+    }
+
+    pub fn scene_on(&self, name: &str) -> bool {
+        self.scenes.get(&joaat(name)).is_some_and(|s| s.on)
+    }
+
+    /// sub_821EC620: refused while its blocking scene runs or another exclusive scene runs; the enter, loop and stream
+    /// sounds on the start; an exclusive scene stops the others.
+    fn scene_start(&mut self, h: u32, strength: f32) {
+        let sc = &self.scenes[&h];
+        if sc.on {
+            if sc.flags & 1 != 0 {
+                self.scenes.get_mut(&h).unwrap().strength = strength.clamp(0.0, 1.0);
+            }
+            return;
+        }
+        let excl = sc.flags & 8 != 0;
+        let (block, snds) = (sc.block, [sc.enter, sc.looped, sc.stream]);
+        if self.scenes.get(&block).is_some_and(|b| b.on) || (!excl && self.scenes.values().any(|s| s.on && s.flags & 8 != 0)) {
+            return;
+        }
+        let mut hs = [None; 3];
+        for (k, s) in snds.into_iter().enumerate() {
+            if s != NONE {
+                hs[k] = self.play_hash(s, Req::default());
+            }
+        }
+        let sc = self.scenes.get_mut(&h).unwrap();
+        sc.on = true;
+        sc.strength = strength.clamp(0.0, 1.0);
+        sc.elapsed = 0.0;
+        sc.playing = hs;
+        if sc.flags & 1 != 0 {
+            sc.level = 1.0;
+        }
+        if excl {
+            let others: Vec<u32> = self.scenes.iter().filter(|(k, s)| **k != h && s.on && s.flags & 8 == 0).map(|x| *x.0).collect();
+            for o in others {
+                self.scene_stop(o, true);
+            }
+        }
+    }
+
+    /// sub_821EC060: the enter, loop and stream sounds stop, the exit sound plays (`exit`), the records fade back.
+    fn scene_stop(&mut self, h: u32, exit: bool) {
+        let Some(sc) = self.scenes.get_mut(&h).filter(|s| s.on) else { return };
+        sc.on = false;
+        let ps = std::mem::take(&mut sc.playing);
+        let x = sc.exit;
+        if sc.flags & 1 != 0 {
+            sc.level = 0.0;
+        }
+        for p in ps.into_iter().flatten() {
+            self.stop(p);
+        }
+        if exit && x != NONE {
+            self.play_hash(x, Req::default());
+        }
+    }
+
+    /// MANAGER_OPPONENT_GAINS (sub_821EE868 @821EE8F8): `w` = the racers' presence weight; above 1 its categories get
+    /// -3 dB x log2(w) (the object's s16 mB per doubling), at once.
+    pub fn set_presence(&mut self, w: f32) {
+        if self.presence.0.is_empty() {
+            let Some(o) = self.game.get_name("MANAGER_OPPONENT_GAINS").map(|o| o.to_vec()) else { return };
+            let n = o.get(18).copied().unwrap_or(0) as usize;
+            let mut cats = Vec::new();
+            let mut mb = 0.0;
+            for i in 0..n {
+                let at = 19 + 6 * i;
+                let Some(b) = o.get(at..at + 6) else { break };
+                cats.push(u32::from_be_bytes(b[0..4].try_into().unwrap()));
+                mb = i16::from_be_bytes([b[4], b[5]]) as f32;
+            }
+            self.presence = (cats, mb * 0.01);
+            self.presence_db = mb * 0.01;
+        }
+        let db = if w > 1.0 { self.presence_db * w.log2() } else { 0.0 };
+        if db != self.presence.1 {
+            self.presence.1 = db;
+            self.resolve();
+        }
+    }
+
+    /// A category's runtime volume moved to `db` over `secs` (sub_82547F00: linear in dB, I).
+    pub fn ramp_category(&mut self, name: &str, db: f32, secs: f32) {
+        let e = self.ramps.entry(joaat(name)).or_insert((0.0, 0.0, 0.0));
+        if e.1 != db {
+            e.1 = db;
+            e.2 = if secs > 0.0 { (db - e.0).abs() / secs } else { f32::INFINITY };
+        }
+    }
+
+    fn step_scenes(&mut self, dt: f32) {
+        let mut changed = false;
+        for e in self.ramps.values_mut() {
+            if e.0 != e.1 {
+                let step = e.2 * dt;
+                e.0 = if e.1 > e.0 { (e.0 + step).min(e.1) } else { (e.0 - step).max(e.1) };
+                changed = true;
+            }
+        }
+        // the per-frame scene update (sub_821ECA10): auto-stop, blocking scene, the exclusive scene, loops kept alive
+        let mut stops: Vec<(u32, bool)> = Vec::new();
+        let excl = self.scenes.iter().find(|(_, s)| s.on && s.flags & 8 != 0).map(|x| *x.0);
+        let mut alive: Vec<(u32, usize, u32)> = Vec::new();
+        for (h, sc) in &mut self.scenes {
+            if !sc.on {
+                continue;
+            }
+            sc.elapsed += dt;
+            if sc.flags & 2 != 0 && sc.elapsed >= sc.time {
+                stops.push((*h, true));
+            } else if self.scenes_on_hint.contains(&sc.block) {
+                stops.push((*h, false));
+            } else if excl.is_some_and(|e| e != *h) && sc.flags & 8 == 0 {
+                stops.push((*h, true));
+            }
+            for (k, s) in [(1, sc.looped), (2, sc.stream)] {
+                if s != NONE {
+                    alive.push((*h, k, s));
+                }
+            }
+            if sc.flags & 1 != 0 {
+                changed = true;
+            }
+        }
+        for (h, k, s) in alive {
+            let cur = self.scenes[&h].playing[k];
+            if cur.map_or(true, |p| !self.playing(p)) {
+                let n = self.play_hash(s, Req::default());
+                self.scenes.get_mut(&h).unwrap().playing[k] = n;
+            }
+        }
+        for (h, exit) in stops {
+            self.scene_stop(h, exit);
+        }
+        for sc in self.scenes.values_mut() {
+            if sc.flags & 1 != 0 {
+                continue;
+            }
+            let (target, time) = if sc.on { (1.0, sc.fade_in) } else { (0.0, sc.fade_out) };
+            if sc.level != target {
+                let step = if time > 0.0 { dt / time } else { 1.0 };
+                sc.level = if target > sc.level { (sc.level + step).min(1.0) } else { (sc.level - step).max(0.0) };
+                changed = true;
+            }
+        }
+        self.scenes_on_hint = self.scenes.iter().filter(|(_, s)| s.on).map(|x| *x.0).collect();
+        if changed {
+            self.resolve();
+        }
+    }
+
+    fn resolve(&mut self) {
+        let mut rt = self.sliders.clone();
+        for (h, db) in &self.camera {
+            *rt.entry(*h).or_insert(0.0) += db;
+        }
+        for (h, e) in &self.ramps {
+            *rt.entry(*h).or_insert(0.0) += e.0;
+        }
+        for sc in self.scenes.values().filter(|s| s.level > 0.0) {
+            for (h, db) in &sc.recs {
+                // the controller's gain moves linearly from 1 to the scene's at its strength
+                *rt.entry(*h).or_insert(0.0) += lin2db(1.0 + (db2lin(*db) - 1.0) * sc.strength * sc.level);
+            }
+        }
+        if self.presence.1 != 0.0 {
+            for h in &self.presence.0 {
+                *rt.entry(*h).or_insert(0.0) += self.presence.1;
+            }
+        }
+        self.cats = audcfg::resolve_categories_with(&self.cat_dat, &rt).into_iter().collect();
+    }
+
     pub fn rand_float(&mut self, a: f32, b: f32) -> f32 {
         self.rng.float(a, b)
     }
@@ -443,6 +760,25 @@ impl SoundLib {
         Some(Handle(id))
     }
 
+    /// A converted wave file played as a one-shot voice of `category` (a speech take chosen by the speech system: the
+    /// original plays it through its Speech sound, whose category sets the level). `key` = `<bank>/<wave>` below the root.
+    pub fn play_clip(&mut self, key: &str, category: &str, req: Req) -> Option<Handle> {
+        let file = self.root.join(format!("{key}.wav"));
+        let clip = self.clip_of(&file, -1)?;
+        // a header with every tristate inherited and only the category field (mask bit 13)
+        let mut o = vec![12u8, 0, 0, 0, 0, 0xAA, 0xAA, 0xAA, 0xAA, 0, 0];
+        o.extend_from_slice(&(1u32 << 13).to_be_bytes());
+        o.extend_from_slice(&joaat(category).to_be_bytes());
+        let (h, _) = audcfg::parse_header(&o);
+        let dur_ms = clip.frames() as f32 * 1000.0 / clip.rate as f32;
+        let voice = self.voice_id();
+        let root = Node { h, vol: 0.0, pitch: 0, pan: -1, predelay_ms: 0.0, start_ms: 0.0, st: St::Waiting, t: 0.0, play_t: 0.0, release: None, kind: Kind::Wave { wave: None, clip: Some(clip), voice, pos_ms: 0.0, dur_ms, looping: false } };
+        let id = self.next;
+        self.next += 1;
+        self.insts.push(Instance { id, root, req, prev_dist: None, doppler: 1.0, stop: false });
+        Some(Handle(id))
+    }
+
     /// Change what the game asks of a playing sound (position, volume, pitch).
     pub fn set(&mut self, h: Handle, req: Req) {
         if let Some(i) = self.insts.iter_mut().find(|i| i.id == h.0) {
@@ -467,6 +803,7 @@ impl SoundLib {
 
     /// Advance every sound by `dt` and drive the mixer's voices.
     pub fn update(&mut self, dt: f32, audio: &mut Audio) {
+        self.step_scenes(dt);
         let ms = dt * 1000.0;
         let mut insts = std::mem::take(&mut self.insts);
         let (lp, lr, lf) = self.listener;
@@ -486,9 +823,9 @@ impl SoundLib {
                 inst.stop = false;
                 stop_node(&mut inst.root);
             }
-            let ctx = Ctx { vol: inst.req.volume, pitch: inst.req.pitch, pan: inst.req.pan, category: joaat("BASE"), curve: 0, curve_scale: 1.0, doppler: 1.0, mask: 0, positional: 2 };
+            let ctx = Ctx { vol: inst.req.volume, pitch: inst.req.pitch, pan: inst.req.pan, category: joaat("BASE"), curve: 0, curve_scale: 1.0, doppler: 1.0, mask: 0, positional: 2, start_pct: inst.req.start_pct };
             let mut out = Vec::new();
-            self.step(&mut inst.root, ms, ctx, 0.0, &mut out);
+            self.step(&mut inst.root, ms, ctx, inst.req.start_ms, &mut out);
             for v in out {
                 self.emit(v, inst, (lp, lr, lf), audio);
             }
@@ -552,6 +889,7 @@ impl SoundLib {
                 2 => parent.positional,
                 v => v,
             },
+            start_pct: parent.start_pct,
         };
         let offset = n.play_t;
         let releasing = n.release.is_some();
@@ -559,6 +897,7 @@ impl SoundLib {
             Kind::Wave { clip, wave, voice, pos_ms, dur_ms, looping } => {
                 let Some(c) = clip.clone() else { n.st = St::Done; return };
                 if *pos_ms == 0.0 {
+                    let offset = offset + *dur_ms * ctx.start_pct * 0.01;
                     *pos_ms = if *looping { offset % dur_ms.max(1.0) } else { offset };
                 }
                 if !*looping && *pos_ms >= *dur_ms {
@@ -755,7 +1094,7 @@ impl SoundLib {
         // A = chain - headroom, B = category + rolloff, the request's volume is in the chain's top
         let a = v.ctx.vol - v.headroom;
         let b = cat.volume + rolloff;
-        let amp = db2lin(a) * db2lin(b) * self.out_gain;
+        let amp = db2lin(a) * db2lin(b);
         let ratio = 2f32.powf((v.ctx.pitch + cat.pitch) as f32 / 1200.0) * if positional { inst.doppler } else { 1.0 };
         audio.drive(v.voice | if inst.req.player { SLOWED } else { 0 }, &v.clip, (amp * gl, amp * gr), ratio, v.looping, v.start_frame);
     }
@@ -889,6 +1228,59 @@ mod tests {
         // straight up: h = 0 -> every speaker 0.5
         let (l, r) = pan_gains(Vec3::Y);
         assert!((l - (0.5 + 0.5 * k)).abs() < 1e-6 && (r - l).abs() < 1e-6);
+    }
+
+    /// VOLUME_RULE.md: slider 5 = -6.02 dB on its category and its children; the camera table's engine +3 dB in the
+    /// chase views; PAUSE fades in by its own time.
+    #[test]
+    #[ignore = "requires MCLA_DATA_DIR with the user's extracted disc and the converted audio"]
+    fn sliders_camera_scenes() {
+        let dir = std::env::var("MCLA_DATA_DIR").expect("MCLA_DATA_DIR");
+        let a = crate::audio::Audio::new_offline(&dir).expect("audio");
+        let mut lib = SoundLib::load(a.root(), &a.cfg).expect("sound objects");
+        let v = |lib: &SoundLib, n: &str| lib.category(n).unwrap().volume;
+        let (sfx, amb, eng, music) = (v(&lib, "SFX"), v(&lib, "AMBIENCE"), v(&lib, "PLAYER_VEHICLES_ENGINES"), v(&lib, "MUSIC_USER"));
+        assert!((music + 17.5).abs() < 0.05, "{music}");
+        lib.set_sliders([5, 10, 10, 10, 10]);
+        assert!((v(&lib, "SFX") - sfx + 6.0206).abs() < 0.01);
+        assert!((v(&lib, "AMBIENCE") - amb + 6.0206).abs() < 0.01);
+        assert!((v(&lib, "MUSIC_USER") - music).abs() < 1e-4);
+        lib.set_sliders([10, 0, 10, 10, 10]);
+        assert!(v(&lib, "MUSIC_USER") < -100.0);
+        lib.set_sliders([10; 5]);
+        lib.set_camera_mode(2, false);
+        assert!((v(&lib, "PLAYER_VEHICLES_ENGINES") - eng - 3.0).abs() < 0.01);
+        lib.set_camera_mode(1, false);
+        assert!((v(&lib, "PLAYER_VEHICLES_ENGINES") - eng - 4.0).abs() < 0.01);
+        lib.set_camera_mode(-1, false);
+        assert!((v(&lib, "PLAYER_VEHICLES_ENGINES") - eng).abs() < 1e-4);
+        lib.scene("DYNAMIC_MIXER_COP_FORM", true);
+        lib.step_scenes(10.0);
+        assert!(v(&lib, "MUSIC_USER") < -100.0);
+        lib.scene("DYNAMIC_MIXER_COP_FORM", false);
+        lib.step_scenes(10.0);
+        assert!((v(&lib, "MUSIC_USER") - music).abs() < 1e-4);
+        // (MIXER_SCENES_RULE.md 1.3: ENDRACE is exclusive - it stops PAUSE and refuses it; ROAR stops itself after 1.75 s)
+        lib.scene("DYNAMIC_MIXER_PAUSE", true);
+        assert!(lib.scene_on("DYNAMIC_MIXER_PAUSE"));
+        lib.scene("DYNAMIC_MIXER_ENDRACE", true);
+        lib.step_scenes(0.1);
+        assert!(!lib.scene_on("DYNAMIC_MIXER_PAUSE"));
+        lib.scene("DYNAMIC_MIXER_PAUSE", true);
+        assert!(!lib.scene_on("DYNAMIC_MIXER_PAUSE"));
+        lib.scene("DYNAMIC_MIXER_ENDRACE", false);
+        lib.scene("DYNAMIC_MIXER_ROAR", true);
+        lib.step_scenes(1.0);
+        assert!(lib.scene_on("DYNAMIC_MIXER_ROAR"));
+        lib.step_scenes(1.0);
+        assert!(!lib.scene_on("DYNAMIC_MIXER_ROAR"));
+        // MANAGER_OPPONENT_GAINS: four racers close by -> -6 dB on PLAYER_VEHICLES_ENGINES
+        lib.step_scenes(10.0);
+        let e0 = v(&lib, "PLAYER_VEHICLES_ENGINES");
+        lib.set_presence(4.0);
+        assert!((v(&lib, "PLAYER_VEHICLES_ENGINES") - e0 + 6.0).abs() < 0.01);
+        lib.set_presence(0.5);
+        assert!((v(&lib, "PLAYER_VEHICLES_ENGINES") - e0).abs() < 1e-4);
     }
 
     #[test]

@@ -17,6 +17,8 @@ enum Step {
     /// a clip by its full name (the taunts' special-case assets): from `voice`'s banks, or the player's
     Clip { name: String, player: bool, voice: Option<String> },
     Wait(f32),
+    /// the scenario's dynamic mixer (`DynMixer`, default DYNAMIC_MIXER_SPEECH_DEFAULT; "" = NULL): on while it plays
+    Mixer(String),
 }
 
 /// The bank that holds the player's replies to every hookman's pre-race taunt (`PRERACE_TAUNT_HP_*` /
@@ -41,6 +43,9 @@ pub struct Speech {
     taunt_h: u32,
     taunt_l: u32,
     taunt_ready: Vec<Step>,
+    /// the dynamic mixer of the scenario playing now, and whether it was switched on
+    mixer: String,
+    mixer_on: bool,
 }
 
 fn attr<'a>(s: &'a str, name: &str) -> Option<&'a str> {
@@ -94,15 +99,20 @@ impl Speech {
             let Some(name) = attr(sc, "name") else { continue };
             let body = sc.split("</Scenario>").next().unwrap_or("");
             let mut scripts: Vec<Vec<Step>> = Vec::new();
-            let mut steps = Vec::new();
+            let mixer = match attr(sc.split('>').next().unwrap_or(""), "DynMixer") {
+                Some("NULL") => String::new(),
+                Some(m) => m.to_string(),
+                None => "DYNAMIC_MIXER_SPEECH_DEFAULT".to_string(),
+            };
+            let mut steps = vec![Step::Mixer(mixer.clone())];
             for line in body.lines() {
                 let l = line.trim();
                 if l.starts_with("<!--") {
                     continue;
                 }
                 // (step 19d: a new <Script> is another way of saying it)
-                if l.starts_with("<Script") && !steps.is_empty() {
-                    scripts.push(std::mem::take(&mut steps));
+                if l.starts_with("<Script") && steps.len() > 1 {
+                    scripts.push(std::mem::replace(&mut steps, vec![Step::Mixer(mixer.clone())]));
                 }
                 if l.starts_with("<PlayAsset") {
                     let Some(asset) = attr(l, "name") else { continue };
@@ -121,7 +131,7 @@ impl Speech {
                     steps.push(Step::Wait(attr(l, "value").and_then(|v| v.parse().ok()).unwrap_or(0.4)));
                 }
             }
-            if !steps.is_empty() {
+            if steps.len() > 1 {
                 scripts.push(steps);
             }
             if !scripts.is_empty() {
@@ -252,6 +262,8 @@ impl Speech {
         }
         self.queue.clear();
         self.wait = 0.0;
+        // (the TAUNT_PRERACE_* scenarios' DynMixer)
+        self.queue.push_back(Step::Mixer("DYNAMIC_MIXER_PRERACE_TAUNT".into()));
         self.queue.extend(steps);
         true
     }
@@ -293,6 +305,16 @@ impl Speech {
                 self.line = None;
             }
         }
+        self.step(a);
+        // the scenario's dynamic mixer while it plays (sub_821F1860 / sub_821EC620)
+        let on = self.busy() && !self.mixer.is_empty();
+        if on != self.mixer_on && !self.mixer.is_empty() {
+            a.obj_scene(&self.mixer, on);
+        }
+        self.mixer_on = on;
+    }
+
+    fn step(&mut self, a: &mut Audio) {
         while self.wait <= 0.0 {
             let Some(step) = self.queue.pop_front() else {
                 self.wait = 0.0;
@@ -300,12 +322,24 @@ impl Speech {
             };
             match step {
                 Step::Wait(t) => self.wait = t,
+                Step::Mixer(m) => {
+                    if m != self.mixer {
+                        if self.mixer_on {
+                            a.obj_scene(&self.mixer, false);
+                            self.mixer_on = false;
+                        }
+                        self.mixer = m;
+                    }
+                }
                 Step::Clip { name, player, voice } => {
                     let Some(key) = self.clip_in(&name, player, voice.as_deref()) else { continue };
                     let dur = a.clip(&key).map_or(0.0, |c| c.data.len() as f32 / c.rate.max(1) as f32);
                     if dur > 0.0 {
                         log::info!("speech: taunt line {} ({}) -> {} ({:.1} s)", name, if player { "player" } else { "hookman" }, key, dur);
-                        a.play(&key, 1.0);
+                        // (the career speech plays through its Speech sound: category SPEECH_CAREER)
+                        if !a.obj_clip(&key, "SPEECH_CAREER", None) {
+                            a.play(&key, 1.0);
+                        }
                         self.wait = dur;
                         self.line = Some((player, dur));
                     }
@@ -315,7 +349,9 @@ impl Speech {
                     let dur = a.clip(&key).map_or(0.0, |c| c.data.len() as f32 / c.rate.max(1) as f32);
                     if dur > 0.0 {
                         log::debug!("speech: {} -> {} ({:.1} s)", asset, key, dur);
-                        a.play(&key, 1.0);
+                        if !a.obj_clip(&key, "SPEECH_CAREER", None) {
+                            a.play(&key, 1.0);
+                        }
                         self.wait = dur + 0.15;
                     }
                 }

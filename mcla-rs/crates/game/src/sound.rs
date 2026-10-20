@@ -103,11 +103,52 @@ pub struct Sound {
     coll: Option<crate::collaudio::CollisionAudio>,
     /// the original's district ambience (with `lib`)
     amb: Option<crate::ambaudio::Ambience>,
+    /// the AUDIO OPTIONS sliders (effects, music, voice, player vehicle, cutscene; 0..10) and the audio camera
+    /// mode, set by the game each frame
+    pub sliders: [u8; 5],
+    pub cam_audio: i32,
+    /// every car's sounds beside the engine and collisions (caraudio.rs, with `lib`)
+    fleet: Option<crate::caraudio::Fleet>,
+    /// the player car's performance stages the sounds read: intake, turbo, nitrous
+    pub parts: [u8; 3],
+    /// the countdown's last sounded step (3, 2, 1, 0 = GO; 4 = before it; -1 = no race)
+    count_stage: i32,
+    end_race: bool,
+    /// the reward screen's rep bar sound waits 20 movie frames
+    rep_fill: Option<f32>,
+    ability_snd: Option<crate::sndobj::Handle>,
+    nitro_btn: bool,
+    /// a speech or police radio line is playing (set by the game each frame)
+    pub speech_busy: bool,
+    /// cruisers already reported disabled on the radio
+    pub cop_disabled: std::collections::HashSet<usize>,
+    /// set by the game each frame: the HUD movie's `damage_alpha`, a splash posted to the HUD's queue 1, the pause
+    /// movie's `cur_camera`
+    pub damage_alpha: f32,
+    pub racer_found: bool,
+    pub menu_cam: Option<i32>,
+    /// a speech line the sounds ask for (PLAYER_IN_AIR); the game says it if no speech plays
+    pub want_speech: Option<&'static str>,
+    navmap: bool,
+    phone: bool,
+    tutorial: bool,
+    dmg_prev: f32,
+    dmg_armed: bool,
+    pan_cam: Option<i32>,
+    /// AIRTIME (sub_823267E8): the wheel probed this frame, misses so far, on, time in the air
+    air_i: usize,
+    air_miss: usize,
+    air_on: bool,
+    air_t: f32,
+    /// persistent sounds asked for by name (Audio::obj_loop)
+    obj_loops: std::collections::HashMap<String, crate::sndobj::Handle>,
 }
 
 impl Sound {
     #[allow(clippy::too_many_arguments)]
-    pub fn update(&mut self, a: &mut Audio, vehicles: &Vehicles, game: &Game, police: &Police, ability: &Abilities, prop_hits: &[PropHit], cam_pos: Vec3, cam_right: Vec3, rain: f32, horn: bool, night: bool, dt: f32) {
+    /// `rain`: the weather's rain share (wet = not 0); `probe(from, to)`: the city's collision has something on that line.
+    pub fn update(&mut self, a: &mut Audio, vehicles: &Vehicles, game: &Game, police: &Police, ability: &Abilities, prop_hits: &[PropHit], cam_pos: Vec3, cam_right: Vec3, rain: f32, horn: bool, night: bool, probe: &dyn Fn(Vec3, Vec3) -> bool, dt: f32) {
+        let wet = rain > 0.0;
         a.set_listener(cam_pos, cam_right);
         if !self.lib_tried {
             self.lib_tried = true;
@@ -117,13 +158,133 @@ impl Sound {
                 let data = a.cfg.ancestors().nth(3).map(|p| p.to_path_buf()).unwrap_or_default();
                 self.coll = Some(crate::collaudio::CollisionAudio::new(&data));
                 self.amb = self.lib.as_ref().and_then(crate::ambaudio::Ambience::new);
+                self.fleet = Some(crate::caraudio::Fleet::new(&data));
             }
             if self.lib.is_none() {
                 log::warn!("audio: {} not loaded - the original's sound objects are not played", a.cfg.display());
             }
         }
+        a.objects = self.lib.is_some();
         if let Some(lib) = &mut self.lib {
+            // what the rest of the game asked for this frame (Audio::obj ...)
+            let mut loops_now: Vec<String> = Vec::new();
+            for c in std::mem::take(&mut a.obj_cmds) {
+                match c {
+                    crate::audio::ObjCmd::Loop { name } => {
+                        let alive = self.obj_loops.get(&name).is_some_and(|h| lib.playing(*h));
+                        if !alive {
+                            if let Some(h) = lib.play(&name, crate::sndobj::Req::default()) {
+                                self.obj_loops.insert(name.clone(), h);
+                            }
+                        }
+                        loops_now.push(name);
+                    }
+                    crate::audio::ObjCmd::Play { name, pos, volume } => {
+                        if lib.play(&name, crate::sndobj::Req { pos, volume, ..Default::default() }).is_none() {
+                            log::warn!("audio: no sound object {name}");
+                        }
+                    }
+                    crate::audio::ObjCmd::Clip { key, category, pos } => {
+                        lib.play_clip(&key, category, crate::sndobj::Req { pos, ..Default::default() });
+                    }
+                    crate::audio::ObjCmd::Scene { name, on } => {
+                        // (a speech line's scene, sub_821F1038: strength = dB2lin(the SPEECH category's runtime volume))
+                        let s = if name.starts_with("DYNAMIC_MIXER_SPEECH") || name == "DYNAMIC_MIXER_PRERACE_TAUNT" { lib.category("SPEECH").map_or(1.0, |c| mcla_formats::audcfg::db2lin(c.volume)) } else { 1.0 };
+                        lib.scene_at(&name, on, s)
+                    }
+                    crate::audio::ObjCmd::Field { object, offset, pos, on } => {
+                        let h = lib.game.get_name(&object).and_then(|o| o.get(offset..offset + 4)).map(|b| u32::from_be_bytes(b.try_into().unwrap()));
+                        if let Some(h) = h {
+                            match lib.game.name_of(h).map(|n| n.to_string()) {
+                                Some(scene) if lib.game.get(h).and_then(|o| o.first()) == Some(&23) => lib.scene(&scene, on),
+                                _ if on => {
+                                    lib.play_hash(h, crate::sndobj::Req { pos, ..Default::default() });
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            self.obj_loops.retain(|n, h| {
+                let keep = loops_now.contains(n);
+                if !keep {
+                    lib.stop(*h);
+                }
+                keep
+            });
             lib.listener = (cam_pos, cam_right, Vec3::Y.cross(cam_right));
+            lib.set_sliders(self.sliders);
+            let bike = vehicles.player().is_some_and(|p| p.model.bike);
+            lib.set_camera_mode(self.cam_audio, bike);
+            // the dynamic mixer scenes (MIXER_SCENES_RULE.md 2)
+            // NAVMAP: the GPS camera rises into the map (GPS_UP_HIGH, GLOBAL_UI_NAVMAP +66) / comes down (+70)
+            if game.show_map != self.navmap {
+                let f = lib.game.get_name("GLOBAL_UI_NAVMAP").and_then(|o| o.get(if game.show_map { 66..70 } else { 70..74 })).map(|b| u32::from_be_bytes(b.try_into().unwrap()));
+                if let Some(h) = f {
+                    lib.play_hash(h, crate::sndobj::Req::default());
+                }
+                lib.scene("DYNAMIC_MIXER_NAVMAP", game.show_map);
+                self.navmap = game.show_map;
+            }
+            // PAUSE (sub_821E63F0): paused, not the map, not the replay viewer playing outside the race end
+            let endrace = lib.scene_on("DYNAMIC_MIXER_ENDRACE") || lib.scene_on("DYNAMIC_MIXER_ENDRACE_BEATMETHERE");
+            let viewer = game.replay.as_ref().is_some_and(|r| !r.paused);
+            lib.scene("DYNAMIC_MIXER_PAUSE", game.mode == Mode::Paused && !lib.scene_on("DYNAMIC_MIXER_NAVMAP") && !(viewer && !endrace));
+            lib.scene("DYNAMIC_MIXER_GARAGE", game.mode == Mode::Garage);
+            // REPLAY_*: the replay viewer's speed (sub_82640958; the port's viewer plays at 1 or is paused)
+            match &game.replay {
+                Some(r) if r.paused => {
+                    lib.scene("DYNAMIC_MIXER_REPLAY_FRAME_ADVANCE", false);
+                    lib.scene("DYNAMIC_MIXER_REPLAY_PAUSED", true);
+                    lib.scene_at("DYNAMIC_MIXER_REPLAY_SCALED", true, 1.0);
+                }
+                _ => {
+                    for n in ["DYNAMIC_MIXER_REPLAY_PAUSED", "DYNAMIC_MIXER_REPLAY_FRAME_ADVANCE", "DYNAMIC_MIXER_REPLAY_SCALED"] {
+                        lib.scene(n, false);
+                    }
+                }
+            }
+            // MUSIC (sub_821EED90): while a song plays, strength = dB2lin(MUSIC + MUSIC_USER), continuous; off when the
+            // song stops or MUSIC_USER is at -95 dB or below
+            let vol = |n: &str| lib.category(n).map_or(0.0, |c| c.volume);
+            let (mv, mu) = (vol("MUSIC"), vol("MUSIC_USER"));
+            let song = a.music_on && !a.now_playing.is_empty() && mu > -95.0;
+            lib.scene_at("DYNAMIC_MIXER_MUSIC", song, mcla_formats::audcfg::db2lin(mv + mu));
+            // event sounds (MIXER_SCENES_RULE.md 3): the phone rings when it comes up and closes when it goes
+            let phone = game.flash_phone.as_ref().is_some_and(|p| p.visible());
+            if phone != self.phone {
+                lib.play(if phone { "UI_CELLPHONE_RING" } else { "UI_CELLPHONE_CLOSE" }, crate::sndobj::Req::default());
+                self.phone = phone;
+            }
+            // a tutorial box opens / closes
+            let tut = game.tutorial_box.as_ref().is_some_and(|t| t.2 <= 0.0);
+            if tut != self.tutorial {
+                lib.play(if tut { "UI_MENU_TUTORIAL_OPEN_MASTER" } else { "UI_MENU_TUTORIAL_CLOSE_MASTER" }, crate::sndobj::Req::default());
+                self.tutorial = tut;
+            }
+            // DAMAGE_METER_BEEP (sub_82328078): one beep per rise of the HUD's damage_alpha, re-armed when it falls
+            let v = if matches!(game.mode, Mode::FreeRoam | Mode::Race) && game.flash_hud.is_some() { self.damage_alpha } else { 0.0 };
+            if v < self.dmg_prev {
+                self.dmg_armed = true;
+            } else if self.dmg_armed && v != 0.0 {
+                lib.play("DAMAGE_METER_BEEP", crate::sndobj::Req::default());
+                self.dmg_armed = false;
+            }
+            self.dmg_prev = v;
+            // RACER_FOUND_MASTER: the HUD movie's splash queue 1 begins
+            if std::mem::take(&mut self.racer_found) {
+                lib.play("RACER_FOUND_MASTER", crate::sndobj::Req::default());
+            }
+            // END_OF_RACE_CAMERA_PAN (sub_82653450): the menu camera changes while the end-race scene is on
+            if self.menu_cam != self.pan_cam {
+                if self.pan_cam.is_some() && self.menu_cam.is_some() && endrace {
+                    lib.play("END_OF_RACE_CAMERA_PAN", crate::sndobj::Req::default());
+                }
+                self.pan_cam = self.menu_cam;
+            }
+            // the songs: a MUSIC_USER stream at 0 dB (3.1), less their headroom (Audio::stream_gain)
+            a.music_volume = lib.category("MUSIC_USER").map_or(0.0, |c| mcla_formats::audcfg::db2lin(c.volume));
         }
         // ---- collisions (collaudio.rs): every car's contacts of the frame, the props' hits
         if let (Some(lib), Some(coll)) = (&mut self.lib, &mut self.coll) {
@@ -155,24 +316,42 @@ impl Sound {
         if self.started {
             if self.mode != Some(game.mode) {
                 let back = matches!((self.mode, game.mode), (Some(Mode::Garage), Mode::MainMenu) | (Some(Mode::RaceSelect), Mode::MainMenu) | (Some(Mode::Paused), Mode::FreeRoam) | (Some(Mode::Paused), Mode::Race) | (Some(Mode::Garage), Mode::Paused));
-                a.play(&format!("{MENUS}/{}", if back { "ui_menu_back_l" } else { "ui_menu_select_l" }), 0.6);
-                if game.mode == Mode::Results {
+                self.ui(a, if back { "UI_MENU_BACK" } else { "UI_MENU_SELECT" }, &format!("{MENUS}/{}", if back { "ui_menu_back_l" } else { "ui_menu_select_l" }), 0.6);
+                // (with the sound objects the sting is the ENDRACE mixer's own sound, below)
+                if game.mode == Mode::Results && self.lib.is_none() {
                     let won = game.last_results.first().map_or(false, |r| r.0.starts_with("YOU"));
                     a.play(&format!("{FX}/{}", if won { "end_of_race_01.l" } else { "end_of_race_05.l" }), 0.8);
                 }
             } else if in_menu && (self.menu_sel != game.menu_sel || self.garage_row != game.garage_row || self.race_sel != game.race_sel || self.selected_car != game.selected_car) {
-                a.play(&format!("{MENUS}/ui_menu_nav_l"), 0.5);
+                // (MenuInput.sc.xml: up -> NAV_UP, down -> NAV_DOWN; MenuHorizontalInput: right -> NAV_DOWN, left -> NAV_UP)
+                let down = game.menu_sel > self.menu_sel || game.garage_row > self.garage_row || game.race_sel > self.race_sel || game.selected_car > self.selected_car;
+                self.ui(a, if down { "UI_MENU_NAV_DOWN" } else { "UI_MENU_NAV_UP" }, &format!("{MENUS}/ui_menu_nav_l"), 0.5);
             }
             // the overhead map up / down (hud.sc.xml: the transitions' playSound UI_MENU_SELECT /
             // UI_MENU_BACK - D-pad up and the scripts' mapGoBig / mapGoNormal alike)
             if game.hud_map_big != self.map_big {
-                a.play(&format!("{MENUS}/{}", if game.hud_map_big { "ui_menu_select_l" } else { "ui_menu_back_l" }), 0.6);
+                self.ui(a, if game.hud_map_big { "UI_MENU_SELECT" } else { "UI_MENU_BACK" }, &format!("{MENUS}/{}", if game.hud_map_big { "ui_menu_select_l" } else { "ui_menu_back_l" }), 0.6);
             }
+            // the reward: a new rank RANK_UP_MASTER, else the bar filling, 20 movie frames in (AnimateReward)
             if game.rep > self.rep && game.rep / 2000 != self.rep / 2000 {
-                a.play(&format!("{MENUS}/rank_up"), 0.7);
+                self.ui(a, "RANK_UP_MASTER", &format!("{MENUS}/rank_up"), 0.7);
+            } else if game.rep > self.rep && self.lib.is_some() {
+                self.rep_fill = Some(20.0 / 30.0);
             }
-            if game.money < self.money && in_menu {
+            if self.lib.is_some() {
+                // GARAGE_MONEY_MASTER at a purchase or sale in the garage
+                if game.money != self.money && game.mode == Mode::Garage {
+                    self.ui(a, "GARAGE_MONEY_MASTER", "", 0.0);
+                }
+            } else if game.money < self.money && in_menu {
                 a.play(&format!("{MENUS}/ui_menu_select_l"), 0.7);
+            }
+        }
+        if let Some(t) = &mut self.rep_fill {
+            *t -= dt;
+            if *t <= 0.0 {
+                self.rep_fill = None;
+                self.ui(a, "REP_BAR_FILL_MASTER", "", 0.0);
             }
         }
         self.started = true;
@@ -187,15 +366,36 @@ impl Sound {
 
         // ---- race flow ------------------------------------------------------------
         if let Some(r) = game.race.as_ref() {
-            let tick = if r.countdown > 0.0 { r.countdown.ceil() as i32 } else { 0 };
-            if tick != self.count_tick && game.mode == Mode::Race {
-                if tick == 0 {
-                    a.play(&format!("{MENUS}/321go_big_go_04_fin.l"), 0.8);
-                } else if tick <= 3 {
-                    a.play(&format!("{MENUS}/321go_big_04_fin.l"), 0.7);
+            if self.lib.is_some() {
+                // countdown_321Go_3sec: 3 at the start, 2 at -2050 ms, 1 at -1050, GO at -50
+                let cd = r.countdown;
+                let stage = if cd > 3.0 {
+                    4
+                } else if cd > 2.05 {
+                    3
+                } else if cd > 1.05 {
+                    2
+                } else if cd > 0.05 {
+                    1
+                } else {
+                    0
+                };
+                if stage < 4 && stage != self.count_stage && game.mode == Mode::Race && (stage < self.count_stage || stage == 3) {
+                    let n = if stage == 0 { "HUD_CNTDWN_GO_MASTER".to_string() } else { format!("HUD_CNTDWN_{stage}_MASTER") };
+                    self.ui(a, &n, "", 0.0);
                 }
+                self.count_stage = stage;
+            } else {
+                let tick = if r.countdown > 0.0 { r.countdown.ceil() as i32 } else { 0 };
+                if tick != self.count_tick && game.mode == Mode::Race {
+                    if tick == 0 {
+                        a.play(&format!("{MENUS}/321go_big_go_04_fin.l"), 0.8);
+                    } else if tick <= 3 {
+                        a.play(&format!("{MENUS}/321go_big_04_fin.l"), 0.7);
+                    }
+                }
+                self.count_tick = tick;
             }
-            self.count_tick = tick;
             let pi = vehicles.cars.iter().position(|c| c.is_player).unwrap_or(0);
             let cp = r.next.get(pi).copied().unwrap_or(0);
             // (the player's checkpoint, not the finish: HUD_CHECKPOINT_MASTER - OrderedCheckpointCore
@@ -203,14 +403,37 @@ impl Sound {
             // UI_MENUS_CHECKPOINT_BIG_WAY_2 twice - their own fields differ, not decoded - and
             // UI_MENUS_CHECK_POIMT_SWTNR)
             if cp > self.cp && cp < r.checkpoints.len() && game.mode == Mode::Race && game.flag.is_none() && r.kind != crate::game::RaceKind::Payback {
-                a.play(&format!("{MENUS}/checkpoint_big_way_2"), 0.6);
-                a.play(&format!("{MENUS}/check_poimt_swtnr"), 0.4);
+                if self.lib.is_some() {
+                    self.ui(a, "HUD_CHECKPOINT_MASTER", "", 0.0);
+                } else {
+                    a.play(&format!("{MENUS}/checkpoint_big_way_2"), 0.6);
+                    a.play(&format!("{MENUS}/check_poimt_swtnr"), 0.4);
+                }
             }
             self.cp = cp;
         } else {
             self.cp = 0;
             self.count_tick = 0;
+            self.count_stage = -1;
         }
+        // the race's end: the player's voice (race core 0x422e62e2: 1st win, 2nd within 0.3 s close, else lose), then
+        // the ENDRACE mixer, whose own sound is the sting (AudioManager_SetActiveEndRace)
+        let ended = game.race_end_t.is_some();
+        if let Some(lib) = &mut self.lib {
+            if ended && !self.end_race {
+                let res = &game.last_results;
+                let place = res.iter().position(|r| r.0.starts_with("YOU"));
+                let close = place == Some(1) && matches!((res.first().and_then(|r| r.1), res.get(1).and_then(|r| r.1)), (Some(a), Some(b)) if b - a <= 0.3);
+                let g = match place {
+                    Some(0) => "WIN",
+                    _ if close => "CLOSE",
+                    _ => "LOSE",
+                };
+                lib.play(&format!("PLAYER_ENDRACE_GESTURE_{g}_MASTER"), crate::sndobj::Req::default());
+            }
+            lib.scene("DYNAMIC_MIXER_ENDRACE", game.race_end_t.is_some_and(|t| t >= 0.2));
+        }
+        self.end_race = ended;
 
         // ---- the player's car -----------------------------------------------------
         let Some(p) = vehicles.player() else {
@@ -221,12 +444,51 @@ impl Sound {
             if let (Some(lib), Some(amb)) = (&mut self.lib, &mut self.amb) {
                 amb.stop(lib);
             }
+            if let (Some(lib), Some(f)) = (&mut self.lib, &mut self.fleet) {
+                f.stop_all(lib);
+            }
             self.finish(a, dt);
             return;
         };
         let st = &p.state;
         let speed = st.speed();
         let grounded = st.wheels.iter().any(|w| w.grounded);
+        // AIRTIME (sub_823267E8): in the air and a 10 m probe down from each wheel in turn (one a frame) hits nothing;
+        // after 0.5 s in the air PLAYER_IN_AIR is asked for once
+        if let Some(lib) = &mut self.lib {
+            let order: &[usize] = if p.model.bike { &[0, 2] } else { &[0, 2, 1, 3] };
+            if st.airborne_time > 0.0 && !in_menu {
+                let w = st.wheels[order[self.air_i % order.len()]].world_pos;
+                if probe(w, w - Vec3::new(0.0, 10.0, 0.0)) {
+                    self.air_miss = 0;
+                    if self.air_on {
+                        lib.scene("DYNAMIC_MIXER_AIRTIME", false);
+                        self.air_on = false;
+                    }
+                } else {
+                    self.air_miss += 1;
+                }
+                self.air_i = (self.air_i + 1) % order.len();
+                if self.air_miss >= order.len() && !self.air_on {
+                    lib.scene("DYNAMIC_MIXER_AIRTIME", true);
+                    self.air_on = true;
+                    self.air_t = 0.0;
+                }
+                if self.air_on && self.air_t >= 0.0 {
+                    self.air_t += dt;
+                    if self.air_t > 0.5 && !self.speech_busy {
+                        self.want_speech = Some("PLAYER_IN_AIR");
+                        self.air_t = -1.0;
+                    }
+                }
+            } else {
+                self.air_miss = 0;
+                if self.air_on {
+                    lib.scene("DYNAMIC_MIXER_AIRTIME", false);
+                    self.air_on = false;
+                }
+            }
+        }
         let name = p.model.name.clone();
         let throttle = if in_menu { 0.0 } else { p.input.throttle };
         let eng_vol = if in_menu { 0.28 } else { 0.62 };
@@ -256,12 +518,49 @@ impl Sound {
                 gear: vs.map_or(st.gear, |v| v.gear),
                 shift: vs.map_or(0, |v| if v.gear_change.active { v.gear_change.direction } else { 0 }),
                 idle_only: in_menu,
+                racing: false,
+                speed_ratio: 0.0,
             };
             eng.update(lib, &inp, dt);
         } else {
             // engine sits a little towards the centre of the mix whatever the camera does
             a.engine(0, &name, st.rpm, throttle, (eng_vol, eng_vol));
         }
+        // police events for the cars' sounds: a pull-over chirps and speaks, the chase runs the sirens, the radio
+        // timer asks for the worldized chatter (the original's AI triggers: VEHICLE_EXTRA_AUDIO_RULE.md section 5)
+        let fleet_on = self.fleet.is_some();
+        if fleet_on {
+            if self.heat != Some(police.heat) && !police.goons && police.heat == Heat::Busted {
+                self.ui(a, "COP_ARREST_FORM_OPEN_MASTER", "", 0.0);
+            }
+            self.heat = Some(police.heat);
+        }
+        if let (Some(lib), Some(fleet)) = (&mut self.lib, &mut self.fleet) {
+            // COP_FORM (sub_82653B30): the ticket form with its prepared audio stream (CopPullover); the arrest form has none
+            lib.scene("DYNAMIC_MIXER_COP_FORM", game.ticket_for.is_some() && game.arrest_panel.is_some_and(|p| p.0 <= 0.0));
+            let press = p.input.nitro && !self.nitro_btn;
+            let ctl = crate::caraudio::PlayerCtl {
+                horn: horn && !in_menu,
+                nitro_empty: press && !st.nitro_on() && st.nitro_shots == 0,
+                parts: self.parts,
+                cam_mode: self.cam_audio,
+                engine: self.engine.as_ref().map(|(_, e)| (e.smoothed_rpm(), e.load_volume())),
+            };
+            let pol = crate::caraudio::PoliceIn {
+                heat: match police.heat {
+                    Heat::None => 0,
+                    Heat::PullOver => 1,
+                    Heat::Pursuit => 2,
+                    Heat::Search => 3,
+                    Heat::Busted => 4,
+                },
+                goons: police.goons,
+                score: police.score,
+                speech_busy: self.speech_busy,
+            };
+            fleet.update(lib, vehicles, cam_pos, ctl, wet, game.mode == Mode::Race, pol, dt);
+        }
+        self.nitro_btn = p.input.nitro;
 
         if driving {
             // gear changes
@@ -284,7 +583,7 @@ impl Sound {
             }
             // hydraulics: the pump as the car is switched up or down, each ram as it goes
             // (the events are cleared by the caller once heard)
-            if let Some(h) = st.veh.as_ref().map(|v| v.hyd) {
+            if let Some(h) = st.veh.as_ref().map(|v| v.hyd).filter(|_| !fleet_on) {
                 if h.ev_switch > 0 {
                     a.play(&format!("{AUX}/hydro_transition_up"), 0.6);
                 } else if h.ev_switch < 0 {
@@ -303,31 +602,30 @@ impl Sound {
             }
             // nitrous
             let nitro = st.nitro_on();
-            if nitro && !self.nitro_on {
-                match &mut self.lib {
-                    Some(lib) => crate::engaudio::nitro_fire(lib, &name, st.pos),
-                    None => a.play(&format!("{AUX}/nitrous_01_fin_l"), 0.7),
-                }
+            if nitro && !self.nitro_on && !fleet_on {
+                a.play(&format!("{AUX}/nitrous_01_fin_l"), 0.7);
             }
-            if !nitro && self.nitro_on {
+            if !nitro && self.nitro_on && !fleet_on {
                 a.play(&format!("{AUX}/nitrous_tail"), 0.4);
             }
             self.nitro_on = nitro;
-            // tyres
+            // tyres, road, wind, landings, horn: the port's own sounds where the sound objects are missing
+            // (the original has no wind loop and no landing sound of its own: caraudio.rs)
+            let old = !fleet_on;
             let slip = st.wheels.iter().filter(|w| w.grounded).map(|w| (w.slip - 0.92).max(0.0)).fold(0.0, f32::max);
             let skid_t = if grounded && speed > 4.0 { (slip * 2.2).min(1.0) } else { 0.0 };
-            if skid_t > 0.25 && self.skid < 0.05 {
+            if old && skid_t > 0.25 && self.skid < 0.05 {
                 if let Some(k) = a.pick(AUX, "tire_chirp") {
                     a.play(&k, 0.4);
                 }
             }
             self.skid += (skid_t - self.skid) * (dt * 10.0).min(1.0);
-            if self.skid > 0.02 {
+            if old && self.skid > 0.02 {
                 a.set_loop(1, &format!("{AUX}/skids_01"), (self.skid * 0.5, self.skid * 0.5), 0.9 + (speed / 60.0).min(0.35));
             }
             // road and wind
             let roll = (speed / 55.0).clamp(0.0, 1.0);
-            if grounded && roll > 0.03 {
+            if old && grounded && roll > 0.03 {
                 // (the tyre loop of what the car is rolling on - the terrain recordings of the game)
                 use crate::physics::collision::Surface;
                 let under = st.wheels.iter().find(|w| w.grounded).map(|w| Surface::from_u8(w.surface).kind());
@@ -348,16 +646,16 @@ impl Sound {
                 a.set_loop(2, &format!("{AUX}/{surface}"), (roll * 0.3, roll * 0.3), 0.7 + roll * 0.6);
             }
             let wind = ((speed - 18.0) / 60.0).clamp(0.0, 1.0);
-            if wind > 0.01 {
+            if old && wind > 0.01 {
                 a.set_loop(3, &format!("{AUX}/wind_01_l"), (wind * 0.35, wind * 0.2), 0.8 + wind * 0.5);
                 a.set_loop(4, &format!("{AUX}/wind_01_r"), (wind * 0.2, wind * 0.35), 0.8 + wind * 0.5);
             }
-            if wind > 0.6 {
+            if old && wind > 0.6 {
                 let w = (wind - 0.6) * 2.0;
                 a.set_loop(5, &format!("{AUX}/wind_high_01_l"), (w * 0.3, w * 0.3), 1.0);
             }
             // landings
-            if self.airborne && grounded && st.airborne_time < 0.05 {
+            if old && self.airborne && grounded && st.airborne_time < 0.05 {
                 if let Some(k) = a.pick(AUX, "suspension_car_down") {
                     a.play(&k, 0.6);
                 }
@@ -385,7 +683,7 @@ impl Sound {
                 self.impact_cool = 0.35;
             }
             // horn
-            if horn {
+            if horn && old {
                 let key = format!("{AUX}/mustang_horn_fin");
                 a.set_loop(6, &key, (0.5, 0.5), 1.0);
             }
@@ -418,8 +716,8 @@ impl Sound {
             }
         }
 
-        // ---- other vehicles --------------------------------------------------------
-        if driving {
+        // ---- other vehicles (the port's own sounds where the sound objects are missing) -------------
+        if driving && !fleet_on {
             let mut near: Vec<(f32, usize)> = vehicles.cars.iter().enumerate().filter(|(_, c)| !c.is_player && c.parked.is_none() && c.placed).map(|(i, c)| (c.state.pos.distance(cam_pos), i)).filter(|(d, _)| *d < 90.0).collect();
             near.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
             for (slot, (_, i)) in near.iter().take(5).enumerate() {
@@ -464,7 +762,7 @@ impl Sound {
 
         // ---- police ---------------------------------------------------------------
         // (step 19d: the payback client's friends have no siren and no radio)
-        if self.heat != Some(police.heat) && !police.goons {
+        if self.heat != Some(police.heat) && !police.goons && !fleet_on {
             match police.heat {
                 Heat::PullOver => {
                     a.play(&format!("{AUX}/police_siren_alert_02"), 0.6);
@@ -479,7 +777,7 @@ impl Sound {
             }
         }
         self.heat = Some(police.heat);
-        if matches!(police.heat, Heat::Pursuit | Heat::Search) && !police.goons {
+        if matches!(police.heat, Heat::Pursuit | Heat::Search) && !police.goons && !fleet_on {
             self.radio -= dt;
             if self.radio <= 0.0 {
                 self.radio = 9.0 + (a.pick(AUX, "radio_cutoff_squelch").map_or(0, |k| k.len()) % 5) as f32 * 2.0;
@@ -491,7 +789,31 @@ impl Sound {
 
         // ---- abilities ------------------------------------------------------------
         let on = ability.active > 0.0;
-        if on && !self.ability_on {
+        if let Some(lib) = &mut self.lib {
+            // GLOBAL_SPECIAL_ABILITIES: 17-byte blocks {flag, +1 start, +5 exit, +9 extra} at +10 Zone, +27 Agro,
+            // +44 Roar, +61 Pulse; the exit stops the start sound (sub_8237BEA0); the ability's dynamic mixer while on
+            let block = match ability.kind {
+                crate::ability::Kind::Zone => 10,
+                crate::ability::Kind::Agro => 27,
+                crate::ability::Kind::Roar => 44,
+                crate::ability::Kind::Emp => 61,
+            };
+            let field = |lib: &crate::sndobj::SoundLib, at: usize| lib.game.get_name("GLOBAL_SPECIAL_ABILITIES").and_then(|o| o.get(block + at..block + at + 4)).map(|b| u32::from_be_bytes(b.try_into().unwrap())).unwrap_or(0);
+            if on && !self.ability_on {
+                let h = field(lib, 1);
+                self.ability_snd = lib.play_hash(h, crate::sndobj::Req::default());
+            }
+            if !on && self.ability_on {
+                if let Some(h) = self.ability_snd.take() {
+                    lib.stop(h);
+                }
+                let h = field(lib, 5);
+                lib.play_hash(h, crate::sndobj::Req::default());
+            }
+            for (k, n) in [(crate::ability::Kind::Zone, "DYNAMIC_MIXER_ZONE"), (crate::ability::Kind::Agro, "DYNAMIC_MIXER_AGRO"), (crate::ability::Kind::Roar, "DYNAMIC_MIXER_ROAR"), (crate::ability::Kind::Emp, "DYNAMIC_MIXER_PULSE")] {
+                lib.scene(n, on && ability.kind == k);
+            }
+        } else if on && !self.ability_on {
             let key = match ability.kind {
                 crate::ability::Kind::Zone => "special_abilities/zone/in_the_zone_enter_l",
                 crate::ability::Kind::Agro => "special_abilities/agro/agro_ignite_oneshots_01.l",
@@ -500,7 +822,7 @@ impl Sound {
             };
             a.play(key, 0.8);
         }
-        if !on && self.ability_on {
+        if !on && self.ability_on && self.lib.is_none() {
             let key = match ability.kind {
                 crate::ability::Kind::Zone => "special_abilities/zone/in_the_zone_exit_l",
                 crate::ability::Kind::Emp => "special_abilities/pulse/pulse_exit.l",
@@ -510,13 +832,14 @@ impl Sound {
         }
         self.ability_on = on;
         let ready = ability.ready();
-        if ready && !self.ability_ready && driving {
+        // (the original's ability-ready alert has no caller found: no sound with the sound objects)
+        if ready && !self.ability_ready && driving && self.lib.is_none() {
             a.play(&format!("{MENUS}/rep_bar"), 0.5);
         }
         self.ability_ready = ready;
 
         // ---- weather --------------------------------------------------------------
-        if rain > 0.03 && !in_menu {
+        if rain > 0.03 && !in_menu && self.lib.is_none() {
             a.set_loop(7, &format!("{AUX}/amb_bed_rain_int_fin"), (rain * 0.45, rain * 0.45), 1.0);
         }
 
@@ -565,8 +888,12 @@ impl Sound {
             // the original's district ambience (ambaudio.rs) at the listener; the port's rain bed stays until the
             // original's rain sounds are decoded
             amb.update(lib, cam_pos, night, game.mode == Mode::Garage, dt);
-            let rain_bed = (rain > 0.5 && game.mode != Mode::Garage).then(|| self.beds.as_ref().and_then(|m| m.get("RAIN_EXT_01")).cloned()).flatten();
-            a.set_bed(rain_bed.as_deref(), if in_menu { 0.25 } else { 0.4 });
+            // rain and thunder (WEATHER_AUDIO_RULE.md): the player's wheel cover probes, the listener's probe 50 m up
+            let wheels: Vec<Vec3> = if p.model.bike { vec![st.wheels[0].world_pos, st.wheels[2].world_pos] } else { [0, 2, 1, 3].iter().map(|&i| st.wheels[i].world_pos).collect() };
+            amb.cover_probe(wet, &wheels, probe);
+            let covered = wet && probe(cam_pos, cam_pos + Vec3::new(0.0, 50.0, 0.0));
+            amb.weather(lib, wet, self.cam_audio == 1, covered, dt);
+            a.set_bed(None, 0.0);
         } else {
             let bed = self.beds.as_ref().and_then(|m| m.get(base)).cloned();
             a.set_bed(bed.as_deref(), if in_menu { 0.25 } else { 0.4 });
@@ -574,6 +901,20 @@ impl Sound {
 
         a.update_music(driving || game.mode == Mode::Paused);
         self.finish(a, dt);
+    }
+
+    /// A frontend sound by name (sub_821E6800: 0 dB, no position; the tree's speaker masks place it); the port's own
+    /// sample `old` where the sound objects are missing.
+    fn ui(&mut self, a: &mut Audio, name: &str, old: &str, vol: f32) {
+        match &mut self.lib {
+            Some(lib) => {
+                if lib.play(name, crate::sndobj::Req::default()).is_none() {
+                    log::warn!("audio: no sound object {name}");
+                }
+            }
+            None if !old.is_empty() => a.play(old, vol),
+            None => {}
+        }
     }
 
     /// The sound objects drive their voices, then every voice not driven this frame fades.

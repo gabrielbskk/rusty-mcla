@@ -56,7 +56,7 @@ fn full_volume() -> u8 {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { master: 10, music: 7, subtitles: false, shake: true, sens: 5, voice: 10, vehicle: 10, cutscene: 10 }
+        Options { master: 10, music: 10, subtitles: false, shake: true, sens: 5, voice: 10, vehicle: 10, cutscene: 10 }
     }
 }
 

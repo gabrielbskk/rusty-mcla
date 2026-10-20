@@ -57,6 +57,9 @@ struct District {
     quads: Vec<Shot>,
     locs: Vec<Loc>,
     line: Vec<Vec3>,
+    /// +30 bit 0: the district sets the weather categories (+31 s16 rain 0.01 dB, +35 s16 thunder 0.01 dB; the LPFs +33 / +37
+    /// are not applied by the port's mixer)
+    weather_mix: Option<(f32, f32)>,
 }
 
 fn parse_district(name: &str, o: &[u8]) -> Option<District> {
@@ -106,7 +109,8 @@ fn parse_district(name: &str, o: &[u8]) -> Option<District> {
     p += 1;
     let line = (0..ne).map(|k| Vec3::new(be_f32(o, p + 12 * k), be_f32(o, p + 12 * k + 4), be_f32(o, p + 12 * k + 8))).collect();
     let [shots, quads] = shots;
-    Some(District { name: name.to_string(), bed: [be_u32(o, 10), be_u32(o, 14)], line_dist: be_f32(o, 39), line_sound: be_u32(o, 43), circles, shots, quads, locs, line })
+    let weather_mix = (o.get(30).copied().unwrap_or(0) & 1 != 0).then(|| (be_u16(o, 31) as i16 as f32 * 0.01, be_u16(o, 35) as i16 as f32 * 0.01));
+    Some(District { name: name.to_string(), bed: [be_u32(o, 10), be_u32(o, 14)], line_dist: be_f32(o, 39), line_sound: be_u32(o, 43), circles, shots, quads, locs, line, weather_mix })
 }
 
 struct Slot {
@@ -130,6 +134,33 @@ pub struct Ambience {
     landmark_curve: u32,
     null: u32,
     now: f32,
+    rain: Rain,
+}
+
+/// The rain and thunder of the ambience manager (sub_821E8410; `reference/audio/WEATHER_AUDIO_RULE.md`).
+#[derive(Default)]
+struct Rain {
+    /// AMBIENCE_GLOBAL +22 RAIN_INT, +26 RAIN_EXT, +30 THUNDER, +34 / +38 thunder interval, +58 ramp time, +62 covered rain dB
+    int_snd: u32,
+    ext_snd: u32,
+    thunder_snd: u32,
+    thunder_gap: (f32, f32),
+    ramp: f32,
+    covered_db: (f32, f32),
+    /// slots +280 (RAIN_EXT), +836 (RAIN_INT), +284 (thunder); byte +1074; +824 the next thunder
+    ext: Option<Handle>,
+    int: Option<Handle>,
+    thunder: Option<Handle>,
+    raining: bool,
+    next_thunder: f32,
+    /// +1048 / +1052: the share of the player's wheels with something above them, and its smoothed value
+    cover_target: f32,
+    cover: f32,
+    /// the player car's probe walk (this+2213 / +2214)
+    probe_i: usize,
+    probe_hits: usize,
+    /// the mix last applied: (district, listener covered)
+    mix: Option<(Option<usize>, bool)>,
 }
 
 /// Voices for the distant one-shots and quadshots at once (the manager's free-slot lists; size not decoded).
@@ -163,7 +194,123 @@ impl Ambience {
             landmark_curve: joaat("MC4_HANGOUT_LANDMARK_APPLY"),
             null: joaat(NULL_SOUND),
             now: 0.0,
+            rain: Rain {
+                int_snd: be_u32(glob, 22),
+                ext_snd: be_u32(glob, 26),
+                thunder_snd: be_u32(glob, 30),
+                thunder_gap: (be_f32(glob, 34), be_f32(glob, 38)),
+                ramp: be_f32(glob, 58),
+                covered_db: (be_u16(glob, 62) as i16 as f32 * 0.01, be_u16(glob, 66) as i16 as f32 * 0.01),
+                cover_target: 1.0,
+                cover: 1.0,
+                // (+824 starts at rand(0, 20), sub_821EAD98 @821EAF8C: drawn in the first update)
+                next_thunder: -1.0,
+                ..Default::default()
+            },
         })
+    }
+
+    /// The player car's cover probe (sub_82326A78, from the car audio update while wet): one wheel a frame, a line 40 m
+    /// straight up (or back down); after every wheel the share of hits is the cover target. `probe(from, to)`.
+    pub fn cover_probe(&mut self, wet: bool, wheels: &[Vec3], probe: &dyn Fn(Vec3, Vec3) -> bool) {
+        let r = &mut self.rain;
+        if !wet || wheels.is_empty() {
+            // (dry: the wheel index goes back to 0, the hit count is kept - the original's quirk)
+            r.probe_i = 0;
+            return;
+        }
+        let i = r.probe_i.min(wheels.len() - 1);
+        let p = wheels[i];
+        let q = p + Vec3::new(0.0, 40.0, 0.0);
+        if probe(p, q) || probe(q, p) {
+            r.probe_hits += 1;
+        }
+        r.probe_i += 1;
+        if r.probe_i >= wheels.len() {
+            r.cover_target = r.probe_hits as f32 / wheels.len() as f32;
+            r.probe_i = 0;
+            r.probe_hits = 0;
+        }
+    }
+
+    /// Rain and thunder (sub_821EB080 -> sub_821E8410): `wet` = the weather's wet amount is not 0, `cockpit` = audio camera
+    /// mode 1 with a player, `covered` = the listener's probe 50 m up hit something.
+    pub fn weather(&mut self, lib: &mut SoundLib, wet: bool, cockpit: bool, covered: bool, dt: f32) {
+        let now = self.now;
+        let level = |lib: &SoundLib, n: &str| lib.category(n).map_or(0.0, |c| c.volume);
+        let r = &mut self.rain;
+        if r.next_thunder < 0.0 {
+            r.next_thunder = now + lib.rand_float(0.0, 20.0);
+        }
+        if level(lib, "AMBIENCE") <= -80.0 {
+            // (sub_821E9C50: the rain bed's and the thunder's slots stop with everything else)
+            for s in [&mut r.ext, &mut r.thunder] {
+                if let Some(h) = s.take() {
+                    lib.stop(h);
+                }
+            }
+            return;
+        }
+        if level(lib, "AMBIENCE_BEDS") <= -80.0 {
+            return;
+        }
+        if !wet {
+            if let Some(h) = r.int.take() {
+                lib.stop(h);
+            }
+            if r.raining {
+                if let Some(h) = r.ext.take() {
+                    lib.stop(h);
+                }
+            }
+            r.raining = false;
+            return;
+        }
+        if !r.raining {
+            for s in [&mut r.int, &mut r.ext] {
+                if let Some(h) = s.take() {
+                    lib.stop(h);
+                }
+            }
+            r.raining = true;
+        }
+        if r.ext.map_or(true, |h| !lib.playing(h)) {
+            r.ext = lib.play_hash(r.ext_snd, Req::default());
+        }
+        if r.int.map_or(true, |h| !lib.playing(h)) {
+            r.int = lib.play_hash(r.int_snd, Req::default().vol(-100.0));
+        }
+        // the weather categories by the district (+30 flag) or the listener's cover, ramped over AG+58
+        let key = (self.cur, covered);
+        if r.mix != Some(key) {
+            let (rain_db, thunder_db) = match self.cur.and_then(|d| self.districts[d].weather_mix) {
+                Some(m) => m,
+                None if covered => r.covered_db,
+                None => (0.0, 0.0),
+            };
+            lib.ramp_category("AMBIENCE_BEDS_WEATHER_RAIN", rain_db, r.ramp);
+            lib.ramp_category("AMBIENCE_BEDS_WEATHER_THUNDER", thunder_db, r.ramp);
+            r.mix = Some(key);
+        }
+        // the cover moves toward its target at 1 per second (G+92, I: unscaled dt)
+        let step = dt;
+        r.cover = if r.cover < r.cover_target { (r.cover + step).min(r.cover_target) } else { (r.cover - step).max(r.cover_target) };
+        let (ext_db, int_db) = if cockpit {
+            let open = 1.0 - r.cover;
+            (-100.0, if open >= 1e-5 { mcla_formats::audcfg::lin2db(open) } else { -100.0 })
+        } else {
+            (0.0, -100.0)
+        };
+        if let Some(h) = r.ext {
+            lib.set(h, Req::default().vol(ext_db));
+        }
+        if let Some(h) = r.int {
+            lib.set(h, Req::default().vol(int_db));
+        }
+        if now >= r.next_thunder && r.thunder.map_or(true, |h| !lib.playing(h)) {
+            r.thunder = lib.play_hash(r.thunder_snd, Req::default());
+            r.next_thunder = now + lib.rand_float(r.thunder_gap.0, r.thunder_gap.1);
+        }
     }
 
     /// The district the listener is in (sub_821EB810): the lowest squared distance over weight of all circles.

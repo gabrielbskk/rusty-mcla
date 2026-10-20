@@ -1405,6 +1405,11 @@ impl FlashPhone {
         self.shown.is_some() || self.closing > 0
     }
 
+    /// A message is up (the sidekick control's SetVisible: the phone's ring / close sounds).
+    pub fn visible(&self) -> bool {
+        self.shown.is_some()
+    }
+
     /// Show a message (or none), and run the movie.
     /// `prompt`: the line at the foot of the screen with the Back glyph ("MISSION LOG"
     /// on a mission call), empty for none.
@@ -1711,6 +1716,8 @@ pub struct FlashHud {
     /// the game's splash queues (`0x82234440`): per slot, up to five waiting
     /// (text, colour, seconds), posted when the movie has freed the slot
     splash_queue: [std::collections::VecDeque<(String, i32, f32)>; 3],
+    /// a splash was posted to queue 1 (the movie then plays RACER_FOUND_MASTER)
+    pub racer_found: bool,
 }
 
 /// Splash slots of the HUD movie (`SplashTypes` 5, 4, 10 for slots 0..2; slot 3
@@ -1722,7 +1729,7 @@ pub const SPLASH_BOTTOM: usize = 2;
 impl FlashHud {
     pub fn load(data_dir: &str, shared: &UiShared) -> Option<FlashHud> {
         let movie = FlashMovie::load(data_dir, "resources/ui/hud/0x1f0e1cda.r27", shared)?;
-        Some(FlashHud { movie, countdown_shown: false, splash_queue: Default::default() })
+        Some(FlashHud { movie, countdown_shown: false, splash_queue: Default::default(), racer_found: false })
     }
 
     /// The line under the speed (`d_selectedlevel_longname`; the movie's own sample
@@ -1759,6 +1766,7 @@ impl FlashHud {
             p.set_path(&format!("SplashVisibles.{}", slot), Value::Int(1));
             p.set_path(&format!("duration.{}", slot), Value::Float(seconds.max(2.0)));
             p.set_path(&format!("SplashStrings.{}", slot), Value::str(&text));
+            self.racer_found |= slot == 1;
         }
     }
 

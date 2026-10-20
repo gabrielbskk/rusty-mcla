@@ -518,14 +518,21 @@ pub struct Category {
 /// Resolve every category (by name hash) from BASE: volume and pitch add, LPF min, HPF max, rolloff scale multiplies;
 /// bits of +9 stop the parent's part (0x80 volume, 0x40 pitch, 0x20 LPF, 0x10 HPF, 0x08 rolloff scale).
 pub fn resolve_categories(cats: &Dat) -> HashMap<u32, Category> {
+    resolve_categories_with(cats, &HashMap::new())
+}
+
+/// As [`resolve_categories`] with the run-time volume of the categories' controllers (the volume sliders, the camera
+/// table ...): `runtime[hash]` dB (20 log10 of the product of the controllers' gains, sub_82548888) is added to that
+/// category's own volume and so passed down to its children.
+pub fn resolve_categories_with(cats: &Dat, runtime: &HashMap<u32, f32>) -> HashMap<u32, Category> {
     let mut out = HashMap::new();
-    fn walk(cats: &Dat, h: u32, parent: Option<Category>, out: &mut HashMap<u32, Category>, depth: usize) {
+    fn walk(cats: &Dat, runtime: &HashMap<u32, f32>, h: u32, parent: Option<Category>, out: &mut HashMap<u32, Category>, depth: usize) {
         let Some(o) = cats.get(h) else { return };
         if depth > 32 {
             return;
         }
         let b9 = o.get(9).copied().unwrap_or(0);
-        let own_vol = lin2db(db2lin(be_i16(o, 11) as f32 * 0.01));
+        let own_vol = lin2db(db2lin(be_i16(o, 11) as f32 * 0.01)) + runtime.get(&h).copied().unwrap_or(0.0);
         let own = Category { volume: own_vol, pitch: be_i16(o, 15) as i32, lpf: be_u16(o, 17), hpf: be_u16(o, 19), rolloff_scale: be_u16(o, 21) as f32 * 0.01 };
         let c = match parent {
             None => own,
@@ -540,10 +547,10 @@ pub fn resolve_categories(cats: &Dat) -> HashMap<u32, Category> {
         out.insert(h, c);
         let n = o.get(35).copied().unwrap_or(0) as usize;
         for i in 0..n {
-            walk(cats, be_u32(o, 36 + 4 * i), Some(c), out, depth + 1);
+            walk(cats, runtime, be_u32(o, 36 + 4 * i), Some(c), out, depth + 1);
         }
     }
-    walk(cats, joaat("BASE"), None, &mut out, 0);
+    walk(cats, runtime, joaat("BASE"), None, &mut out, 0);
     out
 }
 

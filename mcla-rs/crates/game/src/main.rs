@@ -61,6 +61,7 @@ mod sndobj;
 mod engaudio;
 mod collaudio;
 mod ambaudio;
+mod caraudio;
 mod speech;
 mod render;
 mod rimshop;
@@ -438,9 +439,6 @@ struct App {
 }
 
 impl App {
-    /// A start scene begins (`BeginDescription` / `EndDescriptionAndStartClock`): its racer events armed, a
-    /// taunt scene's speech prepared - the hookman (slot 1) speaks in the voice of his driver's character
-    /// (CareerVoices.xml); when it is prepared, slot 0's left and slot 1's right windows go down at once.
     /// The race's start scene from the original's picker and table (prerace.rs) and where it is staged.
     fn prerace_choose(&mut self, front: Vec3, yaw: f32, grid: &str) -> (Vec<String>, glam::Mat4) {
         let grid = grid.to_string();
@@ -479,6 +477,9 @@ impl App {
         }
         (scenes, origin)
     }
+    /// A start scene begins (`BeginDescription` / `EndDescriptionAndStartClock`): its racer events armed, a
+    /// taunt scene's speech prepared - the hookman (slot 1) speaks in the voice of his driver's character
+    /// (CareerVoices.xml); when it is prepared, slot 0's left and slot 1's right windows go down at once.
     fn prerace_acts_begin(&mut self, scene: &str) {
         let events = prerace::slot_events(scene);
         let duration = self.cine.playing.as_ref().map_or(0.0, |sc| sc.duration);
@@ -2103,8 +2104,20 @@ impl App {
                 log::info!("powerups: tick {} car {} {:?} {}", self.tick_no, n.car, n.snd, powerups::NAMES.get(n.kind as usize).unwrap_or(&"none"));
                 // (only the player's car has the power-up sounds: PACKAGE_POWERUP_PLAYER)
                 if Some(n.car) == player {
-                    if let (Some(a), Some(wv)) = (self.audio.as_mut(), powerups::wave(n.kind, n.snd)) {
-                        a.play(&wv, 0.8);
+                    if let Some(a) = self.audio.as_mut() {
+                        let pos = self.vehicles.cars.get(n.car).map(|c| c.state.pos);
+                        let orig = powerups::object(n.kind, n.snd).is_some_and(|(o, f)| {
+                            // the effect's mixer with its in / out sounds
+                            if matches!(n.snd, powerups::Snd::In | powerups::Snd::Out) {
+                                a.obj_field(&o, 50, None, n.snd == powerups::Snd::In);
+                            }
+                            a.obj_field(&o, f, pos, true)
+                        });
+                        if !orig {
+                            if let Some(wv) = powerups::wave(n.kind, n.snd) {
+                                a.play(&wv, 0.8);
+                            }
+                        }
                     }
                 }
             }
@@ -2508,10 +2521,10 @@ impl App {
                 }
             }
         }
+        self.game.dive_k = if self.warp_view.is_some() { 1.0 } else { 0.0 };
         if let Some((front, yaw, grid)) = self.game.prerace.clone() {
             self.prerace_wait += 1;
             if let Some(r) = self.game.race.as_mut() {
-        self.game.dive_k = if self.warp_view.is_some() { 1.0 } else { 0.0 };
                 r.countdown = r.countdown.max(4.4);
             }
             if self.prerace_plan.is_none() {
@@ -2556,12 +2569,12 @@ impl App {
                         self.cine_caption = None;
                     }
                     log::info!("prerace scene: {} (delivery intro {})", p080_sc, hudmap::delivery_intro(&p080_sc).is_some());
-                }
-            }
-        }
                     if let (Some(w), Some(sc)) = (self.warp.as_ref(), self.cine.playing.as_mut()) {
                         sc.t = (self.warp_t - (w.total() - hudmap::CINE_HANDOVER)).max(0.0);
                     }
+                }
+            }
+        }
         if self.cine.playing.is_some() {
             let t = if self.cine_free {
                 let skip = (self.cine_caption.is_some() && std::mem::take(&mut self.game.nav_enter)) || (self.cine_prerace && self.game.race.is_none()) || (self.cine_results && self.game.mode != Mode::Results);
@@ -2761,9 +2774,6 @@ impl App {
                     self.game.shot_now = true;
                 }
             }
-            // (test hook MCLA_RACE_END_SHOTS=<dir>;t1,t2,...: pictures t seconds after the line,
-            // the camera logged in the car's frame - x right, y up, z rear)
-            if let (Ok(v), Some(t)) = (std::env::var("MCLA_RACE_END_SHOTS"), self.game.race_end_t) {
             // (test hook MCLA_RACE_START_SHOTS=<dir>;t1,t2,...: pictures t seconds after the race-start warp
             // began, the camera logged)
             if let Ok(v) = std::env::var("MCLA_RACE_START_SHOTS") {
@@ -2789,6 +2799,9 @@ impl App {
                     }
                 }
             }
+            // (test hook MCLA_RACE_END_SHOTS=<dir>;t1,t2,...: pictures t seconds after the line,
+            // the camera logged in the car's frame - x right, y up, z rear)
+            if let (Ok(v), Some(t)) = (std::env::var("MCLA_RACE_END_SHOTS"), self.game.race_end_t) {
                 static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
                 let (dir, ts) = v.split_once(';').unwrap_or((".", v.as_str()));
                 let ts: Vec<f32> = ts.split(',').filter_map(|x| x.parse().ok()).collect();
@@ -3152,7 +3165,10 @@ impl App {
                     let msg = self.game.career.strings.get("COLLECTABLE_FOUND_MSG").map(|s| s.to_string()).unwrap_or_else(|| "COLLECTABLE FOUND".to_string());
                     self.game.show_message(&format!("{}   {} / {}", msg.to_uppercase(), self.game.collected.len(), self.barrels.len()));
                     if let Some(a) = self.audio.as_mut() {
-                        a.play("ui/menus/rank_up", 0.8);
+                        // (MiscTasks/Collectables @0x7e3: AudioManager_PlayFrontendSound)
+                        if !a.obj("COLLECTIBLES_PICKUP_MASTER") {
+                            a.play("ui/menus/rank_up", 0.8);
+                        }
                     }
                     self.game.write_save(&self.opt.data_dir);
                 }
@@ -3703,7 +3719,8 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                     let secs = (6.0 + text.len() as f32 * 0.055).min(22.0);
                     self.game.tip = Some((title, text, secs));
                     self.game.phone_prompt.clear();
-                    if let Some(a) = self.audio.as_mut() {
+                    // (the call is the phone's: UI_CELLPHONE_RING when it comes up - sound.rs)
+                    if let Some(a) = self.audio.as_mut().filter(|a| !a.has_objects()) {
                         a.play("ui/menus/tutorial_window_fin", 0.7);
                     }
                     self.speech.say(&key);
@@ -3720,7 +3737,8 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                         self.game.show_message(&m);
                     }
                     self.news_timer = 3.4;
-                    if let Some(a) = self.audio.as_mut() {
+                    // (a splash line has no sound of its own; a call rings the phone - sound.rs)
+                    if let Some(a) = self.audio.as_mut().filter(|a| !a.has_objects()) {
                         a.play(if m.starts_with("MISSION COMPLETE") || m.starts_with("PRIZE") { "ui/menus/rank_up" } else { "ui/menus/tutorial_window_fin" }, 0.7);
                     }
                     // the briefing is a story scene where the game has one, else a phone call
@@ -4102,10 +4120,13 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                 }
                 if let Some(a) = self.audio.as_mut() {
                     for s in sounds {
-                        a.play(s, 0.8);
+                        // (the clock's beep: RACE_TIMER_SECOND_BEEP_MASTER, sub_822112A8)
+                        if !(s == "ui/menus/beep_fin" && a.obj("RACE_TIMER_SECOND_BEEP_MASTER")) {
+                            a.play(s, 0.8);
+                        }
                     }
-                    // (step 19d: the race clock's tick loop - `mc4_clock_sounds`)
-                    if tick && self.game.mode != Mode::Paused {
+                    // (step 19d: the race clock's tick loop - `mc4_clock_sounds`: RACE_TIMER_TICK_LOOP_MASTER)
+                    if tick && self.game.mode != Mode::Paused && !a.obj_loop("RACE_TIMER_TICK_LOOP_MASTER") {
                         a.set_loop(0x5449_434B_0019_000D, "ui/menus/stopwatch_fin", (0.8, 0.8), 1.0);
                     }
                 }
@@ -4243,6 +4264,7 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                     }
                 }
                 let heat_before = self.police.heat;
+                let (score_before, search_before) = (self.police.score, self.police.search);
                 if self.police.enabled {
                     self.police.update_units(&gpu, &mut self.vehicles);
                 }
@@ -4258,25 +4280,47 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                         Some(police::Event::PullOver) => {
                             self.radio.say("REPORT_PULL_SUSPECT_OVER", true, &rctx);
                         }
+                        // (siren/RULE.md section 7: hitting the cop adds iDamagePoliceVehPoints 600 at once; the
+                        // score reaching 600 by itself; driving off during the ticket)
+                        Some(police::Event::Pursuit) if heat_before == police::Heat::PullOver => {
+                            if self.police.score - score_before >= 599.0 {
+                                self.radio.say("REPORT_HIT_COP_CAR_HARD", true, &rctx);
+                            } else if self.police.score >= 600.0 {
+                                self.radio.say("REPORT_PULL_OVER_PURSUIT", true, &rctx);
+                            } else {
+                                if !self.speech.busy() {
+                                    self.speech.say("PLAYER_COPS_ESCAPE_TICKET");
+                                }
+                                self.radio.say("REPORT_SUSPECT_FLEES", true, &rctx);
+                            }
+                            self.radio_next = 9.0;
+                        }
                         Some(police::Event::Pursuit) => {
-                            self.radio.say(if heat_before == police::Heat::PullOver { "REPORT_SUSPECT_FLEES" } else { "REPORT_VIOLATION_PURSUIT" }, true, &rctx);
+                            self.radio.say("REPORT_VIOLATION_PURSUIT", true, &rctx);
                             self.radio_next = 9.0;
                         }
                         Some(police::Event::Escaped) => {
                             self.radio.say("REPORT_END_PURSUIT", true, &rctx);
                         }
-                        Some(police::Event::Ticket(_)) => {
-                            self.radio.say("REPORT_SUSPECT_PULLS_OVER", true, &rctx);
-                        }
-                        Some(police::Event::Busted(_)) => {
-                            self.radio.say("REPORT_END_PURSUIT", true, &rctx);
+                        // busted and ticket: the radio line is cut, no scenario
+                        Some(police::Event::Ticket(_)) | Some(police::Event::Busted(_)) => {
+                            self.radio.stop();
                         }
                         None => {}
                     }
                     if heat_before == police::Heat::Pursuit && self.police.heat == police::Heat::Search {
                         self.radio.say("REPORT_SUSPECT_LOST", true, &rctx);
                     } else if heat_before == police::Heat::Search && self.police.heat == police::Heat::Pursuit {
-                        self.radio.say("REPORT_SUSPECT_REACQUIRE", true, &rctx);
+                        self.radio.say(if search_before < 17.5 { "REPORT_SUSPECT_SPOTTED" } else { "REPORT_SUSPECT_REACQUIRE" }, true, &rctx);
+                    }
+                    // a cruiser wrecked or destroyed: REPORT_COP_CAR_DISABLED once (per car)
+                    for (i, c) in self.vehicles.cars.iter().enumerate() {
+                        let down = c.cop && !c.goon && (c.state.wipeout > 0.0 || c.state.damage >= 1.0);
+                        if down && self.sound.cop_disabled.insert(i) {
+                            self.radio.say("REPORT_COP_CAR_DISABLED", true, &rctx);
+                        } else if !c.cop {
+                            self.sound.cop_disabled.remove(&i);
+                        }
                     }
                     if self.police.heat == police::Heat::Pursuit {
                         self.radio_next -= sim_dt;
@@ -4676,8 +4720,26 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
             let horn = (self.game.opt_x.ctrl.kbd.binds.down(crate::keybinds::HORN, |k| self.input.down(k)) || self.pad_horn) && !self.game.in_menu();
             // Zone slows the world: sounds drop in pitch with it
             let o = self.game.opts;
-            a.set_master(if self.game.mode == Mode::Paused { 0.35 } else { 0.9 } * o.master as f32 / 10.0);
-            a.music_volume = o.music as f32 * 0.05 * o.master as f32 / 10.0;
+            if self.sound.lib.is_some() {
+                // the original's levels: the five sliders are category controllers, nothing after the voices
+                // (docs/reference/audio/VOLUME_RULE.md); the pause is the PAUSE scene
+                a.set_master(1.0);
+                self.sound.sliders = [o.master, o.music, o.voice, o.vehicle, o.cutscene];
+                // the audio camera mode (sub_822C0320): 0 bumper, 1 driver, 2 near, 3 medium, 4 far, 5 cinematic, 6 other
+                self.sound.cam_audio = if self.cuts.playing.is_some() || self.cine.playing.is_some() || self.game.replay.is_some() {
+                    6
+                } else if self.vehicles.player().is_none() || self.game.in_menu() && self.game.mode != Mode::Paused {
+                    -1
+                } else {
+                    [4, 3, 2, 1, 0, 5].get(self.cam_mode as usize).copied().unwrap_or(2)
+                };
+                // the performance stages the car sounds read: intake, turbo, nitrous (shop parts 2, 3, 6)
+                let st = self.game.perf_stages(self.game.current_car);
+                self.sound.parts = [st[2], st[3], st[6]];
+            } else {
+                a.set_master(if self.game.mode == Mode::Paused { 0.35 } else { 0.9 } * o.master as f32 / 10.0);
+                a.music_volume = o.music as f32 * 0.05 * o.master as f32 / 10.0;
+            }
             // (steering sensitivity: the middle of the scale is the tuning's own steer rate)
             // (the save's own step where it lies between two of the port's: `mc4`)
             physics::vehsim::STEER_SENS.store((0.5 + self.game.sens_exact() * 0.1).to_bits(), std::sync::atomic::Ordering::Relaxed);
@@ -4693,7 +4755,16 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                     }
                 }
             }
-            self.sound.update(a, &self.vehicles, &self.game, &self.police, &self.ability, &self.props.hits, self.cam.pos, right, rain_snd, horn, self.time_of_day > 19.5 || self.time_of_day < 6.0, dt);
+            if let Some(l) = self.sound.want_speech.take() {
+                if !self.speech.busy() {
+                    self.speech.say(l);
+                }
+            }
+            self.sound.speech_busy = self.speech.busy() || self.radio.busy();
+            self.sound.damage_alpha = self.game.flash_hud.as_ref().and_then(|h| h.movie.player.get_global("damage_alpha")).map_or(0.0, |v| v.to_f32());
+            self.sound.racer_found |= self.game.flash_hud.as_mut().is_some_and(|h| std::mem::take(&mut h.racer_found));
+            self.sound.menu_cam = self.game.flash_menu.as_ref().filter(|_| self.game.in_menu()).and_then(|m| m.movie.player.get_global("cur_camera")).map(|v| v.to_f32() as i32);
+            self.sound.update(a, &self.vehicles, &self.game, &self.police, &self.ability, &self.props.hits, self.cam.pos, right, rain_snd, horn, self.time_of_day > 19.5 || self.time_of_day < 6.0, &|p: Vec3, q: Vec3| { let d = q - p; let l = d.length(); l > 0.0 && world.collider.raycast(p, d / l, l).is_some() }, dt);
             if let Some(v) = self.vehicles.player_mut().and_then(|c| c.state.veh.as_mut()) {
                 (v.hyd.ev_rise, v.hyd.ev_drop, v.hyd.ev_end, v.hyd.ev_switch) = (0, 0, 0, 0);
             }
@@ -4736,6 +4807,9 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
         }
         // ---- the race-over menu's quick fix ----
         if std::mem::take(&mut self.game.quick_fix) {
+            if let Some(a) = self.audio.as_mut() {
+                a.obj("QUICK_FIX_MASTER");
+            }
             if let Some(p) = self.vehicles.player_mut() {
                 p.state.damage = 0.0;
                 p.state.dents = Default::default();
@@ -4792,6 +4866,15 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
             }
             if let Some((nitro, fix)) = filled {
                 self.game.money -= paid;
+                // (the gas station: NITROUS_REFILL_MASTER when a canister was missing, QUICK_FIX_MASTER for a paid fix)
+                if let Some(a) = self.audio.as_mut() {
+                    if nitro {
+                        a.obj("NITROUS_REFILL_MASTER");
+                    }
+                    if fix {
+                        a.obj("QUICK_FIX_MASTER");
+                    }
+                }
                 let s = |k: &str, d: &str| self.game.career.strings.get(k).map(|s| s.to_uppercase()).unwrap_or_else(|| d.into());
                 let m = match (nitro, fix) {
                     (true, true) => format!("{}   {}  -${}", s("GasStation_RefillNitro", "REFILL NITROUS"), s("GasStation_FullFix", "FULL FIX"), paid),
@@ -5131,6 +5214,9 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                     if self.game.mode == Mode::Garage {
                         self.boom_up = Some(self.garage_up);
                     }
+                    if let Some((_, _, up, _)) = self.warp_view.filter(|_| self.game.race.is_some()) {
+                        self.boom_up = Some(up);
+                    }
                 } else if self.game.mode == Mode::Garage || self.cuts.playing.is_some() {
                     // showroom orbit: 3/4 view slowly circling the car
                     self.orbit += dt * 0.25;
@@ -5139,9 +5225,6 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                     let right = Vec3::new(-fwd.z, 0.0, fwd.x);
                     let dir = fwd * a.cos() + right * a.sin();
                     let ext = (car.model.max - car.model.min).length().max(4.0);
-                    if let Some((_, _, up, _)) = self.warp_view.filter(|_| self.game.race.is_some()) {
-                        self.boom_up = Some(up);
-                    }
                     let mut dist = (ext * 1.65).max(8.0);
                     let mut up = (0.34 * ext).max(1.6);
                     self.cam.fov_y = 50f32.to_radians();

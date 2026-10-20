@@ -75,7 +75,7 @@ impl CollisionAudio {
         let dir = data_dir.join("tune").join("physics").join("materials");
         for s in Surface::ALL {
             let name = s.material();
-            let txt = [dir.join(format!("0x{:08x}", joaat(name))), dir.join(name)].iter().find_map(|p| std::fs::read_to_string(p).ok());
+            let txt = [dir.join(format!("0x{:08x}", joaat(&format!("{name}.mtl")))), dir.join(format!("0x{:08x}", joaat(name)))].iter().find_map(|p| std::fs::read_to_string(p).ok());
             let obj = txt
                 .as_deref()
                 .and_then(|t| t.lines().find_map(|l| l.trim().strip_prefix("AudioGameObject:").map(|v| v.trim().to_string())))

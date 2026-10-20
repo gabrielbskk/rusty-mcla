@@ -277,7 +277,10 @@ impl Radio {
             };
             let dur = a.clip(&key).map_or(0.0, |c| c.data.len() as f32 / c.rate.max(1) as f32);
             if dur > 0.0 {
-                a.play(&key, vol);
+                // (the police voices are Speech sounds of category SPEECH_POLICE; the port's own level without them)
+                if !a.obj_clip(&key, "SPEECH_POLICE", None) {
+                    a.play(&key, vol);
+                }
                 self.wait = dur + 0.04;
             }
         }

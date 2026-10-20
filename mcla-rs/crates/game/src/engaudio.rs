@@ -1,10 +1,11 @@
-//! The player car's engine sound as the original makes it (mcCarAudioEntity): the car's `_ENGINE_XFADER` table of
-//! recorded loops cross-faded by a slewed, normalised rpm, the gain curve and load volume, the "kick" pitch chirp and
-//! amp-mod bump, and the gear-shift and backfire one-shots. Rules and sources: `docs/reference/audio/ENGINE_AUDIO_RULE.md`.
+//! The cars' engine sound as the original makes it (mcCarAudioEntity): the car's `_ENGINE_XFADER` table of recorded
+//! loops cross-faded by a slewed, normalised rpm, the gain curve and load volume, the "kick" pitch chirp and amp-mod
+//! bump, and the gear-shift and backfire one-shots. Rules and sources: `docs/reference/audio/ENGINE_AUDIO_RULE.md`.
+//! Computer racers use their `_O_` objects with the opponent rules (`new_opponent`; VEHICLE_EXTRA_AUDIO_RULE.md
+//! section 6); the turbo whine and blow-off read this sound's smoothed rpm and load volume (caraudio.rs).
 //!
 //! Not ported (open there): the start / stop state machine (ignition, crank, rev flare - the port's engine is always
-//! running), the layer-B overlay (off on every player car), turbo whine / blow-off (the port does not know the car's
-//! turbo part), the reverse whine (NULL on the cars looked at), the per-camera category volumes.
+//! running), the layer-B overlay (off on every player car), the reverse whine (NULL on the cars looked at).
 
 use crate::sndobj::{Handle, Req, SoundLib};
 use glam::Vec3;
@@ -61,6 +62,21 @@ pub struct EngineIn {
     pub shift: i8,
     /// the garage / cutscene rev mode (byte 1950): the loops follow idle
     pub idle_only: bool,
+    /// opponents: the car's driver is racing (byte 1951) and its speed over the gearbox's top-gear speed (this+232)
+    pub racing: bool,
+    pub speed_ratio: f32,
+}
+
+/// The car's audio DEFAULT object: `<CAR>_PROFILE` +10 for the player, +14 for an opponent; VPD_ cars fall back to their
+/// VP_ profile, then DEFAULT_CAR / DEFAULT_BIKE_PROFILE.
+pub fn default_object<'a>(lib: &'a SoundLib, car: &str, bike: bool, player: bool) -> Option<&'a [u8]> {
+    let g = &lib.game;
+    let up = car.to_ascii_uppercase();
+    let profile = g
+        .get_name(&format!("{up}_PROFILE"))
+        .or_else(|| g.get_name(&format!("{}_PROFILE", up.replacen("VPD_", "VP_", 1))))
+        .or_else(|| g.get_name(if bike { "DEFAULT_BIKE_PROFILE" } else { "DEFAULT_CAR_PROFILE" }))?;
+    g.get(be_u32(profile, if player { 10 } else { 14 }))
 }
 
 pub struct EngineSound {
@@ -98,6 +114,11 @@ pub struct EngineSound {
     amp_curve: u32,
     amp_time: (f32, f32),
     amp_amount: f32,
+    /// the player's car (true) or a computer racer's (`_O_` objects, section 6 of VEHICLE_EXTRA_AUDIO_RULE.md)
+    player: bool,
+    /// opponents: AMPMOD +30/+34 wobble target range, +38/+42 its rate range
+    wobble_target: (f32, f32),
+    wobble_rate: (f32, f32),
     /// this frame's audio rpm (this+212) and each loop's gain (fade x G), for tests and the debug overlay
     pub audio_rpm: f32,
     pub gains: Vec<f32>,
@@ -117,6 +138,10 @@ pub struct EngineSound {
     prev_gear: i32,
     pending_gear: Option<(f32, u32)>,
     backfire_armed: Option<f32>,
+    /// opponents: the RPM_RACE_OPPONENT blend (this+216) and the wobble (this+220 target, +224 rate, +228 value)
+    blend: f32,
+    wobble: (f32, f32, f32),
+    racing_curve: u32,
 }
 
 #[derive(Default)]
@@ -156,13 +181,17 @@ fn osc(kind: usize, p: f32) -> f32 {
 impl EngineSound {
     /// The car's audio objects: `<CAR>_PROFILE` -> player `_DEFAULT` -> cross-fader, one-shots, LFO, amp-mod.
     pub fn new(lib: &SoundLib, car: &str, bike: bool) -> Option<EngineSound> {
+        Self::make(lib, car, bike, true)
+    }
+
+    /// A computer racer's engine: the profile's opponent DEFAULT (+14), `_O_ENGINE_XFADER`, TUNERS_AMPMOD_MAIN_OPPONENTS.
+    pub fn new_opponent(lib: &SoundLib, car: &str, bike: bool) -> Option<EngineSound> {
+        Self::make(lib, car, bike, false)
+    }
+
+    fn make(lib: &SoundLib, car: &str, bike: bool, player: bool) -> Option<EngineSound> {
         let g = &lib.game;
-        let up = car.to_ascii_uppercase();
-        let profile = g
-            .get_name(&format!("{up}_PROFILE"))
-            .or_else(|| g.get_name(&format!("{}_PROFILE", up.replacen("VPD_", "VP_", 1))))
-            .or_else(|| g.get_name(if bike { "DEFAULT_BIKE_PROFILE" } else { "DEFAULT_CAR_PROFILE" }))?;
-        let def = g.get(be_u32(profile, 10))?;
+        let def = default_object(lib, car, bike, player)?;
         let xf = g.get(be_u32(def, 14))?;
         let one = g.get(be_u32(def, 18)).unwrap_or(&[]);
         let eff = g.get(be_u32(def, 30)).unwrap_or(&[]);
@@ -181,6 +210,12 @@ impl EngineSound {
         let s16 = |o: &[u8], at: usize| be_u16(o, at) as i16 as f32;
         log::info!("audio: engine {} - {} loops {}..{} rpm", lib.game.name_of(be_u32(def, 14)).unwrap_or("?"), n, recs[0].start, recs[n - 1].end);
         Some(EngineSound {
+            player,
+            wobble_target: (be_f32(amp, 30), be_f32(amp, 34)),
+            wobble_rate: (be_f32(amp, 38), be_f32(amp, 42)),
+            blend: 0.0,
+            wobble: (1.0, 0.0, 1.0),
+            racing_curve: joaat("RPM_RACE_OPPONENT"),
             pitch_off: s16(xf, 12),
             vol_a: s16(xf, 14) * 0.01,
             effect_db: if eff.is_empty() { 0.0 } else { s16(eff, 10) * 0.01 },
@@ -231,6 +266,14 @@ impl EngineSound {
         })
     }
 
+    /// The smoothed engine speed (this+204) and the load volume (this+148): the turbo whine reads both.
+    pub fn smoothed_rpm(&self) -> f32 {
+        self.s
+    }
+    pub fn load_volume(&self) -> f32 {
+        self.load_vol
+    }
+
     pub fn stop(&mut self, lib: &mut SoundLib) {
         for h in self.voices.iter_mut().filter_map(|h| h.take()) {
             lib.stop(h);
@@ -244,9 +287,22 @@ impl EngineSound {
         approach(&mut self.load_smooth, load, 6.0 * dt);
         let load_abs = load.abs().min(1.0);
         let reversing = e.gear == -1 && e.speed > 1.0;
-        // load volume (sub_823265E0)
+        // load volume (player sub_823265E0, opponent sub_82364E78)
         if reversing {
             approach(&mut self.load_vol, self.load_rev, 0.8 * dt);
+        } else if !self.player {
+            let drive = load_abs.max(e.pedal).max(self.load_floor).max(self.load_brake);
+            let full = if e.racing { 1.0 } else { drive };
+            let target = if self.load_smooth > 0.0 || e.speed < self.load_slow {
+                full
+            } else if e.pedal < 0.5 {
+                if e.racing { 1.0 } else { self.load_floor }
+            } else if e.shift != 0 {
+                self.load_brake
+            } else {
+                full
+            };
+            approach(&mut self.load_vol, target, self.load_rate * dt);
         } else {
             let drive = load_abs.max(e.throttle_in).max(e.pedal).max(self.load_floor).max(self.load_brake);
             if self.load_smooth > 0.0 {
@@ -278,9 +334,29 @@ impl EngineSound {
         let lfo_cents = self.step_lfo(dt);
         // rpm slew (sub_8234B000, state 4 = running)
         let target = if e.idle_only { e.idle_rpm } else { e.rpm };
+        let rpm_rate = (target - self.s) / dt.max(1e-6);
         approach(&mut self.s, target, self.slew * dt);
         // normalised rpm, audio rpm, master gain
-        let norm = ((self.s - e.idle_rpm) / (e.max_rpm - e.idle_rpm).max(1.0)).min(1.0);
+        let mut norm = ((self.s - e.idle_rpm) / (e.max_rpm - e.idle_rpm).max(1.0)).min(1.0);
+        if !self.player {
+            // the RPM_RACE_OPPONENT blend (sub_823655F0; the brain's share, brain +380 / +404 / +428, is not decoded:
+            // the speed term alone) and the wobble (sub_8234B000 @8234B378)
+            let want = if e.racing { (e.speed_ratio * 3.0).min(1.0) } else { 0.0 };
+            let rate = if want < self.blend { 0.125 } else { 0.25 } * dt;
+            approach(&mut self.blend, want, rate);
+            if e.racing {
+                let c = lib.curve_eval(self.racing_curve, norm).unwrap_or(norm);
+                norm += (c - norm) * self.blend;
+                let (target, rate, mut w) = self.wobble;
+                approach(&mut w, target, rate * dt);
+                if w == target {
+                    self.wobble.0 = lib.rand_float(self.wobble_target.0, self.wobble_target.1);
+                    self.wobble.1 = lib.rand_float(self.wobble_rate.0, self.wobble_rate.1);
+                }
+                self.wobble.2 = w;
+                norm = (norm * (1.0 + (w - 1.0) * self.blend)).min(1.0);
+            }
+        }
         let x = norm * (last.end - first.start) + first.start;
         let mut g = lib.curve_eval(self.gain_curve, norm).unwrap_or(1.0) * self.load_vol;
         if self.amp_left > 0.0 {
@@ -304,10 +380,23 @@ impl EngineSound {
                 0.0
             };
             self.gains[i] = fade * g;
+            if !self.player {
+                // opponents (sub_82365960): record 0 and the sounding records live, and the neighbour the revs are
+                // moving towards fast
+                let prev_start = if i == 0 { f32::MIN } else { self.recs[i - 1].start };
+                let next_end = if i + 1 == n { f32::MAX } else { self.recs[i + 1].end };
+                let active = fade > 0.0 || (rpm_rate < -2000.0 && prev_start < x && x < r.start) || (rpm_rate > 2000.0 && r.end < x && x < next_end);
+                if !active && i != 0 {
+                    if let Some(h) = self.voices[i].take() {
+                        lib.stop(h);
+                    }
+                    continue;
+                }
+            }
             // sub_82329010: every record's voice runs, silent ones at -100 dB
             let vol = lin2db(fade * g) + self.effect_db + self.vol_a;
             let cents = (self.pitch_off + 1200.0 * (x / r.reference).log2() + lfo_cents) as i32;
-            let req = Req { pos: Some(e.pos), volume: vol, pitch: cents, pan: -1, doppler: 1.0, player: true };
+            let req = Req { pos: Some(e.pos), volume: vol, pitch: cents, player: self.player, ..Default::default() };
             match self.voices[i] {
                 Some(h) if lib.playing(h) => lib.set(h, req),
                 _ => self.voices[i] = lib.play_hash(r.sound, req),
@@ -329,7 +418,7 @@ impl EngineSound {
         }
         if let Some((t, snd)) = self.pending_gear {
             if t <= 0.0 {
-                lib.play_hash(snd, Req { pos: Some(e.pos), volume: self.gear_vol, pitch: self.gear_pitch, pan: -1, doppler: 1.0, player: true });
+                lib.play_hash(snd, Req { pos: Some(e.pos), volume: self.gear_vol, pitch: self.gear_pitch, player: self.player, ..Default::default() });
                 self.pending_gear = None;
             } else {
                 self.pending_gear = Some((t - dt, snd));
@@ -343,7 +432,7 @@ impl EngineSound {
             if e.throttle_in <= 0.0 && e.rpm < self.prev_rpm {
                 let t = t - dt;
                 if t <= 0.0 {
-                    lib.play_hash(self.backfire, Req { player: true, ..Req::at(e.pos) });
+                    lib.play_hash(self.backfire, Req { player: self.player, ..Req::at(e.pos) });
                     self.backfire_armed = None;
                 } else {
                     self.backfire_armed = Some(t);
@@ -413,20 +502,6 @@ impl EngineSound {
     }
 }
 
-/// The nitrous shot's sound (sub_823286A0): TUNERS_NITRO's fire sound at level 0; the world version in the chase
-/// camera modes (the front-end version is for camera modes 0 / 1 - which camera those are is open).
-pub fn nitro_fire(lib: &mut SoundLib, car: &str, pos: Vec3) {
-    let g = &lib.game;
-    let up = car.to_ascii_uppercase();
-    let snd = g
-        .get_name(&format!("{up}_PROFILE"))
-        .and_then(|p| g.get(be_u32(p, 10)))
-        .and_then(|d| g.get(be_u32(d, 42)))
-        .map(|nitro| be_u32(nitro, 11))
-        .unwrap_or_else(|| joaat("NITROUS_FIRE_MASTER"));
-    lib.play_hash(snd, Req { player: true, ..Req::at(pos) });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,7 +523,7 @@ mod tests {
             // idle 1 s, then a rise to the limiter over 6 s, held, then off the throttle
             let rpm = if t < 1.0 { idle } else if t < 7.0 { idle + (max - idle) * (t - 1.0) / 6.0 } else if t < 8.5 { max } else { idle };
             let on = t >= 1.0 && t < 8.5;
-            let inp = EngineIn { pos: Vec3::ZERO, rpm, idle_rpm: idle, max_rpm: max, torque: if on { 300.0 } else { -50.0 }, full_torque: 400.0, pedal: on as u8 as f32, throttle_in: on as u8 as f32, speed: 20.0, gear: 3, shift: 0, idle_only: false };
+            let inp = EngineIn { pos: Vec3::ZERO, rpm, idle_rpm: idle, max_rpm: max, torque: if on { 300.0 } else { -50.0 }, full_torque: 400.0, pedal: on as u8 as f32, throttle_in: on as u8 as f32, speed: 20.0, gear: 3, shift: 0, idle_only: false, ..Default::default() };
             e.update(&mut lib, &inp, dt);
             lib.update(dt, &mut a);
             a.end_frame();

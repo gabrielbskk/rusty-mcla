@@ -257,6 +257,26 @@ pub struct Audio {
     ear_right: Vec3,
     rng: u32,
     pub available: bool,
+    /// requests for the original's sound objects, played by `sound::Sound` (which owns the sound library) this frame;
+    /// `objects` = the library is loaded (requests are accepted)
+    pub obj_cmds: Vec<ObjCmd>,
+    pub objects: bool,
+}
+
+/// A request for the sound-object player (`sndobj.rs`).
+#[derive(Clone, Debug)]
+pub enum ObjCmd {
+    /// a sounds.dat object by name: at a place (positional) or not, with a requested volume (dB)
+    Play { name: String, pos: Option<Vec3>, volume: f32 },
+    /// a converted wave (`<bank>/<wave>` below the audio root) played as a voice of the category (speech lines:
+    /// the speech system picks the take, the category and the scenario's mixer set the level)
+    Clip { key: String, category: &'static str, pos: Option<Vec3> },
+    /// a dynamic mixer scene on / off
+    Scene { name: String, on: bool },
+    /// the sound (or, for a type-23 object, the scene) whose hash sits at `offset` of a game.dat object
+    Field { object: String, offset: usize, pos: Option<Vec3>, on: bool },
+    /// a persistent sound by name, kept while it is asked for every frame (stopped in the first frame it is not)
+    Loop { name: String },
 }
 
 /// Gains for a sound at `pos`: inverse-distance roll-off with a reference distance,
@@ -334,6 +354,8 @@ impl Audio {
             ear_right: Vec3::X,
             rng: seed,
             available,
+            obj_cmds: Vec::new(),
+            objects: false,
         })
     }
 
@@ -369,6 +391,50 @@ impl Audio {
         }
         let _ = std::fs::write(path, d);
         log::info!("audio: wrote {} ({:.1} s)", path, out.len() as f32 / (RATE as f32 * 2.0));
+    }
+
+    /// Play a sounds.dat object by name (non-positional, 0 dB requested: the frontend path sub_821E6800). False when the
+    /// sound objects are not loaded, so the caller can fall back.
+    pub fn has_objects(&self) -> bool {
+        self.objects
+    }
+    pub fn obj(&mut self, name: &str) -> bool {
+        self.obj_ex(name, None, 0.0)
+    }
+    /// A persistent sound by name, asked for every frame it should run (non-positional).
+    pub fn obj_loop(&mut self, name: &str) -> bool {
+        if self.objects {
+            self.obj_cmds.push(ObjCmd::Loop { name: name.to_string() });
+        }
+        self.objects
+    }
+    pub fn obj_at(&mut self, name: &str, pos: Vec3) -> bool {
+        self.obj_ex(name, Some(pos), 0.0)
+    }
+    pub fn obj_ex(&mut self, name: &str, pos: Option<Vec3>, volume: f32) -> bool {
+        if self.objects {
+            self.obj_cmds.push(ObjCmd::Play { name: name.to_string(), pos, volume });
+        }
+        self.objects
+    }
+    /// A speech take as a voice of `category` (see [`ObjCmd::Clip`]).
+    pub fn obj_clip(&mut self, key: &str, category: &'static str, pos: Option<Vec3>) -> bool {
+        if self.objects {
+            self.obj_cmds.push(ObjCmd::Clip { key: key.to_string(), category, pos });
+        }
+        self.objects
+    }
+    /// The sound named by a game.dat object's field (`on` false: a scene field switched off).
+    pub fn obj_field(&mut self, object: &str, offset: usize, pos: Option<Vec3>, on: bool) -> bool {
+        if self.objects {
+            self.obj_cmds.push(ObjCmd::Field { object: object.to_string(), offset, pos, on });
+        }
+        self.objects
+    }
+    pub fn obj_scene(&mut self, name: &str, on: bool) {
+        if self.objects {
+            self.obj_cmds.push(ObjCmd::Scene { name: name.to_string(), on });
+        }
     }
 
     pub fn root(&self) -> &Path {

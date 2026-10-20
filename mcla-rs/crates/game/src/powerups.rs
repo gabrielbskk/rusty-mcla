@@ -1000,6 +1000,25 @@ pub fn wave(kind: u8, s: Snd) -> Option<String> {
     w.map(|w| format!("{BANK}{w}"))
 }
 
+/// The player's power-up sound as the original names it: game.dat `POWERUP_<X>_PLAYER` (PACKAGE_POWERUP_PLAYER) and the
+/// field of the event (+10 picked up, +14 hit, +18 fired, +30 in, +38 out, +42 mirrored, +46 shielded, +54 melting);
+/// +50 is the effect's dynamic mixer (on at In, off at Out).
+pub fn object(kind: u8, s: Snd) -> Option<(String, usize)> {
+    let base = if (12..21).contains(&kind) { kind - 11 } else { kind };
+    let name = ["NITRO", "ICE", "REVERSE", "STEALTH", "DISRUPTOR", "SHIELD", "STOP", "PULSE", "MIRROR", "AGRO"].get(base as usize)?;
+    let field = match s {
+        Snd::Pickup => 10,
+        Snd::Hit => 14,
+        Snd::Fire => 18,
+        Snd::In => 30,
+        Snd::Out => 38,
+        Snd::Mirrored => 42,
+        Snd::Shielded => 46,
+        Snd::Melt => 54,
+    };
+    Some((format!("POWERUP_{name}_PLAYER"), field))
+}
+
 /// The loops: the shot's (+22) and the effect's "static" one (+34).
 pub fn loop_wave(kind: u8, shot: bool) -> Option<String> {
     let base = if (12..21).contains(&kind) { kind - 11 } else { kind };
