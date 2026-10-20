@@ -893,6 +893,10 @@ mod tests {
         let e = &fx.effects[fx.effect("checkpoint_ctf_generic").unwrap()];
         let z = e.zoom.eval(0.5);
         assert!((z[0] - 39.06976).abs() < 1e-3 && (z[1] - 39.06976).abs() < 1e-3, "{:?}", z);
+        // (the programs drawn as the original's: the flare's fire lit (mode 4), the sparks unlit
+        // (mode 5), the column its own mode)
+        let mode = |n: &str| { let r = fx.particle_rules.iter().find(|r| r.name == n).unwrap(); crate::particles::sprite_mode(r.sprite.as_ref().unwrap(), r.render.blend_set) };
+        assert_eq!((mode("cp_flare_fire"), mode("checkpoint_sparks"), mode("light_column")), (4.0, 5.0, 0.0));
     }
 
     #[test]

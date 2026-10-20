@@ -243,6 +243,18 @@ pub struct Particles {
 }
 
 const MAX: usize = 3000;
+/// The particle shader's mode for the programs ported as the original draws them (the scene's
+/// linear value, not a display colour): 4 = `mc4_rmptfx_mainlist`'s draw_SoftPart_VertLit when
+/// it adds (blend 7 - the flares' fire, glows), 5 = `mc4_rmptfx_default`'s unlit_draw (the
+/// checkpoints' sparks); 0 = the generic look.
+pub(crate) fn sprite_mode(s: &mcla_formats::rage::ptfx::Sprite, blend_set: u32) -> f32 {
+    match (s.shader.as_str(), s.technique.as_str()) {
+        ("mc4_rmptfx_mainlist", "draw_SoftPart_VertLit") if blend_set == 7 => 4.0,
+        ("mc4_rmptfx_default", "unlit_draw") => 5.0,
+        _ => 0.0,
+    }
+}
+
 /// the texture key of the projected arrows' four textures (`arrow_atlas`)
 const ARROW_ATLAS_KEY: u32 = 0x7a77_0c90;
 
@@ -1046,8 +1058,14 @@ impl Particles {
                     let (du, dv) = (1.0 / s.tiles_x as f32, 1.0 / s.tiles_y as f32);
                     uv = [(f % s.tiles_x) as f32 * du, (f / s.tiles_x) as f32 * dv, du, dv];
                     let f0 = p.frame0 as u32 % (s.tiles_x * s.tiles_y);
-                    // (w: the low smoke's soft fade - technique "draw" of mc4_rmptfx_projected)
-                    let soft = if projected && s.technique == "draw" { 1.0 } else { 0.0 };
+                    // (w: the soft fade's factor k of sat(k d^2) - technique "draw" of mc4_rmptfx_projected
+                    // and mc4_rmptfx_default's PS_Draw 0.1, ps_main_SoftPart_VertLit 4; 0 none)
+                    let soft = match sprite_mode(s, pr.render.blend_set) {
+                        _ if projected && s.technique == "draw" => 0.1,
+                        4.0 => 4.0,
+                        5.0 => 0.1,
+                        _ => 0.0,
+                    };
                     uv2 = [(f0 % s.tiles_x) as f32 * du, (f0 / s.tiles_x) as f32 * dv, p.anim, soft];
                     rot = p.theta;
                     if pr.flags & flag::DRAW_DIRECTIONAL != 0 {
@@ -1074,8 +1092,16 @@ impl Particles {
                 if !(w > 1e-4 && h > 1e-4) {
                     continue;
                 }
-                let lit = if projected { 3.0 } else if column { 2.0 } else if self.additive[card.sheet] { 0.0 } else { 1.0 };
-                let extra = if projected { [p.shadow[0], p.shadow[1], p.shadow[2], (2.0 * night).max(1.0)] } else { [0.0; 4] };
+                let mode = pr.sprite.as_ref().map_or(0.0, |s| sprite_mode(s, pr.render.blend_set));
+                let lit = if projected { 3.0 } else if column { 2.0 } else if mode > 0.0 { mode } else if self.additive[card.sheet] { 0.0 } else { 1.0 };
+                let mut extra = if projected { [p.shadow[0], p.shadow[1], p.shadow[2], (2.0 * night).max(1.0)] } else { [0.0; 4] };
+                let mut normal_arc = 0.0;
+                if let (4.0, Some(s)) = (mode, pr.sprite.as_ref()) {
+                    // (vs_main_SoftPart_VertLit's variables, the effect file's defaults where the rule has none)
+                    let var = |n: &str, d: f32| s.vars.iter().find(|(k, _)| k == n).map_or(d, |(_, v)| v[0]);
+                    extra = [var("gDiffuse", 1.0), var("gAmbient", 1.0), var("gAmbientDayControl", 1.0), var("gTranslucency", 0.0)];
+                    normal_arc = var("gNormalArc", 0.0);
+                }
                 // (the technique "draw" of `mc4_rmptfx_projected` - the low smoke - maps the arrows'
                 // target round its effect; "draw_noarrow" - the plume - does not)
                 let (mut arrow_a, mut arrow_b, mut arrow_c, mut arrow_d) = ([0.0f32; 4], [0.0f32; 4], [0.0f32; 4], [0.0f32; 4]);
@@ -1093,6 +1119,18 @@ impl Particles {
                     arrow_b = [bounds[0], bounds[1], self.arrow_rt[0], self.arrow_rt[1]];
                     arrow_c = [tint[0], tint[1], tint[2], boost];
                     arrow_d = [self.arrow_rt[2], tile, self.clock * rate, night];
+                }
+                if mode == 4.0 {
+                    // (x: gNormalArc; arrow_b xyz: the effect's place - the light picker's position)
+                    arrow_a[0] = normal_arc;
+                    let at = inst_at.get(&p.inst).map_or(p.pos, |e| e.0);
+                    arrow_b = [at.x, at.y, at.z, 0.0];
+                    // (arrow_c rgb: what the picker adds to gLightAmbient there - the night fill
+                    // light, map / 255 x 0.25 x m_NFLFade, as for the traffic cars, not cut to bytes;
+                    // recorded c26 (0.2255, 0.2382, 0.2363) = (0.0353, 0.0510, 0.0588) + (0.1902,
+                    // 0.1873, 0.1775) at checkpoint 0 of AROUND HOLLYWOOD, 01:06)
+                    let f = crate::fillmap::body_now(at.x, at.z);
+                    arrow_c = [f[0], f[1], f[2], 0.0];
                 }
                 items.push((card.sheet as u32, p.pos.distance_squared(cam), PInst { pos_size: [p.pos.x, p.pos.y, p.pos.z, h], color: [c.x, c.y, c.z, alpha], uv, misc: [rot, w / h, 1.0, lit], extra, arrow_a, arrow_b, arrow_c, arrow_d, uv2 }));
             }

@@ -27,6 +27,18 @@ struct Globals {
 };
 @group(0) @binding(0) var<uniform> g: Globals;
 
+// the dynamic lights (render/mod.rs `LightSet`): the lit sprites' four vertex lights
+struct LightSet {
+    count: vec4<u32>,
+    pos_range: array<vec4<f32>, 48>,
+    color: array<vec4<f32>, 48>,
+    dir: array<vec4<f32>, 48>,
+};
+@group(0) @binding(1) var<uniform> lights: LightSet;
+// the city lamp grid (render/mod.rs `set_lamps`): four lamp numbers per cell, the lamps' table
+@group(0) @binding(7) var t_lamp_grid: texture_2d<u32>;
+@group(0) @binding(8) var t_lamp_data: texture_2d<f32>;
+
 // What the tone map (post.wgsl) will turn into this display colour: its colour correction
 // undone, then its curve on the luminance, then its exposure.
 fn to_scene(d: vec3<f32>) -> vec3<f32> {
@@ -100,7 +112,13 @@ fn vs_particle(
     // smoke takes the light of the scene, flames and sparks glow on their own
     let light = g.ambient_sky.rgb * 0.9 + g.sun_color.rgb * g.sun_dir.w * 0.35;
     o.color = vec4<f32>(color.rgb * mix(vec3<f32>(1.0), light, select(misc.w, 0.0, misc.w > 1.5)), color.a);
-    o.prof = vec2<f32>(corner.y, select(select(0.0, 1.0, column), 2.0, smoke));
+    if (misc.w > 3.5 && misc.w < 4.5) {
+        // misc.w 4: mc4_rmptfx_mainlist's vs_main_SoftPart_VertLit - the vertex's normal is its
+        // turned corner in the camera's plane plus (gNormalArc + 0.1) towards the camera
+        let nrm = normalize(right * r.x + up * r.y + to_cam * (arrow_a.x + 0.1));
+        o.color = vec4<f32>(color.rgb * vert_lit(wp, nrm, extra, arrow_b.xyz, arrow_c.xyz), color.a);
+    }
+    o.prof = vec2<f32>(corner.y, select(select(select(0.0, 1.0, column), 2.0, smoke), misc.w, misc.w > 3.5));
     o.extra = extra;
     // VSCheckpointProj: EffectPos + ProjMapOffset projected, the rectangle ProjMapBounds about
     // it scaled as the billboards are (gAspectRatio = the projection's x and y scales, set from
@@ -117,6 +135,63 @@ fn vs_particle(
     o.ac = vec4<f32>(arrow_c.xyz, arrow_a.w + arrow_d.w * arrow_c.w);
     o.ad = vec4<f32>(arrow_d.y, arrow_d.z, 0.0, 0.0);
     return o;
+}
+
+// vs_main_SoftPart_VertLit's light (mc4_rmptfx_mainlist; v = (gDiffuse, gAmbient,
+// gAmbientDayControl, gTranslucency) of the rule's shader variables):
+//   gGlobalPtxBrightnessScale (0.55) x (gLightAmbient x lerp(gAmbientDayControl, gAmbient, N)
+//     + gDiffuse x (gLightColor x sat(n.l + T) + the four dynamic lights)),
+// N = sat(4 (|hour / 12 - 1| - 0.25)) (1 at night); a dynamic light: colour x sat(strength / d^2)
+// x sat(dot(to light, axis) / d + cone bias) x sat(n.to light / d + T).
+// The four lights (the effect's render setup sub_82264968 -> the light picker sub_822F5D98, at the
+// effect's cull-sphere centre `ec`): by day none; at night the city lamp grid's four lamps of the
+// cell under it (sub_82303900 - the same table as the city's night programs, render/mod.rs
+// `set_lamps`; full colour, the table holds half), the player's first head lamp in lane 3.
+// gLightAmbient there is the scene's plus the night fill light at the effect (`fill`, particles.rs).
+// (Not ported: the program's RMPTFX fog, c78 .. c81 - 0.1 % a metre at night.)
+fn lamp_term(i: i32, wp: vec3<f32>, n: vec3<f32>, tr: f32) -> vec3<f32> {
+    let at = vec2<i32>((i % 256) * 4, i / 256);
+    let p = textureLoad(t_lamp_data, at, 0);
+    let c = textureLoad(t_lamp_data, at + vec2<i32>(1, 0), 0);
+    let axis = textureLoad(t_lamp_data, at + vec2<i32>(2, 0), 0);
+    let bias = textureLoad(t_lamp_data, at + vec2<i32>(3, 0), 0).x;
+    let d = p.xyz - wp;
+    let inv = inverseSqrt(max(dot(d, d), 1e-6));
+    let dn = d * inv;
+    return c.rgb * 2.0 * clamp(p.w * inv * inv, 0.0, 1.0) * clamp(dot(dn, axis.xyz) * axis.w + bias, 0.0, 1.0) * clamp(dot(n, dn) + tr, 0.0, 1.0);
+}
+
+fn vert_lit(wp: vec3<f32>, n: vec3<f32>, v: vec4<f32>, ec: vec3<f32>, fill: vec3<f32>) -> vec3<f32> {
+    let nf = clamp(4.0 * (abs(g.sun_color.w / 12.0 - 1.0) - 0.25), 0.0, 1.0);
+    let amb = (g.ambient_sky.rgb + fill) * mix(v.z, v.y, nf);
+    var dl = g.sun_color.rgb * g.sun_dir.w * clamp(dot(n, g.sun_dir.xyz) + v.w, 0.0, 1.0);
+    // (night: the hours the night programs run)
+    if (g.tone.w > 0.5) {
+        // (the player's first head lamp: strength 500, the cone sat(4.4696 cos - 2.872))
+        var hl = -1;
+        for (var i = 0; i < i32(min(lights.count.x, 48u)); i = i + 1) {
+            if (hl < 0 && lights.color[i].w > 1.5 && lights.color[i].w < 2.5) {
+                hl = i;
+            }
+        }
+        let uv = ec.xz * vec2<f32>(1.0 / 6320.0, 1.0 / 4463.75) + vec2<f32>(0.5485759, 0.5282554);
+        if (uv.x >= 0.0 && uv.x < 1.0 && uv.y >= 0.0 && uv.y < 1.0) {
+            let cell = textureLoad(t_lamp_grid, vec2<i32>(uv * vec2<f32>(512.0, 640.0)), 0);
+            for (var k = 0; k < select(4, 3, hl >= 0); k = k + 1) {
+                let i = i32(cell[k]);
+                if (i != 0) {
+                    dl = dl + lamp_term(i, wp, n, v.w);
+                }
+            }
+        }
+        if (hl >= 0) {
+            let d = lights.pos_range[hl].xyz - wp;
+            let inv = inverseSqrt(max(dot(d, d), 1e-6));
+            let cone = clamp(dot(d, -lights.dir[hl].xyz * 4.4696) * inv - 2.872, 0.0, 1.0);
+            dl = dl + lights.color[hl].rgb * clamp(500.0 * inv * inv, 0.0, 1.0) * cone * clamp(dot(n, d) * inv + v.w, 0.0, 1.0);
+        }
+    }
+    return 0.55 * (amb + v.x * dl);
 }
 
 // The arrows' 128 x 128 target (sub_82262960), worked out per texel instead of drawn: a camera at
@@ -230,7 +305,7 @@ fn arrow_add(in: VsOut) -> vec3<f32> {
 // map through NearFarPlane) - the particle's clip z (the original's projection: near 0.2, far
 // 6000, clip z = (view depth - 0.2) x f / (f - n)).
 fn soft_fade(in: VsOut) -> f32 {
-    if (in.soft < 0.5) {
+    if (in.soft <= 0.0) {
         return 1.0;
     }
     let px = vec2<i32>(in.clip.xy);
@@ -241,7 +316,7 @@ fn soft_fade(in: VsOut) -> f32 {
     let zs = select(1e6, 1.0 / h.w, abs(h.w) > 1e-9);
     let zp = (in.pc.z - 0.2) * (6000.0 / 5999.8);
     let dd = zs - zp;
-    return clamp(0.1 * dd * dd, 0.0, 1.0);
+    return clamp(in.soft * dd * dd, 0.0, 1.0);
 }
 
 fn tonemap(c: vec3<f32>) -> vec3<f32> {
@@ -255,7 +330,7 @@ fn fs_particle(in: VsOut) -> @location(0) vec4<f32> {
     let t = textureSample(t_sprite, s_sprite, in.uv);
     let t_a = textureSample(t_sprite, s_sprite, in.uva.xy);
     // (the column's PS_Draw: alpha x (1 - 2 |v - 0.5|) squared)
-    if (in.prof.y > 1.5) {
+    if (in.prof.y > 1.5 && in.prof.y < 2.5) {
         // (the checkpoint smoke, mc4_rmptfx_projected's PSCheckpoint: the texture's alpha from
         // frames A and B by the blend, lerp(ShadowColor, colour x boost, it), alpha = sat(2 x it x
         // colour alpha); the projected arrows added on top, unclamped. The output is the scene's
@@ -264,11 +339,18 @@ fn fs_particle(in: VsOut) -> @location(0) vec4<f32> {
         let c = clamp(mix(in.extra.rgb, in.color.rgb * in.extra.w, ta), vec3<f32>(0.0), vec3<f32>(1.0)) + arrow_add(in);
         return vec4<f32>(c, clamp(2.0 * ta * in.color.a, 0.0, 1.0) * soft_fade(in));
     }
+    if (in.prof.y > 4.5) {
+        // (mode 5, mc4_rmptfx_default's PS_Draw: frames A and B by the blend, times the colour;
+        // alpha x the soft fade; the scene's linear value)
+        let tb = mix(t_a, t, clamp(in.uva.z, 0.0, 1.0));
+        return vec4<f32>(tb.rgb * in.color.rgb, tb.a * in.color.a * soft_fade(in));
+    }
     let pr = 1.0 - abs(in.prof.x);
     let a = t.a * in.color.a * mix(1.0, pr * pr, in.prof.y);
     if (in.prof.y > 0.5) {
-        // (the column's PS_Draw takes only the texture's alpha; its colour is the particle's)
-        return vec4<f32>(to_scene(clamp(in.color.rgb, vec3<f32>(0.0), vec3<f32>(1.0))), a);
+        // (the column's PS_Draw takes only the texture's alpha; its colour is the particle's -
+        // the scene's linear value)
+        return vec4<f32>(in.color.rgb, a);
     }
     return vec4<f32>(to_scene(tonemap(t.rgb * in.color.rgb)), a);
 }
@@ -277,5 +359,12 @@ fn fs_particle(in: VsOut) -> @location(0) vec4<f32> {
 @fragment
 fn fs_particle_add(in: VsOut) -> @location(0) vec4<f32> {
     let t = textureSample(t_sprite, s_sprite, in.uv);
+    let t_a = textureSample(t_sprite, s_sprite, in.uva.xy);
+    if (in.prof.y > 3.5) {
+        // (modes 4 and 5 add the scene's linear value, as SRC_ALPHA / ONE: the lit sprite's
+        // ps_main_SoftPart_VertLit takes one frame, mc4_rmptfx_default's PS_Draw blends A and B)
+        let tb = select(t, mix(t_a, t, clamp(in.uva.z, 0.0, 1.0)), in.prof.y > 4.5);
+        return vec4<f32>(tb.rgb * in.color.rgb * (tb.a * in.color.a * soft_fade(in)), 1.0);
+    }
     return vec4<f32>(to_scene(min(t.rgb * in.color.rgb * t.a * in.color.a, vec3<f32>(0.98))), 1.0);
 }

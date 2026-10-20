@@ -727,7 +727,7 @@ impl Gpu {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
                     count: None,
                 },
@@ -773,13 +773,13 @@ impl Gpu {
                 // the night lamp grid (four lamp numbers per cell) and the lamps' data
                 wgpu::BindGroupLayoutEntry {
                     binding: 7,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Uint, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 8,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
                     count: None,
                 },
