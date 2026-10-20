@@ -61,7 +61,7 @@ support/           crate `mcla-support` (no Tauri): `redact` (user / machine nam
 src/update.rs      Tauri commands of the update system (status poll, check, update now, game setup, release list, specific version, local package, open_url) over `mcla-updater`; the run state
 updater/           crate `mcla-updater` (no Tauri): manifest.json + validator, GitHub Releases client + cache, notes renderer, plan, game package, self-update, save backup;
                    `src/bin/mk_manifest.rs` (makes a release's manifest), `tests/` (mock server + integration tests), `examples/` (mock GitHub server, fixture builder, static server)
-release.json       the repository (`holdmysocks/rusty-mcla`, private until the project is made public), API base, host allow-list: the one place to change it
+release.json       the repository (`holdmysocks/rusty-mcla`, public), API base, host allow-list: the one place to change it
 update-key.pub     the minisign public key of the launcher signature (placeholder until the real key exists)      manifest.example.json  a sample release manifest
 src/settings.rs    %LOCALAPPDATA%\RustyMCLA\launcher.json: versioned, unknown keys kept, atomic write, bad file moved aside
 src/logging.rs     %LOCALAPPDATA%\RustyMCLA\logs\launcher-<time>.log, newest 10 kept
