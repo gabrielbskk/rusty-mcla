@@ -190,6 +190,10 @@ pub struct Sky {
     pub fog_max: Track,
     pub fog_near: Track,
     pub fog_far: Track,
+    /// `sm_KeyMinFogColor...`, `sm_KeyFogHeight...`: the particles' fog only (RMPTFX_FogMinColor,
+    /// RMPTFX_FogParams.x - mc4_rmptfx_mainlist's vertex programs)
+    pub fog_min: Track,
+    pub fog_height: Track,
     pub sky_color: Track,
     pub azimuth: Track,
     pub azimuth2: Track,
@@ -260,6 +264,10 @@ pub struct Tod {
     pub fog_color: [f32; 4],
     pub fog_near: f32,
     pub fog_far: f32,
+    /// the particles' fog: the colour at the fog's height (rgb as keyed; the max colour is
+    /// `fog_color`) and that height (m)
+    pub fog_min: [f32; 4],
+    pub fog_height: f32,
 }
 
 impl Tod {
@@ -288,6 +296,8 @@ impl Tod {
         arr(&self.fog_color, &o.fog_color, &mut t.fog_color);
         t.fog_near = m(self.fog_near, o.fog_near);
         t.fog_far = m(self.fog_far, o.fog_far);
+        arr(&self.fog_min, &o.fog_min, &mut t.fog_min);
+        t.fog_height = m(self.fog_height, o.fog_height);
         t
     }
 }
@@ -458,6 +468,8 @@ impl Sky {
             s.fog_max = one("MaxFogColor");
             s.fog_near = one("FogNearZ");
             s.fog_far = one("FogFarZ");
+            s.fog_min = one("MinFogColor");
+            s.fog_height = one("FogHeight");
         }
         if let Some(x) = read(weather.sky_file()) {
             let first = |n: &str| tracks(&x, n).into_iter().next().unwrap_or_default();
@@ -696,6 +708,8 @@ impl Sky {
             fog_color: fog,
             fog_near: if self.fog_near.keys.is_empty() { 50.0 } else { self.fog_near.sample(t)[0] },
             fog_far: if self.fog_far.keys.is_empty() { 500.0 } else { self.fog_far.sample(t)[0] },
+            fog_min: if self.fog_min.keys.is_empty() { [0.0; 4] } else { self.fog_min.sample(t) },
+            fog_height: if self.fog_height.keys.is_empty() { 1000.0 } else { self.fog_height.sample(t)[0] },
         })
     }
 }

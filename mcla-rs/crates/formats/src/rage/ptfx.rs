@@ -716,6 +716,11 @@ pub struct EffectRule {
     /// time): scales every particle's size and the emitter / velocity domains with the event's
     /// zoom (`sub_824B1058` 0x824B13AC -> instance +500; `sub_824BB3E8` 0x824BB670)
     pub zoom: Keyframe,
+    /// +0x180 / +0x148: the cull sphere's centre offset in the effect's frame and its radius
+    /// (`sub_824C1B08`: centre = effect matrix x offset x scale, radius x scale, 1 when <= 0) -
+    /// the lit sprites' light picker works at its centre
+    pub cull_offset: [f32; 3],
+    pub cull_radius: f32,
     pub events: Vec<Event>,
     /// +100 -> `PtxEvoGroup`: the effect's evolutions by name (the instance keeps a value for
     /// each, `sub_8247A6A0`; "LOD" is set from the camera's distance, `sub_824B1058`)
@@ -762,7 +767,7 @@ impl FxList {
                     events.push(Event { time: rd.f32(e + 0x08), cap: rd.u32(e + 0x18) as i32, kind, evo: rd.ptr(e + 0x0c).map(|g| EvoGroup::parse(&rd, g)) });
                 }
             }
-            effects.push(EffectRule { name: rd.cstr_ptr(o + 0xf8).unwrap_or_default(), duration: [rd.f32(o + 0x15c), rd.f32(o + 0x160)], time_scalar: [rd.f32(o + 0x164), rd.f32(o + 0x168)], pre_update: rd.f32(tl + 0x08), num_loops: rd.u32(tl + 0x0c) as i32, cull_distance: rd.f32(o + 0x14c), fade_distance: rd.f32(o + 0x144), lod_near: rd.f32(o + 0x150), lod_far: rd.f32(o + 0x154), zoom: Keyframe::parse(&rd, o + 0x58), events, evo_names: rd.ptr(o + 0x100).map(|g| EvoGroup::parse(&rd, g).names).unwrap_or_default() });
+            effects.push(EffectRule { name: rd.cstr_ptr(o + 0xf8).unwrap_or_default(), duration: [rd.f32(o + 0x15c), rd.f32(o + 0x160)], time_scalar: [rd.f32(o + 0x164), rd.f32(o + 0x168)], pre_update: rd.f32(tl + 0x08), num_loops: rd.u32(tl + 0x0c) as i32, cull_distance: rd.f32(o + 0x14c), fade_distance: rd.f32(o + 0x144), lod_near: rd.f32(o + 0x150), lod_far: rd.f32(o + 0x154), zoom: Keyframe::parse(&rd, o + 0x58), cull_offset: [rd.f32(o + 0x180), rd.f32(o + 0x184), rd.f32(o + 0x188)], cull_radius: rd.f32(o + 0x148), events, evo_names: rd.ptr(o + 0x100).map(|g| EvoGroup::parse(&rd, g).names).unwrap_or_default() });
         }
         Ok(FxList { effects, emit_rules, particle_rules, effect_hashes: df.hashes.clone() })
     }

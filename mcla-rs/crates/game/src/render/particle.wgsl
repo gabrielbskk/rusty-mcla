@@ -116,7 +116,7 @@ fn vs_particle(
         // misc.w 4: mc4_rmptfx_mainlist's vs_main_SoftPart_VertLit - the vertex's normal is its
         // turned corner in the camera's plane plus (gNormalArc + 0.1) towards the camera
         let nrm = normalize(right * r.x + up * r.y + to_cam * (arrow_a.x + 0.1));
-        o.color = vec4<f32>(color.rgb * vert_lit(wp, nrm, extra, arrow_b.xyz, arrow_c.xyz), color.a);
+        o.color = vec4<f32>(color.rgb * ptx_fog(vert_lit(wp, nrm, extra, arrow_b.xyz, arrow_c.xyz), wp, arrow_d, arrow_c.w), color.a);
     }
     o.prof = vec2<f32>(corner.y, select(select(select(0.0, 1.0, column), 2.0, smoke), misc.w, misc.w > 3.5));
     o.extra = extra;
@@ -148,7 +148,6 @@ fn vs_particle(
 // cell under it (sub_82303900 - the same table as the city's night programs, render/mod.rs
 // `set_lamps`; full colour, the table holds half), the player's first head lamp in lane 3.
 // gLightAmbient there is the scene's plus the night fill light at the effect (`fill`, particles.rs).
-// (Not ported: the program's RMPTFX fog, c78 .. c81 - 0.1 % a metre at night.)
 fn lamp_term(i: i32, wp: vec3<f32>, n: vec3<f32>, tr: f32) -> vec3<f32> {
     let at = vec2<i32>((i % 256) * 4, i / 256);
     let p = textureLoad(t_lamp_data, at, 0);
@@ -161,12 +160,38 @@ fn lamp_term(i: i32, wp: vec3<f32>, n: vec3<f32>, tr: f32) -> vec3<f32> {
     return c.rgb * 2.0 * clamp(p.w * inv * inv, 0.0, 1.0) * clamp(dot(dn, axis.xyz) * axis.w + bias, 0.0, 1.0) * clamp(dot(n, dn) + tr, 0.0, 1.0);
 }
 
+// The same program's fog (RMPTFX_FogParams c79 = (height H, -, near, far), FogParams2 c78 = (1 / H,
+// 0, 1 / (far - near), -near / (far - near)), FogMaxColor c80 = the fog pass's colour and alpha,
+// FogMinColor c81 = `mn`): the share f of the ray from the vertex up to the camera below H, the
+// heights of its two ends seen through it, the colour between the min (at H) and the max
+// (on the ground) by them, its alpha x sat((d - near) / (far - near)) the amount towards it.
+fn ptx_fog(lit: vec3<f32>, wp: vec3<f32>, mn: vec4<f32>, hgt: f32) -> vec3<f32> {
+    let dy = wp.y - g.cam_pos.y;
+    let dh = wp.xz - g.cam_pos.xz;
+    let d = sqrt(dy * dy + dot(dh, dh));
+    var r2 = vec2<f32>(1.0, 0.0);
+    if (wp.y < hgt) {
+        let f = clamp((hgt - wp.y) / (g.cam_pos.y - wp.y), 0.0, 1.0);
+        r2 = vec2<f32>(1.0 - f, f);
+    }
+    let hw = 0.5 * r2.y;
+    let h1 = clamp((dy * r2.x + wp.y) / hgt, 0.0, 1.0);
+    let h2 = clamp((dy * r2.y + wp.y) / hgt, 0.0, 1.0);
+    let a = hw * (h1 + h2) + r2.x;
+    let b = hw * ((1.0 - h1) + (1.0 - h2));
+    let fc = mn * a + g.fog_color * b;
+    let amount = clamp(fc.a * clamp((d - g.params.x) / max(g.params.y - g.params.x, 0.001), 0.0, 1.0), 0.0, 1.0);
+    return mix(lit, fc.rgb, amount);
+}
+
 fn vert_lit(wp: vec3<f32>, n: vec3<f32>, v: vec4<f32>, ec: vec3<f32>, fill: vec3<f32>) -> vec3<f32> {
     let nf = clamp(4.0 * (abs(g.sun_color.w / 12.0 - 1.0) - 0.25), 0.0, 1.0);
     let amb = (g.ambient_sky.rgb + fill) * mix(v.z, v.y, nf);
     var dl = g.sun_color.rgb * g.sun_dir.w * clamp(dot(n, g.sun_dir.xyz) + v.w, 0.0, 1.0);
-    // (night: the hours the night programs run)
-    if (g.tone.w > 0.5) {
+    // (night: the light picker's own test - after 18:00 or before 06:00 (obj +14568 / +14564, read
+    // live: 18, 6); its third case, the interior flag the garage scenes set (`sub_82304648`),
+    // has no lit particle to apply to)
+    if (g.sun_color.w > 18.0 || g.sun_color.w < 6.0) {
         // (the player's first head lamp: strength 500, the cone sat(4.4696 cos - 2.872))
         var hl = -1;
         for (var i = 0; i < i32(min(lights.count.x, 48u)); i = i + 1) {

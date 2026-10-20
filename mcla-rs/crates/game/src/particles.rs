@@ -235,6 +235,8 @@ pub struct Particles {
     pub wind: Vec3,
     /// the clock (hours): the checkpoint smoke's night boost
     pub hour: f32,
+    /// the lit sprites' fog: RMPTFX_FogMinColor rgba and RMPTFX_FogParams.x (the height)
+    pub fog_min: [f32; 5],
     /// the projected arrows' 128 x 128 target this frame: its quad's two turns and which
     /// `checkpoint_arrows_anim_*` it shows (`checkpoints::Markers::update`)
     pub arrow_rt: [f32; 3],
@@ -323,6 +325,7 @@ impl Particles {
             standin: std::env::var("MCLA_FX_STANDIN").map_or(false, |v| v == "1"),
             wind: Vec3::new(1.5, 0.0, 0.8),
             hour: 12.0,
+            fog_min: [0.0, 0.0, 0.0, 0.0, 1000.0],
             arrow_rt: [0.0, std::f32::consts::PI, 1.0],
             clock: 0.0,
         }
@@ -1007,9 +1010,12 @@ impl Particles {
             let mut inst: HashMap<u32, (f32, [f32; 4])> = HashMap::new();
             // (and where it stands, with its render setup's EffectPos.w)
             let mut inst_at: HashMap<u32, (Vec3, bool)> = HashMap::new();
+            // (and its cull sphere's centre offset, turned with it: `sub_824C1B08`)
+            let mut inst_cull: HashMap<u32, Vec3> = HashMap::new();
             for e in &self.effects {
                 inst.insert(e.id, (e.alpha, e.evo));
                 inst_at.insert(e.id, (e.pos, e.arrow));
+                inst_cull.insert(e.id, e.rot * Vec3::from(fx.effects[e.effect].cull_offset));
             }
             for p in &self.rule_list {
                 let pr = &fx.particle_rules[p.rule as usize];
@@ -1121,16 +1127,20 @@ impl Particles {
                     arrow_d = [self.arrow_rt[2], tile, self.clock * rate, night];
                 }
                 if mode == 4.0 {
-                    // (x: gNormalArc; arrow_b xyz: the effect's place - the light picker's position)
+                    // (x: gNormalArc; arrow_b xyz: the light picker's position - the effect's cull
+                    // sphere centre, its place + the rule's offset x the event's and the effect's
+                    // zoom, from the frame before; checkpoint_ctf_generic: 68 m straight up)
                     arrow_a[0] = normal_arc;
-                    let at = inst_at.get(&p.inst).map_or(p.pos, |e| e.0);
+                    let at = inst_at.get(&p.inst).map_or(p.pos, |e| e.0) + inst_cull.get(&p.inst).copied().unwrap_or(Vec3::ZERO) * p.zoom;
                     arrow_b = [at.x, at.y, at.z, 0.0];
                     // (arrow_c rgb: what the picker adds to gLightAmbient there - the night fill
                     // light, map / 255 x 0.25 x m_NFLFade, as for the traffic cars, not cut to bytes;
                     // recorded c26 (0.2255, 0.2382, 0.2363) = (0.0353, 0.0510, 0.0588) + (0.1902,
                     // 0.1873, 0.1775) at checkpoint 0 of AROUND HOLLYWOOD, 01:06)
                     let f = crate::fillmap::body_now(at.x, at.z);
-                    arrow_c = [f[0], f[1], f[2], 0.0];
+                    arrow_c = [f[0], f[1], f[2], self.fog_min[4]];
+                    // (arrow_d: the fog's colour at its height; arrow_c.w the height)
+                    arrow_d = [self.fog_min[0], self.fog_min[1], self.fog_min[2], self.fog_min[3]];
                 }
                 items.push((card.sheet as u32, p.pos.distance_squared(cam), PInst { pos_size: [p.pos.x, p.pos.y, p.pos.z, h], color: [c.x, c.y, c.z, alpha], uv, misc: [rot, w / h, 1.0, lit], extra, arrow_a, arrow_b, arrow_c, arrow_d, uv2 }));
             }

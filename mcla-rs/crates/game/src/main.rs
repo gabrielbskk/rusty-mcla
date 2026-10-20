@@ -6517,6 +6517,12 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
         }
         // (the plants' impostor pictures that are due this frame - props/impostor.rs)
         self.props.update_impostors(&gpu, &mut enc, &globals);
+        // (the particles' fog: RMPTFX_FogMinColor = sm_KeyMinFogColor x the light factor the
+        // fog pass's colour takes, RMPTFX_FogParams.x = sm_KeyFogHeight - recorded c81 / c79)
+        self.fx.fog_min = self.sky_now().tod.map_or([0.0, 0.0, 0.0, 0.0, 1000.0], |d| {
+            let k = (d.light + d.ambient).lerp(Vec3::ONE, d.light_w);
+            [d.fog_min[0] * k.x, d.fog_min[1] * k.y, d.fog_min[2] * k.z, d.fog_min[3], d.fog_height]
+        });
         self.fx.prepare(&gpu, self.cam.pos);
         // (the rain and the lamps' cones in it, as the original draws them - rain.rs)
         rain::prepare(&gpu, &rain::Frame { cam_pos: globals.cam_pos, inv_view_proj: globals.inv_view_proj, rain: self.rain_amount(), light: self.sky_now().tod.map(|t| (t.light + t.ambient, t.nfl)), car: self.vehicles.player().filter(|_| self.drive).map(|c| c.render_pose(self.vehicles.render_alpha).pos), lamps: &self.props.prop_lamps, weather: match self.weather { sky::Weather::Cloudy => 1, sky::Weather::Stormy => 2, sky::Weather::Foggy => 3, _ => 0 }, hour: self.time_of_day, collider: Some(&world.collider) });

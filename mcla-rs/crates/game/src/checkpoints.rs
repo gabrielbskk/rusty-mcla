@@ -897,6 +897,8 @@ mod tests {
         // (mode 5), the column its own mode)
         let mode = |n: &str| { let r = fx.particle_rules.iter().find(|r| r.name == n).unwrap(); crate::particles::sprite_mode(r.sprite.as_ref().unwrap(), r.render.blend_set) };
         assert_eq!((mode("cp_flare_fire"), mode("checkpoint_sparks"), mode("light_column")), (4.0, 5.0, 0.0));
+        // (its cull sphere - the lit sprites' light picker works at its centre: 68 m straight up, x zoom)
+        assert_eq!((e.cull_offset, e.cull_radius), ([0.0, 68.0, 0.0], 72.0));
     }
 
     #[test]
