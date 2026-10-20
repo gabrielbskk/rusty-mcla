@@ -30,6 +30,13 @@ pub struct Link {
     pub len: f32,
     pub flags: u32,
     pub zone: Option<usize>,
+    /// the owner object's (road section or junction) flags word +04 and word +10: the
+    /// ambient traffic's rail speed reads them (sub_82245A28: 0x10 or 0x20 with +10 == 0
+    /// 15 mph, 0x20 10 mph, 0x40 6 mph, else the road's limit)
+    pub owner_flags: u32,
+    pub owner_w10: u32,
+    /// the owner's speed word +94 (m/s; a road section's limit, 0 = the default)
+    pub owner_speed: f32,
     /// index of the lane this segment belongs to
     pub lane: usize,
     /// links that start where this one ends
@@ -77,6 +84,14 @@ pub struct Zone {
     pub name: String,
     /// Authored road speed in m/s; zero selects the engine's default (40 mph).
     pub speed_limit: f32,
+    /// the road's rectangle as the traffic spawner tests it (mcRnRoadAmbient +3c width, +40
+    /// length, +50 centre, +60 direction: sub_826F4E90 / sub_8261B200)
+    pub width: f32,
+    pub rect_len: f32,
+    pub mid: Vec3,
+    pub dir: Vec3,
+    /// the road's traffic density index from data (+98; -1: the default, 3)
+    pub density: i32,
 }
 
 pub const DEFAULT_ROAD_SPEED: f32 = 40.0 * 0.44704;
@@ -130,6 +145,7 @@ struct RawLane {
     len: f32,
     flags: u32,
     zone: Option<usize>,
+    owner: (u32, u32, f32),
 }
 
 impl NavSys {
@@ -187,13 +203,18 @@ impl NavSys {
             if pts.is_empty() {
                 pts.push(min);
             }
-            raw.push(RawLane { pts, min, max, len: rd.f32(lo + 0xc), flags: rd.u32(lo + 4), zone: rd.ptr(lo + 8).and_then(zone_index) });
+            raw.push(RawLane { pts, min, max, len: rd.f32(lo + 0xc), flags: rd.u32(lo + 4), zone: rd.ptr(lo + 8).and_then(zone_index), owner: rd.ptr(lo + 8).filter(|&o| rd.has(o, 0x98)).map_or((0, 0, 0.0), |o| (rd.u32(o + 4), rd.u32(o + 0x10), rd.f32(o + 0x94))) });
         }
         let link_index = |off: usize| link_offs.binary_search(&off).ok();
         let mut zone_lanes: Vec<Vec<usize>> = Vec::new();
         for &zo in &zone_offs {
             let mut z = Zone { length: rd.f32(zo + 0x1c), center: Vec3::new(rd.f32(zo + 0x24), rd.f32(zo + 0x28), rd.f32(zo + 0x2c)), radius: rd.f32(zo + 0x30), ..Default::default() };
             z.speed_limit = rd.f32(zo + 0x94);
+            z.width = rd.f32(zo + 0x3c);
+            z.rect_len = rd.f32(zo + 0x40);
+            z.mid = Vec3::new(rd.f32(zo + 0x50), rd.f32(zo + 0x54), rd.f32(zo + 0x58));
+            z.dir = Vec3::new(rd.f32(zo + 0x60), rd.f32(zo + 0x64), rd.f32(zo + 0x68));
+            z.density = rd.u32(zo + 0x98) as i32;
             if let Some(np) = rd.ptr(zo + 0x90) {
                 let s = rd.cstr(np);
                 if s.len() < 64 && s.bytes().all(|b| (0x20..0x7f).contains(&b)) {
@@ -335,7 +356,7 @@ impl NavSys {
             first[i] = links.len();
             for w in l.pts.windows(2) {
                 let k = links.len();
-                links.push(Link { a: w[0], b: w[1], len: w[0].distance(w[1]).max(0.01), flags: l.flags, zone: l.zone, lane: i, next: vec![k + 1], prev: Vec::new(), side: Vec::new(), opp: Vec::new(), back: Vec::new(), hop: Vec::new(), hop_a: Vec::new(), node_a: 0, node_b: 0 });
+                links.push(Link { a: w[0], b: w[1], len: w[0].distance(w[1]).max(0.01), flags: l.flags, zone: l.zone, owner_flags: l.owner.0, owner_w10: l.owner.1, owner_speed: l.owner.2, lane: i, next: vec![k + 1], prev: Vec::new(), side: Vec::new(), opp: Vec::new(), back: Vec::new(), hop: Vec::new(), hop_a: Vec::new(), node_a: 0, node_b: 0 });
             }
             lastl[i] = links.len() - 1;
         }
@@ -1083,6 +1104,34 @@ mod speed_tests {
         assert_eq!(census.into_iter().collect::<Vec<_>>(), vec![(10, 1), (15, 3), (25, 1), (30, 133), (40, 646), (45, 356), (55, 37), (60, 2), (65, 484)]);
         assert!(nav.links.iter().enumerate().any(|(i, _)| nav.speed_limit_mps(i).is_some_and(|s| s > 29.0)));
     }
+
+    #[test]
+    #[ignore = "requires user's extracted Complete Edition data; set MCLA_DATA_DIR"]
+    fn complete_edition_lane_owner_flags() {
+        let root = std::env::var("MCLA_DATA_DIR").expect("set MCLA_DATA_DIR to extracted/cache");
+        let bytes = std::fs::read(std::path::Path::new(&root).join("resources/city/sc/0x9960fcd8.r66")).unwrap();
+        let data = bytes[16..].to_vec();
+        let virtual_size = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        let res = Resource { rtype: 66, flags: 0, virtual_size, physical_size: data.len() - virtual_size, data };
+        let nav = NavSys::parse(&res).unwrap();
+        let mut census = std::collections::BTreeMap::new();
+        for l in &nav.links {
+            *census.entry((l.zone.is_some(), l.owner_flags, (l.owner_w10 != 0) as u8)).or_insert(0usize) += 1;
+        }
+        // roads 0x2, intersections 0x4, the junctions' connector lanes 0x10 / 0x20
+        assert_eq!(census.into_iter().collect::<Vec<_>>(), vec![((false, 4, 1), 5060), ((false, 16, 0), 2693), ((false, 16, 1), 928), ((false, 32, 0), 1981), ((false, 32, 1), 1117), ((true, 2, 1), 23480)]);
+        // the roads' rectangles for the traffic spawner: unit directions, density indices
+        // -1 (the default) / 2 / 3 / 5
+        let odd: Vec<_> = nav.zones.iter().filter(|z| !((z.dir.length() - 1.0).abs() < 0.01 && z.width > 0.0 && z.rect_len > 0.0)).map(|z| (z.dir, z.width, z.rect_len, z.mid)).collect();
+        // (43 roads carry no rectangle at all)
+        assert!(odd.len() == 43 && odd.iter().all(|o| o.1 == 0.0 && o.2 == 0.0), "{} odd: {:?}", odd.len(), &odd[..odd.len().min(5)]);
+        let mut dens = std::collections::BTreeMap::new();
+        for z in &nav.zones {
+            *dens.entry(z.density).or_insert(0usize) += 1;
+        }
+        assert_eq!(dens.into_iter().collect::<Vec<_>>(), vec![(-1, 756), (2, 140), (3, 516), (5, 251)]);
+        assert_eq!(parse_intersections(&res).len(), 351);
+    }
 }
 
 /// A signalled junction of the road network (file class 0x47a0c4, the game's
@@ -1095,6 +1144,26 @@ pub struct NavJunction {
     pub center: glam::Vec3,
     pub arms: Vec<glam::Vec3>,
     pub half: [f32; 2],
+}
+
+/// Every junction as the traffic spawner weighs it (`mcRnIntersectionAmbient`): centre (+80),
+/// its weight (+1c: lane length, times 0.01 x the density value) and its reach (+40).
+pub fn parse_intersections(res: &crate::rsc::Resource) -> Vec<(glam::Vec3, f32, f32)> {
+    let rd = super::Rd::new(res);
+    let mut out = Vec::new();
+    let Some(arr) = rd.ptr(0x58) else { return out };
+    let n = (rd.u32(0xc8) as usize).min(4096);
+    for i in 0..n {
+        let o = arr + i * 0xc0;
+        if !rd.has(o, 0xc0) || rd.vtable(o) != 0x0047_a0c4 {
+            continue;
+        }
+        let c = glam::Vec3::new(rd.f32(o + 0x80), rd.f32(o + 0x84), rd.f32(o + 0x88));
+        if c.is_finite() {
+            out.push((c, rd.f32(o + 0x1c), rd.f32(o + 0x40)));
+        }
+    }
+    out
 }
 
 /// The junctions that have arms (339 of the 351 in the file).

@@ -12,6 +12,9 @@ use std::path::Path;
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
+#[path = "traffic.rs"]
+pub mod traffic;
+
 /// The glow table's kind of a `glow<name>0` bone of a car part's skeleton (every bone of that name
 /// is the place of one glow of the kind): 0 brake, 1 tail, 2 signal, 3 head, 4 high beam,
 /// 6 reversing, 8 fog, 12 third brake.
@@ -267,6 +270,8 @@ pub struct CarInstance {
     pub window_bindings: Vec<ObjectBinding>,
     /// the side windows' controllers (left, right)
     pub windows: [WindowCtl; 2],
+    /// ambient traffic riding its lane as the original's (traffic.rs; None: driven by the physics)
+    pub rail: Option<traffic::Rider>,
 }
 
 /// A side window's controller as the original's (vtable 0x82046958; open sub_8233C3B8, close
@@ -410,6 +415,10 @@ pub struct Vehicles {
     pub road_density: std::collections::HashMap<usize, i32>,
     pub spawn_timer: f32,
     pub rng: u32,
+    /// the traffic types' driving values (`mcAmbientType.xml`), by model name
+    pub amb_types: hashbrown::HashMap<String, traffic::AmbType>,
+    /// the original's traffic spawner (traffic.rs; made with the road network)
+    pub spawner: Option<traffic::Spawner>,
     /// a scene or the vehicle pick: physics and AI are held
     pub frozen: bool,
     /// the race's grid hold (N-VP-1): seconds to GO. The cars simulate, held by their brakes - the
@@ -1559,7 +1568,7 @@ impl Vehicles {
             d.target_speed = 17.88 * (0.86 + self.rand() * 0.14);
             ai = Some(d);
         }
-        self.cars.push(CarInstance { sst: 0.0, model, binding, wheel_bindings, caliper_bindings, state: CarState::new(pos, yaw), input: CarInput::default(), color, ai, placed: false, is_player, wheels: None, lean: 0.0, perf: 0.0, tuned: None, cop: false, stunned: 0.0, parked: None, settle: 0.0, racer: false, pinned: false, boost: 0.0, driver: String::new(), plate_text: String::new(), plate: None, vinyl_name: String::new(), vinyl: None, vinyl_done: false, setup: None, pose_history: Default::default(), inflict: 1.0, goon: false, look: None, brake: None, dressed: false, driver_set: String::new(), pu_ctl: 0, pu_ghost: false, pu_mirror: 0.0, pu_stealth: false, window_bindings, windows: Default::default() });
+        self.cars.push(CarInstance { sst: 0.0, model, binding, wheel_bindings, caliper_bindings, state: CarState::new(pos, yaw), input: CarInput::default(), color, ai, placed: false, is_player, wheels: None, lean: 0.0, perf: 0.0, tuned: None, cop: false, stunned: 0.0, parked: None, settle: 0.0, racer: false, pinned: false, boost: 0.0, driver: String::new(), plate_text: String::new(), plate: None, vinyl_name: String::new(), vinyl: None, vinyl_done: false, setup: None, pose_history: Default::default(), inflict: 1.0, goon: false, look: None, brake: None, dressed: false, driver_set: String::new(), pu_ctl: 0, pu_ghost: false, pu_mirror: 0.0, pu_stealth: false, window_bindings, windows: Default::default(), rail: None });
         self.cars.len() - 1
     }
 
@@ -1652,6 +1661,11 @@ if keep || c.state.pos.distance(center) < 450.0 {
 
     /// Keep `traffic_target` AI cars alive around `center`.
     pub fn manage_traffic(&mut self, gpu: &Gpu, world: &World, center: Vec3, dt: f32) {
+        // with the road network: the original's spawner and unspawner (traffic.rs)
+        if world.nav.is_some() {
+            self.spawn_traffic(gpu, world, center, dt);
+            return;
+        }
         // despawn far cars
         self.cars.retain(|c| c.is_player || c.pinned || c.parked.is_some() || c.state.pos.distance(center) < 420.0);
         self.spawn_timer -= dt;
@@ -1724,6 +1738,11 @@ if keep || c.state.pos.distance(center) < 450.0 {
             TRAFFIC_PALETTE[(self.rand() * TRAFFIC_PALETTE.len() as f32) as usize % TRAFFIC_PALETTE.len()]
         };
         let idx = self.spawn(gpu, model, pos, yaw, color, false);
+        // it rides its lane as the original's traffic (traffic.rs)
+        let name = self.cars[idx].model.name.clone();
+        let ty = *self.amb_types.entry(name.clone()).or_insert_with(|| traffic::AmbType::load(&world.assets.root, &name));
+        let seed = (self.rand() * 16777216.0) as u32 | 1;
+        self.cars[idx].rail = Some(traffic::Rider::new(nav, ty, li, t * nav.links[li].len, seed));
         if std::env::var("MCLA_SPAWN_DUMP").is_ok() {
             log::info!("traffic spawn: link dir {:?} car forward {:?} dot {:.2}", dir, self.cars[idx].state.forward(), dir.dot(self.cars[idx].state.forward()));
         }
@@ -2116,6 +2135,10 @@ if keep || c.state.pos.distance(center) < 450.0 {
         // AI inputs (with simple car-ahead avoidance)
         let positions: Vec<(Vec3, Vec3, f32)> = self.cars.iter().map(|c| (c.state.pos, c.state.forward(), c.state.speed())).collect();
         for i in 0..n {
+            // (traffic riding its lane has no pedals: traffic.rs)
+            if self.cars[i].rail.as_ref().is_some_and(|r| !r.physical) {
+                continue;
+            }
             let (pos, fwd, _) = positions[i];
             let st = self.cars[i].state.clone();
             let mut input = if self.cars[i].parked.is_some() {
@@ -2423,7 +2446,13 @@ if keep || c.state.pos.distance(center) < 450.0 {
             crate::powerups::apply_ctl(&mut input, self.cars[i].pu_ctl);
             self.cars[i].input = CarInput { ai: input.ai || !self.cars[i].is_player, ..input };
         }
+        if let Some(nav) = world.nav.as_ref() {
+            self.ride_traffic(nav, &world.collider, dt.min(1.0 / 30.0));
+        }
         for c in self.cars.iter_mut() {
+            if c.rail.as_ref().is_some_and(|r| !r.physical) {
+                continue;
+            }
             if let Some((p, yaw)) = c.ai.as_mut().and_then(|a| a.reset_to.take()) {
                 c.state = CarState::new(p, yaw);
                 c.pose_history.reset();
@@ -2536,6 +2565,18 @@ if keep || c.state.pos.distance(center) < 450.0 {
                 let dist = d.length();
                 if dist < r && dist > 1e-3 {
                     let nrm = d / dist;
+                    // traffic riding its lane: two of them never meet (each keeps its gap); met
+                    // by anything else but a parked car it turns physical (traffic.rs)
+                    let riding = |c: &CarInstance| c.rail.as_ref().is_some_and(|r| !r.physical);
+                    let (ki, kj) = (riding(&self.cars[i]), riding(&self.cars[j]));
+                    if (ki && kj) || ((ki || kj) && (self.cars[i].parked.is_some() || self.cars[j].parked.is_some())) {
+                        continue;
+                    }
+                    for (k, kin) in [(i, ki), (j, kj)] {
+                        if kin {
+                            self.let_go(k, world);
+                        }
+                    }
                     let (pi, pj) = (self.cars[i].parked.is_some(), self.cars[j].parked.is_some());
                     if pi && pj {
                         continue;
