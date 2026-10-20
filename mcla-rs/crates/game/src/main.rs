@@ -32,6 +32,7 @@ mod fixed_step;
 mod vehicle_pose;
 mod video;
 mod cine;
+mod damageparts;
 mod cutscene;
 mod drivers;
 mod game;

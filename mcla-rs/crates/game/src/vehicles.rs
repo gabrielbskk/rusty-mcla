@@ -73,10 +73,16 @@ pub struct CarModel {
     /// extra garage rows with a placed fragment on this car
     pub extra_variants: std::collections::HashSet<(String, usize)>,
     /// per batch: 0, or 1 / 2 for the left / right side window's glass (drawn with the car's
-    /// window object, `CarInstance::window_bindings`)
+    /// window object, `CarInstance::window_bindings`), 3 hood, 4 trunk lid, 5 rear bumper, 6 front
+    /// bumper and intercooler (drawn with the car's part objects, `CarInstance::part_bindings`)
     pub batch_window: Vec<u8>,
     /// the side windows' clips (left, right), where the base fragment has them
     pub windows: [Option<vehicle_model::WindowClip>; 2],
+    /// the moving damage parts (`damageparts.rs`): the car's movement settings and bumper slot bones, and the bones
+    /// the hood (slot "hood", tag 33332) and the trunk lid (`trunk_0`) turn about, in car space
+    pub part_rig: crate::damageparts::PartRig,
+    pub hood_slot: Option<Mat4>,
+    pub trunk_bone: Option<Mat4>,
 }
 
 pub struct WheelModel {
@@ -270,6 +276,9 @@ pub struct CarInstance {
     pub window_bindings: Vec<ObjectBinding>,
     /// the side windows' controllers (left, right)
     pub windows: [WindowCtl; 2],
+    /// the moving damage parts' objects (hood, trunk lid, rear bumper, front bumper): the body's, moved by
+    /// the part; empty when the model has none of them
+    pub part_bindings: Vec<ObjectBinding>,
     /// ambient traffic riding its lane as the original's (traffic.rs; None: driven by the physics)
     pub rail: Option<traffic::Rider>,
 }
@@ -984,6 +993,56 @@ impl Vehicles {
         let hide_part = std::env::var("MCLA_HIDE_PART").ok();
         let lamp_dump = std::env::var("MCLA_LAMP_DUMP").is_ok();
         let mut glow_bones: Vec<(u8, Vec3, Vec3)> = Vec::new();
+        // (the moving damage parts, DAMAGE_PARTS_RULE.md 1.4 / 2.3: the slot pass moves the parts of the slots
+        // hood / hood_wide (2, 40), bumper_r (3), intercooler and bumper_f (5, 6); the trunk_0 bone turns with
+        // whatever hangs on it - the base fragment's meshes bound to it or to its children, the parts placed there)
+        let sk = car.skeleton.as_ref();
+        let bone_world = |tag: u16| sk.and_then(|s| s.bone_by_tag(tag).map(|i| s.bones[i].world));
+        let trunk_i = sk.and_then(|s| s.bones.iter().position(|b| b.name.eq_ignore_ascii_case("trunk_0")).or_else(|| s.bone_by_tag(33531)));
+        let trunk_set: Vec<usize> = match (sk, trunk_i) {
+            (Some(s), Some(t)) => (0..s.bones.len()).filter(|&i| {
+                let mut j = i;
+                for _ in 0..64 {
+                    if j == t {
+                        return true;
+                    }
+                    if j >= s.bones.len() || s.bones[j].parent == j {
+                        return false;
+                    }
+                    j = s.bones[j].parent;
+                }
+                false
+            }).collect(),
+            _ => Vec::new(),
+        };
+        let trunk_tags: Vec<u16> = trunk_set.iter().filter_map(|&i| sk.map(|s| s.bones[i].tag)).filter(|t| *t != 0).collect();
+        let trunk_worlds: Vec<Mat4> = trunk_set.iter().filter_map(|&i| sk.map(|s| s.bones[i].world)).collect();
+        let hood_slot = bone_world(vehicle_model::slot_tag(Slot::Hood).unwrap_or(0));
+        let trunk_bone = trunk_i.and_then(|i| sk.map(|s| s.bones[i].world));
+        let part_rig = crate::damageparts::PartRig {
+            movement: car.simtune.as_ref().and_then(|s| s.part_movement).unwrap_or(crate::damageparts::DEFAULT_MOVEMENT),
+            bumper_rest: [bone_world(13699), bone_world(13687)],
+        };
+        let part_group = |part: &vehicle_model::CarPart, part_xf: &Mat4, mi: usize| -> u32 {
+            let p = part.primary.to_ascii_lowercase();
+            if part.is_base {
+                return if part.mesh_tag.get(mi).map_or(false, |t| trunk_tags.contains(t)) { 4 } else { 0 };
+            }
+            if p.starts_with("hood") && !p.contains("scoop") && hood_slot.is_some() {
+                3
+            } else if p.starts_with("bumper_r") && part_rig.bumper_rest[0].is_some() {
+                5
+            } else if (p.starts_with("bumper_f") || p.starts_with("intercooler")) && part_rig.bumper_rest[1].is_some() {
+                6
+            } else if *part_xf != Mat4::IDENTITY && trunk_worlds.iter().any(|w| w.w_axis.distance(part_xf.w_axis) < 1e-3) {
+                4
+            } else {
+                0
+            }
+        };
+        if std::env::var("MCLA_PARTS_LOG").is_ok() {
+            log::info!("damage parts {}: rig {:?} hood slot {:?} trunk bone {:?} (set {:?})", car.name, part_rig, hood_slot.map(|m| m.w_axis), trunk_bone.map(|m| m.w_axis), trunk_tags);
+        }
         for (part, part_xf) in car.placed_parts_for(cfg) {
             if let Some(f) = only_part.as_deref() {
                 if !f.split(',').any(|n| part.primary == n) {
@@ -1153,6 +1212,10 @@ impl Vehicles {
                 // meshes sharing textures and material mode are merged into one draw (the side
                 // windows' glass apart, by side: it moves with its bone)
                 let win_side = if part.is_base { car.windows.iter().position(|w| w.as_ref().map_or(false, |w| part.mesh_tag.get(mi) == Some(&w.tag))).map_or(0, |k| k as u32 + 1) } else { 0 };
+                let win_side = if win_side != 0 { win_side } else { part_group(part, &part_xf, mi) };
+                if win_side >= 3 && std::env::var("MCLA_PARTS_LOG").is_ok() {
+                    log::info!("damage parts {}: {} mesh {} -> group {}", car.name, part.primary, mi, win_side);
+                }
                 let acc = merged.entry((k0, k1, mode as u32 | win_side << 16)).or_insert_with(|| MergeAcc { verts: Vec::new(), indices: Vec::new(), d, s2, sname: sname.to_string(), mode, min: Vec3::splat(f32::INFINITY), max: Vec3::splat(f32::NEG_INFINITY) });
                 // (the glass over a lamp is its lens: red over the tail lamps, clear elsewhere -
                 // the game tints it from a table per lamp, BumpedTintColors)
@@ -1339,7 +1402,7 @@ impl Vehicles {
             let vb = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&acc.verts), usage: wgpu::BufferUsages::VERTEX });
             let ib = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&acc.indices), usage: wgpu::BufferUsages::INDEX });
             if k.2 >> 16 != 0 {
-                log::debug!("car {}: window {} batch shader {} tris {}", car.name, k.2 >> 16, acc.sname, acc.indices.len() / 3);
+                log::debug!("car {}: moving group {} (1/2 windows, 3 hood, 4 trunk, 5/6 bumpers) batch shader {} tris {}", car.name, k.2 >> 16, acc.sname, acc.indices.len() / 3);
             }
             batch_window.push((k.2 >> 16) as u8);
             batches.push(GpuBatch { shader: acc.sname, vb, ib, count: acc.indices.len() as u32, bind, mode: acc.mode, min: acc.min, max: acc.max });
@@ -1419,7 +1482,7 @@ impl Vehicles {
             }
         };
         let lamps: Vec<(u8, Vec3)> = lamp_acc.iter().map(|((id, _), (sum, n))| (*id as u8, *sum / (*n).max(1) as f32)).collect();
-        let m = Arc::new(CarModel { name: car.name.clone(), lamps, glow_bones, batches, params, params_mods, simtunes, aitunes: car.aitune.clone(), rest_height: car.hubs.map(|h| (h[0].y + h[2].y) * 0.5), wheels, brakes, brake_dir, rim_dir, rim_ratio, bike: car.bike, min: car.min, max: car.max, cfg: cfg.clone(), variants, variant_labels, extra_variants, batch_window, windows: car.windows.clone() });
+        let m = Arc::new(CarModel { name: car.name.clone(), lamps, glow_bones, batches, params, params_mods, simtunes, aitunes: car.aitune.clone(), rest_height: car.hubs.map(|h| (h[0].y + h[2].y) * 0.5), wheels, brakes, brake_dir, rim_dir, rim_ratio, bike: car.bike, min: car.min, max: car.max, cfg: cfg.clone(), variants, variant_labels, extra_variants, batch_window, windows: car.windows.clone(), part_rig, hood_slot, trunk_bone });
         self.models.push(m.clone());
         if self.wheels.is_none() {
             self.wheels = load_wheels(gpu, world).map(Arc::new);
@@ -1560,6 +1623,7 @@ impl Vehicles {
         let wheel_bindings = (0..4).map(|_| gpu.new_object(&ObjectUniform::default())).collect();
         let caliper_bindings = (0..4).map(|_| gpu.new_object(&ObjectUniform::default())).collect();
         let window_bindings = if model.windows.iter().any(|w| w.is_some()) { (0..2).map(|_| gpu.new_object(&ObjectUniform::default())).collect() } else { Vec::new() };
+        let part_bindings = if model.batch_window.iter().any(|g| *g >= 3) { (0..4).map(|_| gpu.new_object(&ObjectUniform::default())).collect() } else { Vec::new() };
         let mut ai = None;
         if !is_player {
             let mut d = AiDriver::new(self.rng ^ 0x9e3779b9);
@@ -1568,7 +1632,7 @@ impl Vehicles {
             d.target_speed = 17.88 * (0.86 + self.rand() * 0.14);
             ai = Some(d);
         }
-        self.cars.push(CarInstance { sst: 0.0, model, binding, wheel_bindings, caliper_bindings, state: CarState::new(pos, yaw), input: CarInput::default(), color, ai, placed: false, is_player, wheels: None, lean: 0.0, perf: 0.0, tuned: None, cop: false, stunned: 0.0, parked: None, settle: 0.0, racer: false, pinned: false, boost: 0.0, driver: String::new(), plate_text: String::new(), plate: None, vinyl_name: String::new(), vinyl: None, vinyl_done: false, setup: None, pose_history: Default::default(), inflict: 1.0, goon: false, look: None, brake: None, dressed: false, driver_set: String::new(), pu_ctl: 0, pu_ghost: false, pu_mirror: 0.0, pu_stealth: false, window_bindings, windows: Default::default(), rail: None });
+        self.cars.push(CarInstance { sst: 0.0, model, binding, wheel_bindings, caliper_bindings, state: CarState::new(pos, yaw), input: CarInput::default(), color, ai, placed: false, is_player, wheels: None, lean: 0.0, perf: 0.0, tuned: None, cop: false, stunned: 0.0, parked: None, settle: 0.0, racer: false, pinned: false, boost: 0.0, driver: String::new(), plate_text: String::new(), plate: None, vinyl_name: String::new(), vinyl: None, vinyl_done: false, setup: None, pose_history: Default::default(), inflict: 1.0, goon: false, look: None, brake: None, dressed: false, driver_set: String::new(), pu_ctl: 0, pu_ghost: false, pu_mirror: 0.0, pu_stealth: false, window_bindings, windows: Default::default(), part_bindings, rail: None });
         self.cars.len() - 1
     }
 
@@ -2665,6 +2729,24 @@ if keep || c.state.pos.distance(center) < 450.0 {
             }
         }
 
+        // ---- the moving damage parts (sub_823424F0: every car, every frame, after its impacts are queued) ----
+        let ground = |p: Vec3| world.collider.ground(p, 1.0, 3.0).map(|h| (h.point.y, h.normal));
+        for c in self.cars.iter_mut() {
+            let st = &mut c.state;
+            if !st.parts.rigged {
+                st.parts.rig(&c.model.part_rig);
+            }
+            let cm = Mat4::from_rotation_translation(st.rot, st.pos);
+            // (the repair, sub_8233E1B0, runs where the game fixes the car: here, a car whose damage is all gone)
+            if st.damage == 0.0 && st.zones == [0.0; 4] && st.dents.iter().all(|d| d[3] == 0.0) && st.parts.damaged() {
+                st.parts.repair(&cm);
+            }
+            let (speed, heavy) = (st.speed(), st.damage > 0.66);
+            st.parts.tick(cm, speed, heavy, dt, &ground);
+            if c.is_player {
+                parts_test(st, &cm, self.clock);
+            }
+        }
     }
 
     /// Put a car somewhere by hand (cutscenes): wheels follow, it stands still.
@@ -2740,6 +2822,24 @@ if keep || c.state.pos.distance(center) < 450.0 {
                 let Some(clip) = c.model.windows[k].as_ref() else { continue };
                 let wm = m * clip.delta(c.windows[k].clip_time(clip.duration));
                 gpu.update_object(wb, &ObjectUniform { model: wm.to_cols_array_2d(), ..body_u });
+            }
+            // (the moving damage parts: hood, trunk lid, rear and front bumper - damageparts.rs)
+            for (k, pb) in c.part_bindings.iter().enumerate() {
+                let parts = &c.state.parts;
+                let pm = match k {
+                    0 => c.model.hood_slot.map_or(m, |s| m * parts.hood_delta(&s)),
+                    1 => c.model.trunk_bone.map_or(m, |b| m * parts.trunk_delta(&b)),
+                    _ => match parts.bumpers[k - 2].as_ref() {
+                        // (the fallen piece is drawn where its body is: M_slot' = B * M_rest^-1 of the slot's mesh)
+                        Some(b) if b.detached.is_some() && !(self.hide_player && c.is_player) => {
+                            let l = b.detached.unwrap();
+                            Mat4::from_rotation_translation(l.rot, l.pos) * b.m_rest.inverse()
+                        }
+                        Some(b) => m * b.draw_delta(),
+                        None => m,
+                    },
+                };
+                gpu.update_object(pb, &ObjectUniform { model: pm.to_cols_array_2d(), ..body_u });
             }
             for (i, b) in c.wheel_bindings.iter().enumerate() {
                 let left = i % 2 == 0;
@@ -3049,13 +3149,53 @@ if keep || c.state.pos.distance(center) < 450.0 {
     }
 }
 
+/// Test hooks for the moving damage parts on the player's car: MCLA_PARTS_TEST="hood,trunk,frontA,frontB,rearA,rearB"
+/// (loose 0/1, end states 0..2) is put on the car once, two seconds in; MCLA_PARTS_POSE="hood,trunk" holds the
+/// flaps at those angles (rad, <= 0 open) for pictures; MCLA_PARTS_LOG prints the parts twice a second.
+fn parts_test(st: &mut CarState, cm: &Mat4, clock: f32) {
+    static SET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if let Ok(v) = std::env::var("MCLA_PARTS_TEST") {
+        if clock > 2.0 && !SET.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            // (with damage to match, or the repair test puts the parts straight back)
+            st.damage = st.damage.max(0.7);
+            st.zones[2] = st.zones[2].max(1.0);
+            st.zones[3] = st.zones[3].max(1.0);
+            let p = &mut st.parts;
+            let n: Vec<u8> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            let g = |i: usize| n.get(i).copied().unwrap_or(0);
+            p.hood.loose = g(0) != 0;
+            p.trunk.loose = g(1) != 0;
+            for (k, b) in [(1usize, 2usize), (0, 4)] {
+                if let Some(bm) = p.bumpers[k].as_mut() {
+                    bm.a.state = g(b);
+                    bm.b.state = g(b + 1);
+                }
+            }
+        }
+    }
+    if let Some(v) = std::env::var("MCLA_PARTS_POSE").ok() {
+        let p = &mut st.parts;
+        let n: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        p.hood.angle = n.first().copied().unwrap_or(0.0);
+        p.trunk.angle = n.get(1).copied().unwrap_or(0.0);
+    }
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if std::env::var("MCLA_PARTS_LOG").is_ok() && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 30 == 0 {
+        let p = &st.parts;
+        let ci = cm.inverse();
+        let b = |k: usize| p.bumpers[k].as_ref().map(|b| (b.a.state, b.b.state, ci.transform_point3(b.a.pos) - b.a.rest, ci.transform_point3(b.b.pos) - b.b.rest, b.detached.map(|l| l.pos)));
+        eprintln!("parts t {:.2}: damage {:.3} zones {:.2?} hood {} {:.4} trunk {} {:.4} front {:?} rear {:?} events {}", clock, st.damage, st.zones, p.hood.loose, p.hood.angle, p.trunk.loose, p.trunk.angle, b(1), b(0), p.serial);
+    }
+}
+
 impl CarInstance {
     /// The object (group 3) a batch of the car's model is drawn with: the body's, or a side
     /// window's for that window's glass.
     pub fn batch_object(&self, bi: usize) -> &wgpu::BindGroup {
         match self.model.batch_window.get(bi).copied().unwrap_or(0) {
             0 => &self.binding.bg,
-            k => self.window_bindings.get(k as usize - 1).map_or(&self.binding.bg, |b| &b.bg),
+            k @ 1..=2 => self.window_bindings.get(k as usize - 1).map_or(&self.binding.bg, |b| &b.bg),
+            k => self.part_bindings.get(k as usize - 3).map_or(&self.binding.bg, |b| &b.bg),
         }
     }
 }
