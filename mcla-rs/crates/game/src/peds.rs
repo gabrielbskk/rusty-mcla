@@ -110,11 +110,6 @@ struct Ped {
     stops: u32,
     /// sidestep or dodge: from, to, seconds into it, length
     slide: Option<(Vec3, Vec3, f32, f32)>,
-    /// centres of the awareness spheres around the walker (+2176) and ahead of it (+3392) as
-    /// placed at the last query, and seconds to the next query
-    aware: Vec3,
-    ahead: Vec3,
-    aware_age: f32,
     /// the last path was requested facing backwards: turn round to walk it
     turn_round: bool,
     /// yaw still to turn after the Pivot clip, and what follows the turn (angry after a dodge)
@@ -231,9 +226,12 @@ const PED_RADIUS: f32 = 0.3;
 const AWARE_RADIUS: f32 = 0.667;
 /// The sphere ahead sits 0 .. 2.5 m in front, drawn anew for every test.
 const AHEAD_MAX: f32 = 2.5;
-/// Refresh of the sphere around the ped (median 11 - 16 frames live; the scheduling is not
-/// decoded).
-const AWARE_REFRESH: f32 = 13.0 / 30.0;
+/// Sphere refresh (sub_8279D2D8 via the manager): every 30 Hz frame each walker re-queries,
+/// with this chance by its distance to the focus (within 25 m, 85 m, beyond), the one of its
+/// three spheres the global frame counter points at (counter % 3): 0 the ground probe (r 2,
+/// mask 0x800), 1 around the walker, 2 ahead of it. The hits only last that frame.
+const AWARE_CHANCE: [(f32, f32); 2] = [(25.0, 0.4), (85.0, 0.15)];
+const AWARE_CHANCE_FAR: f32 = 0.1;
 /// Sidestep: 0.25 s, the push tried straight and 45 degrees either way (table 0x820da334).
 const SLIDE_TIME: f32 = 0.25;
 /// Clip blends are 8 frames (0x82830878).
@@ -245,10 +243,11 @@ const TURN_RATE: f32 = 2.94524;
 const RAIL_TURN: f32 = 1.25664;
 const RAIL_TURN_LAST: f32 = 3.76991;
 const RAIL_MIN: f32 = 0.5;
-/// A rail around something in the way: at most 130 degrees round, 0.6 m clear
-/// (sub_827A14C0, clearance 0.3 + ped radius).
+/// A rail around something in the way: at most 130 degrees round (sub_827A14C0); the way
+/// to it swept by a capsule of the ped's radius 0.6 - 1.2 m up (sub_8279D9D0, mask 0x383e:
+/// furniture, cars, peds and buildings, the walker being passed included).
 const AVOID_TURN: f32 = 2.26893;
-const AVOID_CLEAR: f32 = 0.3 + PED_RADIUS;
+const AVOID_CLEAR: f32 = PED_RADIUS;
 /// Speed follows the wanted speed with a 0.1 s lag (sub_8279EF40, sub_827966C0).
 const SPEED_LAG: f32 = 0.1;
 
@@ -307,13 +306,20 @@ fn sphere_hit(c: Vec3, r: f32, me: usize, peds: &[Vec3], props: &[Obst], skip_pe
 
 /// Is the way from `a` to `b` clear by `clear` metres (peds unless `skip_peds`, furniture;
 /// the walker `ignore` and the box centred at `ignore_box` - what is being passed - are left
-/// out)? Something the way leads away from does not count (the probe
-/// starts touching what the walker is pushed out of).
+/// out)? With `away`, something the way leads away from does not count (the sidestep's
+/// probe starts touching what the walker is pushed out of); the detour's sweep has no such
+/// test (sub_8279D9D0).
 #[allow(clippy::too_many_arguments)]
-fn way_clear(a: Vec3, b: Vec3, clear: f32, me: usize, ignore: usize, ignore_box: Option<Vec3>, peds: &[Vec3], props: &[Obst], skip_peds: bool) -> bool {
+fn way_clear(a: Vec3, b: Vec3, clear: f32, me: usize, ignore: usize, ignore_box: Option<Vec3>, peds: &[Vec3], props: &[Obst], col: Option<&WorldCollider>, skip_peds: bool, away: bool) -> bool {
     let n = (flat(b - a).length() / 0.2).ceil().max(1.0) as usize;
+    // the city's own bound (buildings, walls; the ground stays below the probe), swept 0.6 -
+    // 1.2 m up
+    let lift = Vec3::Y * (0.6 + clear);
+    if col.is_some_and(|c| (0..=n).any(|k| c.sphere(a.lerp(b, k as f32 / n as f32) + lift, clear).is_some())) {
+        return false;
+    }
     let seg = |o: &Obst| {
-        if box_dist(o, b) >= box_dist(o, a) {
+        if away && box_dist(o, b) >= box_dist(o, a) {
             return f32::MAX;
         }
         (0..=n).map(|k| box_dist(o, a.lerp(b, k as f32 / n as f32))).fold(f32::MAX, f32::min)
@@ -402,7 +408,7 @@ fn car_threat(pos: Vec3, threats: &[Threat]) -> Option<(Vec3, Vec3, f32)> {
 /// reversed path (sub_8279C198). Moves `p` and sets its state; returns the walk clip's
 /// playback rate.
 #[allow(clippy::too_many_arguments)]
-fn sidewalk_step(p: &mut Ped, ty: &PedType, me: usize, peds: &[Vec3], props: &[Obst], threats: &[Threat], dt: f32, rand: &mut dyn FnMut() -> f32, evades: &mut u32, speech: &mut Vec<Speech>) -> f32 {
+fn sidewalk_step(p: &mut Ped, ty: &PedType, me: usize, peds: &[Vec3], props: &[Obst], col: Option<&WorldCollider>, threats: &[Threat], due: u8, dt: f32, rand: &mut dyn FnMut() -> f32, evades: &mut u32, speech: &mut Vec<Speech>) -> f32 {
     let fwd = flat(p.rot * -Vec3::Z).normalize_or(Vec3::Z);
     let set_state = |p: &mut Ped, s: State| {
         if p.state != s {
@@ -449,21 +455,10 @@ fn sidewalk_step(p: &mut Ped, ty: &PedType, me: usize, peds: &[Vec3], props: &[O
         p.speed = 0.0;
         return 1.0;
     }
-    // the awareness spheres are queried now and then; what they hit is acted on when the
-    // results come in, at the next query (live: every 11 - 16 frames, the hit slots emptied
-    // as soon as they are read; the spheres' centres measured 0.5 m behind the walker
-    // around it, -1.7 .. +1.9 m along its way ahead of it)
-    p.aware_age -= dt;
-    let query = p.aware_age <= 0.0;
-    let (aware, ahead) = (p.aware, p.ahead);
-    if query {
-        p.aware = p.pos;
-        p.ahead = p.pos + fwd * (AHEAD_MAX * rand());
-        p.aware_age += AWARE_REFRESH;
-        if p.aware_age <= 0.0 {
-            p.aware_age = AWARE_REFRESH;
-        }
-    }
+    // the awareness spheres re-queried this frame (`due`: bit 1 around the walker, bit 2
+    // ahead of it, 0 .. 2.5 m drawn anew); their hits are acted on in the same frame
+    let (query_around, query) = (due & 2 != 0, due & 4 != 0);
+    let ahead = p.pos + fwd * (AHEAD_MAX * rand());
     // sliding aside
     if let Some((a, b, t, len)) = p.slide {
         let t = t + dt;
@@ -501,9 +496,9 @@ fn sidewalk_step(p: &mut Ped, ty: &PedType, me: usize, peds: &[Vec3], props: &[O
         expired = true;
     }
     // something touching the walker: sidestep, which also drops the path
-    if let Some((o, who)) = sphere_hit(aware, AWARE_RADIUS, me, peds, props, false).filter(|_| query) {
-        let rel = flat(aware - o.0);
-        let dist = box_dist(&o, aware);
+    if let Some((o, who)) = sphere_hit(p.pos, AWARE_RADIUS, me, peds, props, false).filter(|_| query_around) {
+        let rel = flat(p.pos - o.0);
+        let dist = box_dist(&o, p.pos);
         if std::env::var("MCLA_PED_DUMP").is_ok() {
             log::info!("ped touch {} {} depth {:.2}", p.key.1, if who == usize::MAX { "prop" } else { "ped" }, AWARE_RADIUS - dist);
         }
@@ -511,71 +506,76 @@ fn sidewalk_step(p: &mut Ped, ty: &PedType, me: usize, peds: &[Vec3], props: &[O
         for a in [0.0f32, -std::f32::consts::FRAC_PI_4, std::f32::consts::FRAC_PI_4] {
             let d = rotate_y(n, a);
             let off = d * (depth + 0.05) / a.cos();
-            if way_clear(p.pos, p.pos + off, PED_RADIUS, me, usize::MAX, None, peds, props, true) {
+            if way_clear(p.pos, p.pos + off, PED_RADIUS, me, usize::MAX, None, peds, props, col, true, true) {
                 // (the heading stays: the recorded walks keep their line through sidesteps)
                 p.slide = Some((p.pos, p.pos + off, 0.0, SLIDE_TIME));
                 p.rail = None;
                 p.path.clear();
-                p.aware = p.pos + off;
-                p.ahead = p.pos + off;
-                p.aware_age = AWARE_REFRESH;
                 return 1.0;
             }
         }
     }
-    // something ahead: a rail round it, or stop
-    if query && !matches!(p.rail, Some((_, true))) {
-        if let Some((o, who)) = sphere_hit(ahead, AWARE_RADIUS, me, peds, props, false) {
-            // the box's corners furthest round to either side as seen from the walker, pushed
-            // out sideways by half the walker's own width and 0.25 (vfunc 16 of its obstacle
-            // object, mcAmbientObstaclePed: the x extent of its bound, 0.6)
-            let corners = box_corners(&o);
-            let yaw = |v: Vec3| yaw_between(fwd, flat(v - p.pos).normalize_or(fwd));
-            let left = corners.iter().copied().max_by(|a, b| yaw(*a).total_cmp(&yaw(*b))).unwrap();
-            let right = corners.iter().copied().min_by(|a, b| yaw(*a).total_cmp(&yaw(*b))).unwrap();
-            let push = 0.5 * (2.0 * PED_RADIUS) + 0.25;
-            let mut pass: Option<(f32, Vec3)> = None;
-            let mut why = String::new();
-            for (corner, sgn) in [(left, 1.0f32), (right, -1.0)] {
-                let sight = flat(corner - p.pos).normalize_or(fwd);
-                let pp = corner + rotate_y(sight, sgn * std::f32::consts::FRAC_PI_2) * push;
-                let d = flat(pp - p.pos);
-                if d.length() < 1e-3 || yaw_between(fwd, d.normalize()).abs() > AVOID_TURN {
-                    why.push('T');
-                    continue;
-                }
-                if way_clear(p.pos, pp, AVOID_CLEAR, me, who, (who == usize::MAX).then_some(o.0), peds, props, false) && pass.map_or(true, |b| d.length() < b.0) {
-                    pass = Some((d.length(), pp));
-                    why.push('+');
-                } else {
-                    why.push('C');
-                }
+    // something ahead (sub_8279AA18, run every frame the walker is not waiting, on a detour
+    // rail too): a rail round it, or stop. The candidates (sub_827A14C0): the corner of the
+    // box furthest left as seen from the walker, pushed out to the left by half the walker's
+    // width and 0.25 (0.55); for furniture also the corner furthest right pushed right; a
+    // walker in the way is only ever passed on the left (sub_8279AA18 clears args +44 bit 0x40
+    // for type 0x20). Each is reached by a turn of at most 130 degrees (turning radius 0.1:
+    // arcs too short to sample) and swept by the capsule all the way; the shortest wins.
+    let hit = if query { sphere_hit(ahead, AWARE_RADIUS, me, peds, props, false) } else { None };
+    if let Some((o, who)) = hit {
+        let corners = box_corners(&o);
+        let d0 = flat(o.0 - p.pos);
+        let side = |c: Vec3| {
+            let c = flat(c - p.pos).normalize_or_zero();
+            d0.x * c.z - d0.z * c.x
+        };
+        let left = corners.iter().copied().min_by(|a, b| side(*a).total_cmp(&side(*b))).unwrap();
+        let right = corners.iter().copied().max_by(|a, b| side(*a).total_cmp(&side(*b))).unwrap();
+        let push = 0.5 * (2.0 * PED_RADIUS) + 0.25;
+        let mut pass: Option<(f32, Vec3)> = None;
+        let mut why = String::new();
+        let both = who == usize::MAX;
+        for (corner, sgn) in [(left, 1.0f32), (right, -1.0)].into_iter().take(if both { 2 } else { 1 }) {
+            let v = flat(corner - p.pos);
+            let pp = corner + Vec3::new(v.z, 0.0, -v.x).normalize_or_zero() * (sgn * push);
+            let d = flat(pp - p.pos);
+            if d.length() < 1e-3 || yaw_between(fwd, d.normalize()).abs() > AVOID_TURN {
+                why.push('T');
+                continue;
             }
-            if std::env::var("MCLA_PED_DUMP").is_ok() {
-                log::info!("ped avoid {} {} {} ahead {:.2}", p.key.1, if who == usize::MAX { "prop" } else { "ped" }, why, flat(o.0 - p.pos).dot(fwd));
+            if way_clear(p.pos, pp, AVOID_CLEAR, me, usize::MAX, None, peds, props, col, false, false) && pass.map_or(true, |b| d.length() <= b.0) {
+                pass = Some((d.length(), pp));
+                why.push('+');
+            } else {
+                why.push('C');
             }
-            match pass {
-                Some((_, pp)) => p.rail = Some((pp, true)),
-                None => {
-                    if std::env::var("MCLA_PED_DUMP").is_ok() {
-                        log::info!("ped stop {} by {} at {:.1} m, half {:.2} {:.2} centre {:.1} {:.1}", p.key.1, if who == usize::MAX { "prop" } else { "ped" }, box_dist(&o, p.pos), o.2.x, o.2.y, o.0.x, o.0.z);
-                    }
-                    p.stop = stop_time(ty.idle.anim.duration, rand);
-                    p.stops += 1;
-                    if expired && p.stops > 1 {
-                        p.rail = None;
-                        p.path.clear();
-                    }
-                    set_state(p, State::Idle);
-                    p.speed = 0.0;
-                    return 1.0;
-                }
-            }
-        } else if expired {
-            p.stops = 0;
         }
-    } else if expired {
-        // nothing in the slot when the time is up: the stops in a row start again
+        if std::env::var("MCLA_PED_DUMP").is_ok() {
+            log::info!("ped avoid {} {} {} ahead {:.2}", p.key.1, if who == usize::MAX { "prop" } else { "ped" }, why, flat(o.0 - p.pos).dot(fwd));
+        }
+        match pass {
+            Some((_, pp)) => {
+                p.rail = Some((pp, true));
+                p.stops = 0;
+            }
+            None => {
+                if std::env::var("MCLA_PED_DUMP").is_ok() {
+                    log::info!("ped stop {} by {} at {:.1} m, half {:.2} {:.2} centre {:.1} {:.1}", p.key.1, if who == usize::MAX { "prop" } else { "ped" }, box_dist(&o, p.pos), o.2.x, o.2.y, o.0.x, o.0.z);
+                }
+                p.stop = stop_time(ty.idle.anim.duration, rand);
+                p.stops += 1;
+                if expired && p.stops > 1 {
+                    p.rail = None;
+                    p.path.clear();
+                }
+                set_state(p, State::Idle);
+                p.speed = 0.0;
+                return 1.0;
+            }
+        }
+    } else {
+        // nothing in the slot: the stops in a row start again
         p.stops = 0;
     }
     // along the rails
@@ -1185,9 +1185,6 @@ impl Peds {
                 stop: 0.0,
                 stops: 0,
                 slide: None,
-                aware: pos,
-                ahead: pos,
-                aware_age: 0.0,
                 turn_round: false,
                 turn_rest: 0.0,
                 then_angry: false,
@@ -1352,9 +1349,6 @@ impl Peds {
                     stop: 0.0,
                     stops: 0,
                     slide: None,
-                    aware: g.point,
-                    ahead: g.point,
-                    aware_age: 0.0,
                     turn_round: false,
                     turn_rest: 0.0,
                     then_angry: false,
@@ -1373,9 +1367,11 @@ impl Peds {
         if !self.enabled || self.dirs.is_empty() {
             return;
         }
+        let mut frame0 = self.frame_no;
         if let Some(mesh) = self.mesh.take() {
             // the original's 30 Hz frames
             self.step = (self.step + dt).min(FRAME * 4.0);
+            frame0 = self.frame_no;
             while self.step >= FRAME {
                 self.step -= FRAME;
                 self.frame_no = self.frame_no.wrapping_add(1);
@@ -1413,7 +1409,18 @@ impl Peds {
             if on_mesh {
                 boxes.clear();
                 obstacles(p.pos, 4.0, &mut boxes);
-                rate = sidewalk_step(p, ty, i, &peds_pos, &boxes, threats, dt, &mut rand, &mut self.evades, &mut self.speech);
+                // the spheres due in the 30 Hz frames run now
+                let d = p.pos.distance(center);
+                let chance = AWARE_CHANCE.iter().find(|c| d < c.0).map_or(AWARE_CHANCE_FAR, |c| c.1);
+                let mut due = 0u8;
+                let mut n = frame0;
+                while n != self.frame_no {
+                    n = n.wrapping_add(1);
+                    if rand() < chance {
+                        due |= 1 << (n % 3);
+                    }
+                }
+                rate = sidewalk_step(p, ty, i, &peds_pos, &boxes, Some(col), threats, due, dt, &mut rand, &mut self.evades, &mut self.speech);
             }
             // a car about to pass too close?
             if !on_mesh && matches!(p.state, State::Walk | State::Idle) && p.calm <= 0.0 && !ty.evade.is_empty() {
