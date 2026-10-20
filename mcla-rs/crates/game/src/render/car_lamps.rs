@@ -119,6 +119,16 @@ impl LampRows {
         (a, b)
     }
 
+    /// The colour of the car's two head-lamp lights in the night programs' dynamic lights
+    /// (`gMultiLightDynamicLightData` c84..c86) and the lit particles' lane 3: three times the
+    /// head lamp's (id 3) bulb through its cover. Recorded: the R8 (1.8471, 2.3882, 3.0) at
+    /// 18:15, 20:00, 23:30 and 02:00; the Saleen S281 (2.1647, 2.0565, 1.858) at 01:06.
+    pub fn head_light(&self) -> [f32; 3] {
+        const HEAD: usize = 3;
+        let (b, c) = (self.bulb[HEAD], self.cover[HEAD]);
+        [3.0 * b[0] * c[0], 3.0 * b[1] * c[1], 3.0 * b[2] * c[2]]
+    }
+
     /// The colour a lit lamp shines with (bulb through cover), brought to a full channel.
     pub fn lit(&self, id: usize) -> [f32; 3] {
         let i = id.min(IDS - 1);
@@ -198,5 +208,19 @@ mod tests {
         assert!(!r.ambient);
         assert!(LampRows::from_xcc(&d[..0x400]).is_none());
         assert_eq!(R8.lit(3), [0.6157, 0.7961, 1.0]);
+    }
+
+    /// The head-lamp lights' colour against the recordings of the original (c84..c86 of the
+    /// night programs): the R8 at 23:30 (`cap/car_n`), the Saleen S281 of the race save at 01:06
+    /// (`work/checkpoints2/cap/f4`, `vp_sln_s281_06.xcc` head row: bulb (1, 0.95, 0.85), cover
+    /// (0.72157, 0.72157, 0.72862)).
+    #[test]
+    fn head_light_colour() {
+        let close = |a: [f32; 3], b: [f32; 3]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 2e-4);
+        assert!(close(R8.head_light(), [1.8471, 2.3882, 3.0]), "{:?}", R8.head_light());
+        let mut s = R8;
+        s.bulb[3] = [1.0, 0.95, 0.85];
+        s.cover[3] = [0.7215686, 0.7215686, 0.7286152];
+        assert!(close(s.head_light(), [2.1647, 2.0565, 1.858]), "{:?}", s.head_light());
     }
 }

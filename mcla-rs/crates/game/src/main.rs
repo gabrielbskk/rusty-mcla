@@ -6062,7 +6062,7 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                 let mut cars: Vec<(f32, Vec3, Vec3)> = self.vehicles.cars.iter().filter(|c| c.parked.is_none()).map(|c| { let p = c.render_pose(self.vehicles.render_alpha); (p.pos.distance(focus), p.pos, p.rot * Vec3::NEG_Z) }).collect();
                 cars.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
                 // With the weather's keys (the original's night programs): its dynamic lights are
-                // the PLAYER's two head lamps only - colour (1.85, 2.39, 3.0), sat(500 / d squared),
+                // the PLAYER's two head lamps only - the car's own colour (R8: 1.85, 2.39, 3.0), sat(500 / d squared),
                 // a cone from 30 to 50 degrees about an axis 42 degrees below the car's nose
                 // (PSMultiLight c84..c95, measured at 23:30) - and the city's lamps come from the
                 // lamp grid, not from this list.
@@ -6086,14 +6086,17 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                         // is 44.1 degrees below the horizon while the car stands there 2.3 degrees nose
                         // down - the far edge of the cone decides how much of it reaches the walls ahead)
                         let dir = (fwd * 0.7455 - up * 0.6665).normalize();
+                        // (their colour is the car's own: 3 x the head lamp's bulb x cover of its set-up's
+                        // LightTune - R8 (1.85, 2.39, 3.0), Saleen S281 (2.16, 2.06, 1.86); the same at every hour)
+                        let hl_col = render::car_lamps::for_car(&c.model.name, &c.vinyl_name).map_or_else(|| render::car_lamps::R8.head_light(), |t| t.head_light());
                         for side in [-1.0f32, 1.0] {
                             // (where the game puts them, from the lamps' positions in c88..c90 against the
                             // car's own matrix in two captures, fix_night and car_n: 3.2 m ahead of the
                             // car's origin - a metre beyond the nose -, 0.72 m to each side, 0.57 m up)
                             let p = hl_pos + fwd * 3.2 + right * (0.72 * side) + up * 0.57;
-                            if std::env::var("MCLA_TOD_DUMP").is_ok() && self.frame_no == 60 { eprintln!("head lamp at {:?} dir {:?}", p, dir); }
+                            if std::env::var("MCLA_TOD_DUMP").is_ok() && self.frame_no == 60 { eprintln!("head lamp at {:?} dir {:?} colour {:?}", p, dir, hl_col); }
                             ls.pos_range[k] = [p.x, p.y, p.z, 120.0];
-                            ls.color[k] = [1.8471, 2.3882, 3.0, 2.0];
+                            ls.color[k] = [hl_col[0], hl_col[1], hl_col[2], 2.0];
                             ls.dir[k] = [dir.x, dir.y, dir.z, 0.0];
                             k += 1;
                         }
