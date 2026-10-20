@@ -9,7 +9,9 @@
 //! horns, skids, alarms, driver speech and pass-by whooshes (TRAFFIC_AUDIO_RULE.md), the wet road (WEATHER_AUDIO_RULE.md)
 //! and the bikes (BIKE_AUDIO_RULE.md). Approximate (written down there): the opponents' RPM_RACE_OPPONENT blend uses the
 //! speed term only; the traffic brain's obstacle, lane limit and emergency brake are the port's stand-ins; the junction
-//! warn uses the port's signalled junctions; the wipeout loops follow the port's wipeout flag; air ride is not played.
+//! warn uses the port's signalled junctions; the wipeout loops follow the port's wipeout flag; air ride is not played. The hood / trunk / bumper sounds follow the port's
+//! moving damage parts (`damageparts.rs`, DAMAGE_PARTS_RULE.md 1.5, 3, 4); the fallen bumper's contacts are its
+//! small body's against the ground (approximate).
 
 use crate::engaudio::{default_object, EngineIn, EngineSound};
 use crate::physics::collision::Surface;
@@ -226,6 +228,12 @@ pub struct CarSounds {
     nitro: Option<(Option<Handle>, Option<Handle>)>,
     nitro_empty: Option<Handle>,
     pings: Option<Handle>,
+    /// the moving damage parts: the hood / trunk move loops, the bumpers' creak loops (rear, front), the fallen
+    /// bumpers' scrape loops with the time of their last sliding contact (inst+96, +100), the last event heard
+    flap_move: [Option<Handle>; 2],
+    creak: [Option<Handle>; 2],
+    scrape: [(Option<Handle>, f32); 2],
+    parts_seen: Option<u64>,
 }
 
 impl CarSounds {
@@ -273,6 +281,10 @@ impl CarSounds {
             nitro: None,
             nitro_empty: None,
             pings: None,
+            flap_move: [None; 2],
+            creak: [None; 2],
+            scrape: [(None, 0.0); 2],
+            parts_seen: None,
         }
     }
 
@@ -293,6 +305,12 @@ impl CarSounds {
             lib.stop(h);
         }
         for s in [&mut self.two_loop, &mut self.horn, &mut self.siren, &mut self.turbo_v, &mut self.nitro_empty, &mut self.pings] {
+            stop(lib, s);
+        }
+        for s in self.flap_move.iter_mut().chain(self.creak.iter_mut()) {
+            stop(lib, s);
+        }
+        for (s, _) in self.scrape.iter_mut() {
             stop(lib, s);
         }
         if let Some((a, b)) = self.nitro.take() {
@@ -792,6 +810,99 @@ impl CarSounds {
             let h = be_u32(n, base + if front { 12 } else { 8 });
             if !is_null(h) {
                 self.nitro_empty = lib.play_hash(h, self.req(c.pos));
+            }
+        }
+    }
+
+    // ---- the moving damage parts (DAMAGE_PARTS_RULE.md): TUNERS_DAMAGE +15 hood / +43 trunk / +71 rear / +99 front
+    // bumper records {move threshold, move loop, open-stop threshold, open-stop, shut threshold, shut, break-off}
+    pub fn damage_parts(&mut self, lib: &mut SoundLib, parts: &crate::damageparts::DamageParts) {
+        use crate::damageparts::{DamageParts, PartEvent};
+        let d = self.damage_obj.clone();
+        if d.len() < 183 {
+            return;
+        }
+        let rec = |r: usize| 15 + 28 * r;
+        let fdt = DamageParts::FRAME;
+        let (clock, player) = (self.clock, self.player);
+        // the flaps' move loops (sub_8234A680): while loose, |drawn - last| / dt >= rec+0 (0.6 rad/s), at the particle
+        for (i, f) in [&parts.hood, &parts.trunk].into_iter().enumerate() {
+            let r = rec(i);
+            let rate = (f.drawn() - f.drawn_prev()).abs() / fdt;
+            if f.loose && rate >= be_f32(&d, r) {
+                let req = self.req(f.p);
+                keep(lib, &mut self.flap_move[i], be_u32(&d, r + 4), req);
+            } else {
+                stop(lib, &mut self.flap_move[i]);
+            }
+        }
+        // the bumpers' creak loops (sub_8234A768): the fastest loose end relative to the car >= rec+0 (0.4 m/s)
+        for (i, b) in parts.bumpers.iter().enumerate() {
+            let r = rec(2 + i);
+            match b.as_ref().and_then(|b| b.creak(fdt)) {
+                Some((x, pos)) if x >= be_f32(&d, r) => {
+                    let req = self.req(pos);
+                    keep(lib, &mut self.creak[i], be_u32(&d, r + 4), req);
+                }
+                _ => stop(lib, &mut self.creak[i]),
+            }
+        }
+        // the one-shots of this frame's events
+        let (imp_mph, imp_top, imp_lo, imp_hi) = (be_f32(&d, 131), be_f32(&d, 139), be_f32(&d, 135), be_f32(&d, 143));
+        let (scr_lo_mph, scr_hi_mph, scr_lo, scr_hi) = (be_f32(&d, 151), be_f32(&d, 155), be_f32(&d, 159), be_f32(&d, 163));
+        let (pit_lo_mph, pit_hi_mph, pit_lo, pit_hi) = (be_f32(&d, 167), be_f32(&d, 171), be_f32(&d, 175), be_f32(&d, 179));
+        let lerp = |x: f32, x0: f32, x1: f32, y0: f32, y1: f32| y0 + (y1 - y0) * (x.clamp(x0, x1) - x0) / (x1 - x0).max(1e-6);
+        // (events from before this car's sounds were made are not heard)
+        let seen = *self.parts_seen.get_or_insert(parts.serial);
+        for &(serial, e) in parts.events.iter().filter(|(n, _)| *n > seen) {
+            self.parts_seen = Some(serial);
+            match e {
+                // (sub_82348CE0 / sub_82348DC0: shut at rate >= rec+16 plays rec+20, the open stop at >= rec+8 rec+12)
+                PartEvent::FlapStop { flap, open, rate, pos } => {
+                    let r = rec(flap as usize);
+                    let (thr, h) = if open { (be_f32(&d, r + 8), be_u32(&d, r + 12)) } else { (be_f32(&d, r + 16), be_u32(&d, r + 20)) };
+                    if rate >= thr && !is_null(h) {
+                        lib.play_hash(h, self.req(pos));
+                    }
+                }
+                // (sub_8234A868: rec+24 BUMPER_BREAK_OFF at the piece, 0 dB)
+                PartEvent::BumperOff { bumper, pos } => {
+                    let h = be_u32(&d, rec(2 + bumper as usize) + 24);
+                    if !is_null(h) {
+                        lib.play_hash(h, self.req(pos));
+                    }
+                }
+                // (sub_8234CF80: the largest approach of the new contacts, from +131 (3 mph): +127 at
+                // dB(1.5 .. 2.0 over 3 .. 70 mph))
+                PartEvent::BumperImpact { speed, pos, .. } => {
+                    let mph = speed * MPH;
+                    let h = be_u32(&d, 127);
+                    if mph >= imp_mph && !is_null(h) {
+                        let vol = lin2db(lerp(mph.min(imp_top), imp_mph, imp_top, imp_lo, imp_hi));
+                        lib.play_hash(h, self.req(pos).vol(vol));
+                    }
+                }
+                // (a slide from +151 (5 mph) keeps the scrape loop +147 going; its volume dB(0.25 .. 0.5 over 5 .. 60 mph)
+                // and pitch 0.7 .. 1.5 over 5 .. 100 mph are set when it starts and never again)
+                PartEvent::BumperScrape { bumper, speed, pos } => {
+                    let mph = speed * MPH;
+                    let h = be_u32(&d, 147);
+                    let slot = &mut self.scrape[bumper as usize & 1];
+                    if mph >= scr_lo_mph && !is_null(h) {
+                        slot.1 = clock;
+                        if slot.0.map_or(true, |s| !lib.playing(s)) {
+                            let vol = lin2db(lerp(mph.min(scr_hi_mph), scr_lo_mph, scr_hi_mph, scr_lo, scr_hi));
+                            let pitch = cents(lerp(mph, pit_lo_mph, pit_hi_mph, pit_lo, pit_hi));
+                            slot.0 = lib.play_hash(h, Req { player, ..Req::at(pos) }.vol(vol).pitch(pitch));
+                        }
+                    }
+                }
+            }
+        }
+        // (sub_823414C8 @82341D30: the scrape stops 1/15 s after the last slide)
+        for (h, last) in self.scrape.iter_mut() {
+            if h.is_some() && clock >= *last + 1.0 / 15.0 {
+                stop(lib, h);
             }
         }
     }
@@ -1412,6 +1523,7 @@ impl Fleet {
             }
             if let Some(s) = &mut e.sounds {
                 s.update(lib, &self.mats, &c, ctl.cam_mode, dt);
+                s.damage_parts(lib, &p.state.parts);
                 // a police car's horn button chirps the siren (sub_822A1058)
                 if p.cop && ctl.horn {
                     s.siren_alert(lib, c.pos);
@@ -1534,6 +1646,7 @@ impl Fleet {
             }
             if let Some(s) = &mut e.sounds {
                 s.update(lib, &self.mats, &ci, -1, dt);
+                s.damage_parts(lib, &c.state.parts);
                 if c.cop && !c.goon {
                     if stop_all {
                         s.siren_stop(lib);
@@ -1819,5 +1932,40 @@ mod tests {
         assert!(lib.game.get_name("AMBIENT_SEDAN_00").is_some());
         let opp = EngineSound::new_opponent(&lib, "vp_chv_camaro_06", false);
         assert!(opp.is_some());
+    }
+
+    /// TUNERS_DAMAGE's records as DAMAGE_PARTS_RULE.md 4.3 reads them, and the parts' sounds started by their
+    /// events: the hood's slam, the break-off, the fallen bumper's impact and scrape (stopped 1/15 s after the slide).
+    #[test]
+    #[ignore = "requires MCLA_DATA_DIR with the user's extracted disc and the converted audio"]
+    fn damage_part_sounds_from_disc() {
+        use crate::damageparts::{DamageParts, PartEvent};
+        let dir = std::env::var("MCLA_DATA_DIR").expect("MCLA_DATA_DIR");
+        let a = crate::audio::Audio::new_offline(&dir).expect("audio");
+        let mut lib = SoundLib::load(a.root(), &a.cfg).expect("sound objects");
+        let mut s = CarSounds::new(&lib, "vp_aud_r8_08", false, true);
+        let d = s.damage_obj.clone();
+        let f = |o: usize| be_f32(&d, o);
+        assert_eq!((f(15), f(23), f(31)), (0.6f32, 1.0f32, 1.0f32));
+        assert_eq!(be_u32(&d, 19), joaat("DAMAGE_HOOD_MOVE_MASTER"));
+        assert_eq!(be_u32(&d, 35), joaat("DAMAGE_HOOD_IMP_HARD_MASTER"));
+        assert_eq!(be_u32(&d, 27), joaat("DAMAGE_HOOD_IMP_LIGHT_MASTER"));
+        assert_eq!(be_u32(&d, 55), joaat("DAMAGE_TRUNK_LIGHT_MASTER"));
+        assert_eq!((f(71), f(99)), (0.4f32, 0.4f32));
+        assert_eq!(be_u32(&d, 75), joaat("DAMAGE_BUMPER_CREAK_MASTER"));
+        assert_eq!(be_u32(&d, 95), joaat("DAMAGE_BUMPER_BREAK_OFF"));
+        assert_eq!(be_u32(&d, 127), joaat("DAMAGE_BUMPER_IMP_HARD_MASTER"));
+        assert_eq!(be_u32(&d, 147), joaat("DAMAGE_BUMPER_SCRAPE_MASTER"));
+        assert_eq!([f(131), f(135), f(139), f(143)], [3.0f32, 1.5, 70.0, 2.0]);
+        assert_eq!([f(151), f(155), f(159), f(163), f(167), f(171), f(175), f(179)], [5.0f32, 60.0, 0.25, 0.5, 5.0, 100.0, 0.7, 1.5]);
+        let mut parts = DamageParts::default();
+        parts.events = vec![(1, PartEvent::FlapStop { flap: 0, open: false, rate: 2.0, pos: Vec3::ZERO }), (2, PartEvent::BumperOff { bumper: 1, pos: Vec3::ZERO }), (3, PartEvent::BumperImpact { bumper: 1, speed: 10.0, pos: Vec3::ZERO }), (4, PartEvent::BumperScrape { bumper: 1, speed: 10.0, pos: Vec3::ZERO })];
+        s.parts_seen = Some(0);
+        s.damage_parts(&mut lib, &parts);
+        assert_eq!(s.parts_seen, Some(4));
+        assert!(s.scrape[1].0.is_some_and(|h| lib.playing(h)));
+        s.clock += 0.1;
+        s.damage_parts(&mut lib, &parts);
+        assert!(s.scrape[1].0.is_none());
     }
 }
