@@ -1,6 +1,6 @@
 # Rusty MCLA
 
-![Lines of code](https://tokei.rs/b1/github/holdmysocks/rusty-mcla?category=code)
+![Rust lines](https://img.shields.io/endpoint?url=https%3A%2F%2Fghloc.dev%2Fapi%2Fholdmysocks%2Frusty-mcla%2Fbadge%3Ffilter%3D.rs%24&label=Rust%20lines)
 ![License](https://img.shields.io/github/license/holdmysocks/rusty-mcla)
 ![Status](https://img.shields.io/badge/status-early%20development-orange)
 ![Platform](https://img.shields.io/badge/platform-Windows-blue)
