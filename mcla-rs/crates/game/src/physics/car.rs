@@ -235,6 +235,8 @@ pub struct CarState {
     /// solves that gave them
     pub touches: Vec<AudioTouch>,
     pub touch_calls: u32,
+    /// the hood, trunk lid and bumpers that come loose (`crate::damageparts`), with this tick's queued hits
+    pub parts: crate::damageparts::DamageParts,
 }
 
 /// A contact of the car as the original's collision audio reads it (sub_82381FB0, docs/reference/audio/COLLISION_AUDIO_RULE.md).
@@ -282,6 +284,7 @@ impl CarState {
             veh: None,
             touches: Vec::new(),
             touch_calls: 0,
+            parts: Default::default(),
         }
     }
 
@@ -367,11 +370,59 @@ impl CarState {
     }
 
     pub fn add_dent(&mut self, point: Vec3, hit: f32) {
+        // ((hit - 0.5) / 5, at most 1)
         let local = self.rot.inverse() * (point - self.pos);
-        // (the game's zone damage, 0x82356d98: (hit - 0.5) / 5, at most 1, to the front or rear
-        // zone for a hit in the outer two fifths of the length, to a side zone for one in the
-        // outer half of the width)
-        let amount = ((hit - 0.5) * 0.2).clamp(0.0, 1.0);
+        if self.zone_hit(point, local, ((hit - 0.5) * 0.2).clamp(0.0, 1.0)) {
+            self.dent(local, hit);
+        }
+    }
+
+    /// What the original's contact callback (mcCarDamage, 0x82343880) does with the tick's
+    /// contacts of the car against the city: `dv` is the change of velocity they gave it - the sum
+    /// of their impulses over the mass, each 0.4 of itself against something fixed (0x82567A08) -
+    /// and `at` the first of them (on a car lying over, under 0.1 of upright, the last), `local` the
+    /// same point in the car's pose after the tick's move (the instance's matrix then). A wrecked
+    /// car takes nothing more. Over 0.1 m/s the zones and the bumpers' queue take
+    /// clamp((sqrt dv - 0.5) x 0.2) at that point (0x82344394, zone damage kind 0); then the
+    /// damage points take dv itself (0x82343378: a city hit counts 1.0 of it, mcCarDamage +12).
+    pub(super) fn world_hit(&mut self, p: &CarParams, dv: f32, at: Vec3, local: Vec3) {
+        if self.damage >= 1.0 {
+            return;
+        }
+        let mut counts = true;
+        if dv > f32::from_bits(0x3dcc_cccd) {
+            let amount = ((dv.sqrt() - 0.5) * 0.2).clamp(0.0, 1.0);
+            if amount != 0.0 {
+                counts = self.zone_hit(at, local, amount);
+            }
+        }
+        if dv > p.dmg[2] {
+            self.take_hit(p, dv);
+            // (the port's dents stand in for the original's deform pieces, which take the same
+            // gate: a counted blow dents the body where it landed)
+            if counts {
+                self.dent(local, dv);
+            }
+        }
+    }
+
+    /// The game's zone damage (0x82356d98, a collision: kind 0) with `amount` at `point` (world;
+    /// `local` in the car). False when the hit is too low on the car to count.
+    fn zone_hit(&mut self, point: Vec3, local: Vec3, amount: f32) -> bool {
+        // (the game's zone damage, 0x82356d98: only a hit above 0.12 of the way up from the car's
+        // origin counts - the deform pieces, the bumpers' queue @82356F60 and the zones @82357444 -
+        // and on a car upside down the zones take 1.0 and the bumpers 1000, DAMAGE_PARTS_RULE.md 1.2)
+        if std::env::var_os("MCLA_PARTS_LOG").is_some() {
+            eprintln!("parts hit: {amount:.4} at car-local {local:.2?} counts {}", crate::damageparts::hit_counts(local));
+        }
+        if !crate::damageparts::hit_counts(local) {
+            return false;
+        }
+        let upside_down = (self.rot * Vec3::Y).y < 0.0;
+        // (to the front or rear zone for a hit in the outer two fifths of the length, to a side
+        // zone for one in the outer half of the width; a collision: kind 0 - every caller here is one)
+        self.parts.queue(crate::damageparts::PartHit { point, amount: if upside_down { 1000.0 } else { amount }, kind: 0 });
+        let amount = if upside_down { 1.0 } else { amount };
         let [hx, hz] = self.zone_half;
         if local.z < -0.6 * hz {
             self.zones[2] += amount;
@@ -385,6 +436,19 @@ impl CarState {
         if local.x > 0.5 * hx {
             self.zones[1] += amount;
         }
+        // (@82357514: a wrecked rear zone lets the trunk lid fall open, a wrecked front the hood)
+        if self.zones[3] >= 1.0 {
+            self.parts.trunk.loose = true;
+        }
+        if self.zones[2] >= 1.0 {
+            self.parts.hood.loose = true;
+        }
+        true
+    }
+
+    /// A dent of a blow of `hit` m/s at `local` (in the car). A blow next to an older dent deepens
+    /// that one; otherwise the shallowest dent makes room.
+    fn dent(&mut self, local: Vec3, hit: f32) {
         let depth = (hit / 22.0).clamp(0.12, 1.0);
         let mut slot = 0;
         for (i, d) in self.dents.iter().enumerate() {
@@ -750,5 +814,46 @@ impl CarState {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The R8 driven head-on into a wall at 26 m/s (recording sa.0 of the original, tick 153):
+    /// the contacts change its velocity by 10.881046 m/s, landing at car-local (0.807251,
+    /// 0.431519, -2.352051) - mcCarDamage +56 / +64 / +36 - and the next contact ticks by
+    /// 0.334477 m/s at the other front corner. The zone box is the original's live bound box
+    /// (half 1.0038 x 2.2318).
+    #[test]
+    fn a_wall_hit_counts_as_the_original() {
+        let p = CarParams::default();
+        let mut st = CarState::new(Vec3::ZERO, 0.0);
+        st.zone_half = [1.0038, 2.2318];
+        let at = Vec3::new(0.807251, 0.431519, -2.352051);
+        st.world_hit(&p, 10.881046, at, at);
+        assert!((st.damage * p.dmg[0] - 10.881046).abs() < 1e-4);
+        // (sqrt 10.881046 - 0.5) x 0.2, to the right side and the front
+        let a = (10.881046f32.sqrt() - 0.5) * 0.2;
+        assert_eq!(st.zones, [0.0, a, a, 0.0]);
+        assert!((a - 0.5597286).abs() < 1e-6);
+        assert_eq!(st.parts.hits.len(), 1);
+        // a small one adds to the zones but not to the damage points (under ImpactThreshold 2)
+        let at = Vec3::new(-0.816284, 0.534737, -2.355713);
+        st.world_hit(&p, 0.334477, at, at);
+        assert!((st.zones[0] - 0.015668).abs() < 1e-5 && (st.zones[2] - a - 0.015668).abs() < 1e-5);
+        assert!((st.damage * p.dmg[0] - 10.881046).abs() < 1e-4);
+        // under 0.25 m/s (sqrt 0.5) the amount is 0; a hit low on the car (y under 0.12 of the
+        // way out) leaves the zones alone
+        let z = st.zones;
+        st.world_hit(&p, 0.2, at, at);
+        st.world_hit(&p, 5.0, Vec3::new(0.9, 0.1, -2.3), Vec3::new(0.9, 0.1, -2.3));
+        assert_eq!(st.zones, z);
+        assert!((st.damage * p.dmg[0] - 15.881046).abs() < 1e-3);
+        // a wrecked car takes nothing more
+        st.damage = 1.0;
+        st.world_hit(&p, 30.0, at, at);
+        assert_eq!(st.zones, z);
     }
 }

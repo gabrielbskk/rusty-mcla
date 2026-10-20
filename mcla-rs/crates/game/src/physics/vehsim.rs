@@ -5351,6 +5351,8 @@ fn physics_frame(st: &mut CarState, vs: &mut VehState, p: &CarParams, vt: &VehTu
             None
         };
         if let Some((pushed, contacts)) = pushed_now {
+            // (where the velocity solve's move left the body, before it is pushed out)
+            let (moved_rows, moved_origin) = (rows1, origin1);
             at1 = at1 + pushed.push;
             rows1 = super::solver::rows_pushed(&rows1, pushed.turn);
             // (0x8259E790: a turn of under a millionth of a radian is not made and not cleared)
@@ -5366,6 +5368,10 @@ fn physics_frame(st: &mut CarState, vs: &mut VehState, p: &CarParams, vt: &VehTu
             let mut answered = loose_answered && dbg_flag("MCLA_DBG_RA4");
             let mut walls = 0u32;
             st.touch_calls += 1;
+            // (mcCarDamage's view, 0x82343880 / 0x82567A08: every enabled contact's impulse over the
+            // mass, 0.4 of it against the fixed city; the first one's point, the last one's on a car
+            // lying over)
+            let (mut hit_dv, mut hit_first, mut hit_last, mut hit_any) = (Vec3::ZERO, None, Vec3::ZERO, false);
             for m in vs.manifolds.iter_mut() {
                 for slot in m.slots.iter_mut() {
                     if !slot.enabled {
@@ -5373,6 +5379,10 @@ fn physics_frame(st: &mut CarState, vs: &mut VehState, p: &CarParams, vt: &VehTu
                     }
                     let c = contacts[k];
                     k += 1;
+                    hit_dv += c.impulse * (1.0 / mass) * f32::from_bits(0x3ecc_cccd);
+                    hit_any |= c.impulse != Vec3::ZERO;
+                    hit_first.get_or_insert(c.on_body);
+                    hit_last = c.on_body;
                     // (the collision audio's view of it: sub_82381FB0 reads every enabled contact)
                     st.touches.push(super::car::AudioTouch {
                         call: st.touch_calls,
@@ -5402,6 +5412,17 @@ fn physics_frame(st: &mut CarState, vs: &mut VehState, p: &CarParams, vt: &VehTu
                 }
             }
             hull_touched = Some((answered, walls));
+            // (the callback runs only in a tick the solver gave some contact of the car an impulse)
+            if hit_any && !dbg_flag("MCLA_DBG_NOWORLDHIT") {
+                let at = if st.up().y < f32::from_bits(0x3dcc_cccd) { hit_last } else { hit_first.unwrap_or(hit_last) };
+                // (0x82343378: in the instance's matrix, which the tick's move has already set)
+                let d = at - moved_origin;
+                let local = Vec3::new(d.dot(moved_rows[0]), d.dot(moved_rows[1]), d.dot(moved_rows[2]));
+                if dbg_flag("MCLA_DBG_WORLDHIT") {
+                    eprintln!("WORLDHIT dv {:.6} at local {:.6} {:.6} {:.6} zones {:?} damage {:.6}", hit_dv.length(), local.x, local.y, local.z, st.zones, st.damage * p.dmg[0]);
+                }
+                st.world_hit(p, hit_dv.length(), at, local);
+            }
             // (0x8259E920: the matrix the next tick's collision takes for the last one)
             let end = [rows1[0], rows1[1], rows1[2], origin1];
             if !pushed.deep {
@@ -5683,7 +5704,7 @@ fn level_probe(world: &WorldCollider, from: Vec3, to: Vec3) -> Option<(Vec3, Vec
 
 pub(super) fn dbg_flag(name: &'static str) -> bool {
     static FLAGS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
-    FLAGS.get_or_init(|| ["MCLA_DBG_R1", "MCLA_DBG_R2", "MCLA_DBG_R3", "MCLA_DBG_R4", "MCLA_DBG_RB2", "MCLA_DBG_RB3", "MCLA_DBG_RB4", "MCLA_DBG_RB5", "MCLA_DBG_RB6", "MCLA_DBG_P1", "MCLA_DBG_P2", "MCLA_DBG_P3", "MCLA_DBG_RA1", "MCLA_DBG_RA2", "MCLA_DBG_RA3", "MCLA_DBG_RA4", "MCLA_DBG_RA5", "MCLA_DBG_RA6", "MCLA_DBG_RA7", "MCLA_DBG_RA8", "MCLA_DBG_RB1", "MCLA_DBG_RD1", "MCLA_DBG_A1", "MCLA_DBG_A2", "MCLA_DBG_A3", "MCLA_DBG_A4", "MCLA_DBG_Z1", "MCLA_DBG_Z2", "MCLA_DBG_HIT", "MCLA_DBG_OLDCOLLIDE", "MCLA_DBG_NORESOLVE", "MCLA_DBG_NODAMP", "MCLA_DBG_NOROLLBAR", "MCLA_DBG_YAW", "MCLA_DBG_SPHERES", "MCLA_DBG_RAYWHEEL", "MCLA_DBG_HANG", "MCLA_DBG_GYRO", "MCLA_DBG_NOBOX", "MCLA_DBG_NOSTEEP", "MCLA_DBG_NOCAMBER", "MCLA_DBG_NOLEANPROBE", "MCLA_DBG_OLDWHEEL", "MCLA_DBG_ZEROTYRE", "MCLA_DBG_TERMS", "MCLA_DBG_SUBDAMP", "MCLA_DBG_NOFREEZE", "MCLA_DBG_STEEPWHEEL", "MCLA_DBG_NOPIVOT", "MCLA_DBG_NOSETTLE", "MCLA_DBG_NOSTUCK", "MCLA_DBG_STUCK", "MCLA_DBG_SYMSOLVE", "MCLA_DBG_OLDWHEELPOSE", "MCLA_DBG_OLDSUSP", "MCLA_DBG_OLDROWS", "MCLA_DBG_OLDTYREIN", "MCLA_DBG_OLDSUMS", "MCLA_DBG_OLDSTEP", "MCLA_DBG_OLDPOSE", "MCLA_DBG_AXLEORDER", "MCLA_DBG_CALLS", "MCLA_DBG_OLDGYRO", "MCLA_DBG_NOBOTTOM", "MCLA_DBG_WHEELORDER", "MCLA_DBG_OLDMELT", "MCLA_DBG_OLDHANG", "MCLA_DBG_GEAR", "MCLA_DBG_OLDORDER", "MCLA_DBG_OLDSTEER", "MCLA_DBG_OLDDOWN", "MCLA_DBG_OLDDRIFT", "MCLA_DBG_NOENGINEROLL", "MCLA_DBG_OLDAUTOBRAKE", "MCLA_DBG_Y1", "MCLA_DBG_Y2", "MCLA_DBG_Y3", "MCLA_DBG_Y4", "MCLA_DBG_Y5", "MCLA_DBG_Y6", "MCLA_DBG_Y7", "MCLA_DBG_Y8", "MCLA_DBG_Y9", "MCLA_DBG_TRACE"].into_iter().filter(|n| std::env::var(n).is_ok()).collect()).contains(&name)
+    FLAGS.get_or_init(|| ["MCLA_DBG_R1", "MCLA_DBG_R2", "MCLA_DBG_R3", "MCLA_DBG_R4", "MCLA_DBG_RB2", "MCLA_DBG_RB3", "MCLA_DBG_RB4", "MCLA_DBG_RB5", "MCLA_DBG_RB6", "MCLA_DBG_P1", "MCLA_DBG_P2", "MCLA_DBG_P3", "MCLA_DBG_RA1", "MCLA_DBG_RA2", "MCLA_DBG_RA3", "MCLA_DBG_RA4", "MCLA_DBG_RA5", "MCLA_DBG_RA6", "MCLA_DBG_RA7", "MCLA_DBG_RA8", "MCLA_DBG_RB1", "MCLA_DBG_RD1", "MCLA_DBG_A1", "MCLA_DBG_A2", "MCLA_DBG_A3", "MCLA_DBG_A4", "MCLA_DBG_Z1", "MCLA_DBG_Z2", "MCLA_DBG_HIT", "MCLA_DBG_OLDCOLLIDE", "MCLA_DBG_NORESOLVE", "MCLA_DBG_NODAMP", "MCLA_DBG_NOROLLBAR", "MCLA_DBG_YAW", "MCLA_DBG_SPHERES", "MCLA_DBG_RAYWHEEL", "MCLA_DBG_HANG", "MCLA_DBG_GYRO", "MCLA_DBG_NOBOX", "MCLA_DBG_NOSTEEP", "MCLA_DBG_NOCAMBER", "MCLA_DBG_NOLEANPROBE", "MCLA_DBG_OLDWHEEL", "MCLA_DBG_ZEROTYRE", "MCLA_DBG_TERMS", "MCLA_DBG_SUBDAMP", "MCLA_DBG_NOFREEZE", "MCLA_DBG_STEEPWHEEL", "MCLA_DBG_NOPIVOT", "MCLA_DBG_NOSETTLE", "MCLA_DBG_NOSTUCK", "MCLA_DBG_STUCK", "MCLA_DBG_SYMSOLVE", "MCLA_DBG_OLDWHEELPOSE", "MCLA_DBG_OLDSUSP", "MCLA_DBG_OLDROWS", "MCLA_DBG_OLDTYREIN", "MCLA_DBG_OLDSUMS", "MCLA_DBG_OLDSTEP", "MCLA_DBG_OLDPOSE", "MCLA_DBG_AXLEORDER", "MCLA_DBG_CALLS", "MCLA_DBG_OLDGYRO", "MCLA_DBG_NOBOTTOM", "MCLA_DBG_WHEELORDER", "MCLA_DBG_OLDMELT", "MCLA_DBG_OLDHANG", "MCLA_DBG_GEAR", "MCLA_DBG_OLDORDER", "MCLA_DBG_OLDSTEER", "MCLA_DBG_OLDDOWN", "MCLA_DBG_OLDDRIFT", "MCLA_DBG_NOENGINEROLL", "MCLA_DBG_OLDAUTOBRAKE", "MCLA_DBG_Y1", "MCLA_DBG_Y2", "MCLA_DBG_Y3", "MCLA_DBG_Y4", "MCLA_DBG_Y5", "MCLA_DBG_Y6", "MCLA_DBG_Y7", "MCLA_DBG_Y8", "MCLA_DBG_Y9", "MCLA_DBG_TRACE", "MCLA_DBG_WORLDHIT", "MCLA_DBG_NOWORLDHIT"].into_iter().filter(|n| std::env::var(n).is_ok()).collect()).contains(&name)
 }
 
 fn dbg_angdrag() -> f32 {
