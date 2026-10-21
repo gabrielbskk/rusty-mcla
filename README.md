@@ -77,3 +77,12 @@ Interactive. Game names and marks belong to their respective owners.
 Project code is licensed under GPL-3.0-only. See [`LICENSE`](LICENSE) and
 [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md) for details. The Android
 launcher artwork in this fork is an original vector asset.
+
+## AI-assisted development
+
+I used AI assistance for a substantial part of this port. I apologize for using
+it on work that still has this many gaps, and for the mistakes or extra work
+that may result. AI alone has not been capable of completing and validating a
+port of this complexity; the code and results still need careful human review
+and real-device testing. Thank you for your patience while I keep working
+through it step by step.
