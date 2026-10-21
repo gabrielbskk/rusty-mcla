@@ -31,6 +31,15 @@ public final class MainActivity extends Activity {
     private Button play;
     private TextView diagnostic;
     private String diagnosticText = "";
+    private Button copyDiagnostic, shareDiagnostic;
+    private final java.util.concurrent.ExecutorService reports = java.util.concurrent.Executors.newSingleThreadExecutor();
+    private int reportGeneration;
+
+    @Override protected void onDestroy() {
+        reportGeneration++;
+        reports.shutdownNow();
+        super.onDestroy();
+    }
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -63,7 +72,7 @@ public final class MainActivity extends Activity {
         status = new TextView(this);
         status.setTextSize(16);
         panel.addView(status);
-        Button copyDiagnostic = new Button(this);
+        copyDiagnostic = new Button(this);
         copyDiagnostic.setText("Copiar diagnóstico");
         copyDiagnostic.setOnClickListener(v -> {
             ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
@@ -71,13 +80,23 @@ public final class MainActivity extends Activity {
             status.setText("Diagnóstico copiado. Cole o texto na conversa.");
         });
         panel.addView(copyDiagnostic);
+        shareDiagnostic = new Button(this);
+        shareDiagnostic.setText("Compartilhar diagnóstico (.txt)");
+        shareDiagnostic.setOnClickListener(v -> {
+            Uri uri = Uri.parse("content://org.rustymcla.game.diagnostics/report.txt");
+            Intent send = new Intent(Intent.ACTION_SEND).setType("text/plain");
+            send.putExtra(Intent.EXTRA_STREAM, uri);
+            send.setClipData(ClipData.newRawUri("Diagnóstico", uri));
+            send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            startActivity(Intent.createChooser(send, "Enviar diagnóstico"));
+        });
+        panel.addView(shareDiagnostic);
         diagnostic = new TextView(this);
         diagnostic.setTextIsSelectable(true);
         panel.addView(diagnostic);
         ScrollView scroll = new ScrollView(this);
         scroll.addView(panel);
         setContentView(scroll);
-        refresh();
     }
 
     private void installCrashRecorder() {
@@ -138,8 +157,36 @@ public final class MainActivity extends Activity {
         status.setText(!granted ? "Autorize o acesso a todos os arquivos para ler a pasta Rusty na memória interna."
             : found ? "Dados encontrados em " + installRoot().getAbsolutePath() + ". Pode iniciar."
             : "Pasta ainda não encontrada. Crie Rusty na raiz da memória interna e extraia ali todos os ZIPs. Procuro Rusty/RustyMCLA/manifest.local.json e Rusty/RustyMCLA/data/cache.");
-        diagnosticText = buildDiagnostic();
-        diagnostic.setText(diagnosticText);
+        final int generation = ++reportGeneration;
+        copyDiagnostic.setEnabled(false);
+        shareDiagnostic.setEnabled(false);
+        diagnostic.setText("Lendo diagnóstico…");
+        reports.execute(() -> {
+            String report = buildDiagnostic();
+            boolean saved = false;
+            try (FileOutputStream out = new FileOutputStream(new File(getFilesDir(), "diagnostic-report.tmp"))) {
+                out.write(report.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                File trace = new File(getFilesDir(), "diagnostic-anr.txt");
+                if (trace.isFile()) {
+                    out.write("\n\nANR completo (limite de 4 MiB):\n".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                    try (InputStream in = new FileInputStream(trace)) {
+                        byte[] bytes = new byte[8192]; int n;
+                        while ((n = in.read(bytes)) != -1) out.write(bytes, 0, n);
+                    }
+                }
+                out.flush();
+                saved = new File(getFilesDir(), "diagnostic-report.tmp").renameTo(new File(getFilesDir(), "diagnostic-report.txt"));
+            } catch (Exception error) { report += "\nFalha ao salvar relatório: " + error; }
+            final String result = report;
+            final boolean shareReady = saved;
+            runOnUiThread(() -> {
+                if (generation != reportGeneration || isFinishing()) return;
+                diagnosticText = result;
+                diagnostic.setText(result);
+                copyDiagnostic.setEnabled(true);
+                shareDiagnostic.setEnabled(shareReady);
+            });
+        });
     }
 
     private void prepareAndPlay() {
@@ -167,7 +214,7 @@ public final class MainActivity extends Activity {
     }
 
     private String buildDiagnostic() {
-        StringBuilder text = new StringBuilder("Diagnóstico Rusty MCLA 0.7\n");
+        StringBuilder text = new StringBuilder("Diagnóstico Rusty MCLA 0.8\n");
         text.append("Android: ").append(Build.VERSION.RELEASE).append("; aparelho: ")
             .append(Build.MANUFACTURER).append(' ').append(Build.MODEL).append('\n');
         text.append("Acesso aos arquivos: ").append(hasFilesAccess()).append('\n');
@@ -175,6 +222,27 @@ public final class MainActivity extends Activity {
         text.append("Pasta: ").append(root == null ? "não encontrada" : root.getAbsolutePath()).append('\n');
         File index = root == null ? null : new File(root, "data/cache/world_index.json");
         text.append("Índice do mundo: ").append(index != null && index.isFile() ? index.length() + " bytes" : "ausente").append('\n');
+        File javaCrash = new File(getFilesDir(), "last-java-crash.txt");
+        if (javaCrash.isFile()) {
+            text.append("\nExceção Java:\n");
+            appendFileTail(text, javaCrash);
+        }
+        File logs = new File(getFilesDir(), "user/logs");
+        for (String prefix : new String[] {"game-", "crash-"}) {
+            File latest = null;
+            File[] files = logs.listFiles();
+            if (files != null) for (File file : files) {
+                if (file.getName().startsWith(prefix) && (latest == null || file.lastModified() > latest.lastModified()))
+                    latest = file;
+            }
+            if (latest != null) {
+                text.append("\n").append(latest.getName()).append(":\n");
+                appendFileTail(text, latest);
+            }
+        }
+        File savedTrace = new File(getFilesDir(), "diagnostic-anr.txt");
+        savedTrace.delete();
+        boolean traceCaptured = false;
         long started = getSharedPreferences("diagnostics", MODE_PRIVATE).getLong("last_native_launch", 0);
         if (Build.VERSION.SDK_INT >= 30 && started != 0) {
             try {
@@ -186,18 +254,21 @@ public final class MainActivity extends Activity {
                         text.append("Saída ").append(++shown).append(": motivo=").append(exit.getReason())
                             .append(", status=").append(exit.getStatus())
                             .append(", descrição=").append(exit.getDescription()).append('\n');
-                        if (exit.getReason() == ApplicationExitInfo.REASON_ANR) {
+                        if (exit.getReason() == ApplicationExitInfo.REASON_ANR && !traceCaptured) {
                             try (InputStream trace = exit.getTraceInputStream()) {
                                 if (trace != null) {
-                                    text.append("Rastreamento ANR (início):\n");
-                                    byte[] bytes = new byte[20480];
-                                    int count = 0;
-                                    while (count < bytes.length) {
-                                        int read = trace.read(bytes, count, bytes.length - count);
-                                        if (read <= 0) break;
-                                        count += read;
+                                    try (FileOutputStream out = new FileOutputStream(savedTrace)) {
+                                        byte[] bytes = new byte[8192];
+                                        int remaining = 4 * 1024 * 1024, n;
+                                        while (remaining > 0 && (n = trace.read(bytes, 0, Math.min(bytes.length, remaining))) > 0) {
+                                            out.write(bytes, 0, n); remaining -= n;
+                                        }
                                     }
-                                    text.append(new String(bytes, 0, count, java.nio.charset.StandardCharsets.UTF_8)).append('\n');
+                                    traceCaptured = true;
+                                    text.append("\nResumo ANR:\n");
+                                    try (java.io.FileReader input = new java.io.FileReader(savedTrace)) {
+                                        text.append(TraceSummary.read(input));
+                                    }
                                 }
                             } catch (Exception error) {
                                 text.append("Rastreamento ANR indisponível: ").append(error).append('\n');
@@ -210,31 +281,13 @@ public final class MainActivity extends Activity {
                 text.append("Histórico de saída indisponível: ").append(error).append('\n');
             }
         }
-        File javaCrash = new File(getFilesDir(), "last-java-crash.txt");
-        if (javaCrash.isFile()) {
-            text.append("\nExceção Java:\n");
-            appendFileTail(text, javaCrash);
-        }
-        File logs = new File(getFilesDir(), "user/logs");
-        for (String prefix : new String[] {"crash-", "game-"}) {
-            File latest = null;
-            File[] files = logs.listFiles();
-            if (files != null) for (File file : files) {
-                if (file.getName().startsWith(prefix) && (latest == null || file.lastModified() > latest.lastModified()))
-                    latest = file;
-            }
-            if (latest != null) {
-                text.append("\n").append(latest.getName()).append(":\n");
-                appendFileTail(text, latest);
-            }
-        }
         return text.toString();
     }
 
     private static void appendFileTail(StringBuilder text, File file) {
         try (RandomAccessFile input = new RandomAccessFile(file, "r")) {
             long length = input.length();
-            input.seek(Math.max(0, length - 12000));
+            input.seek(Math.max(0, length - 6000));
             byte[] bytes = new byte[(int) (length - input.getFilePointer())];
             input.readFully(bytes);
             text.append(new String(bytes, java.nio.charset.StandardCharsets.UTF_8));

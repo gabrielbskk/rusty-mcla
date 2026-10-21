@@ -23,9 +23,9 @@ if [[ ! -s "$index" ]]; then echo 'Set ANDROID_WORLD_INDEX to the generated data
 mkdir -p build/package/assets
 cp "$index" build/package/assets/world_index.json
 if command -v javac >/dev/null 2>&1; then
-  javac --release 8 -encoding UTF-8 -classpath "$android_jar" -d build/classes src/org/rustymcla/game/MainActivity.java
+  javac --release 8 -encoding UTF-8 -classpath "$android_jar" -d build/classes src/org/rustymcla/game/*.java
 elif [[ -n "${ECJ_JAR:-}" ]]; then
-  java -jar "$ECJ_JAR" -1.8 -encoding UTF-8 -classpath "$android_jar" -d build/classes src/org/rustymcla/game/MainActivity.java
+  java -jar "$ECJ_JAR" -1.8 -encoding UTF-8 -classpath "$android_jar" -d build/classes src/org/rustymcla/game/*.java
 else
   echo 'Install a JDK (javac), or set ECJ_JAR to the Eclipse Java compiler jar.' >&2
   exit 1
