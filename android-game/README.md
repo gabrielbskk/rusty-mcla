@@ -11,7 +11,8 @@ build tools 35.0.0, and NDK 27.2.12479018. Set `ANDROID_HOME` and run
 needed for the data import Activity; `ECJ_JAR` can point to the Eclipse Java
 compiler instead. The output is `android-game/build/rusty-mcla-android-dev.apk`.
 
-The APK contains engine code only. It does not contain the commercial game.
+The APK contains engine code and a small index derived from the user's converted
+city files. It does not contain the commercial game assets.
 Version 0.2 reads a converted install directly from
 `/storage/emulated/0/Rusty/RustyMCLA` (or directly from `Rusty`). Its setup
 Activity requests Android's all-files access permission and checks the folder
@@ -38,3 +39,8 @@ connected to the engine.
 
 The project does not distribute game data. The user must provide their own
 copy. The APK uses a locally generated debug key and is not a release build.
+
+Before building the APK, run `mcla-tool world-index /path/to/data/cache` on the
+converted installation and set `ANDROID_WORLD_INDEX` to the resulting
+`world_index.json`. The setup Activity installs the index to the shared game
+folder on first launch. This skips scanning all city files on the phone.

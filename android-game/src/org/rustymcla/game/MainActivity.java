@@ -18,6 +18,7 @@ import android.widget.TextView;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.InputStream;
 import java.io.PrintWriter;
 import java.io.RandomAccessFile;
 import java.util.List;
@@ -42,7 +43,7 @@ public final class MainActivity extends Activity {
         title.setTextSize(23);
         panel.addView(title);
         TextView explanation = new TextView(this);
-        explanation.setText("Extraia todas as 154 partes ZIP na pasta Rusty da memória interna, ao lado de Download. Deve existir Rusty/RustyMCLA/manifest.local.json e Rusty/RustyMCLA/data/cache. O jogo lerá esses arquivos diretamente, sem copiar 13,5 GB para dentro do aplicativo. O motor ainda não foi testado num aparelho.");
+        explanation.setText("Extraia todas as 154 partes ZIP na pasta Rusty da memória interna, ao lado de Download. Deve existir Rusty/RustyMCLA/manifest.local.json e Rusty/RustyMCLA/data/cache. O jogo lerá esses arquivos diretamente, sem copiar 13,5 GB para dentro do aplicativo. A primeira abertura pode levar algum tempo.");
         explanation.setTextSize(16);
         panel.addView(explanation);
         permission = new Button(this);
@@ -139,9 +140,10 @@ public final class MainActivity extends Activity {
         File root = installRoot();
         if (!hasFilesAccess() || !ready(root)) { refresh(); return; }
         play.setEnabled(false);
-        status.setText("Preparando vídeo de abertura. Mantenha o aplicativo aberto.");
+        status.setText("Preparando os dados. Mantenha o aplicativo aberto.");
         new Thread(() -> {
             try {
+                installWorldIndex(root);
                 joinIntroVideo(root);
                 runOnUiThread(() -> {
                     refresh();
@@ -159,12 +161,14 @@ public final class MainActivity extends Activity {
     }
 
     private String buildDiagnostic() {
-        StringBuilder text = new StringBuilder("Diagnóstico Rusty MCLA 0.5\n");
+        StringBuilder text = new StringBuilder("Diagnóstico Rusty MCLA 0.6\n");
         text.append("Android: ").append(Build.VERSION.RELEASE).append("; aparelho: ")
             .append(Build.MANUFACTURER).append(' ').append(Build.MODEL).append('\n');
         text.append("Acesso aos arquivos: ").append(hasFilesAccess()).append('\n');
         File root = installRoot();
         text.append("Pasta: ").append(root == null ? "não encontrada" : root.getAbsolutePath()).append('\n');
+        File index = root == null ? null : new File(root, "data/cache/world_index.json");
+        text.append("Índice do mundo: ").append(index != null && index.isFile() ? index.length() + " bytes" : "ausente").append('\n');
         long started = getSharedPreferences("diagnostics", MODE_PRIVATE).getLong("last_native_launch", 0);
         if (Build.VERSION.SDK_INT >= 30 && started != 0) {
             try {
@@ -213,6 +217,18 @@ public final class MainActivity extends Activity {
         } catch (Exception error) {
             text.append("Não consegui ler: ").append(error).append('\n');
         }
+    }
+
+    private void installWorldIndex(File root) throws Exception {
+        File index = new File(root, "data/cache/world_index.json");
+        File temp = new File(index.getPath() + ".tmp");
+        try (InputStream in = getAssets().open("world_index.json");
+             FileOutputStream out = new FileOutputStream(temp)) {
+            byte[] bytes = new byte[8192];
+            int count;
+            while ((count = in.read(bytes)) != -1) out.write(bytes, 0, count);
+        }
+        if (!temp.renameTo(index)) throw new IllegalStateException("Não foi possível gravar o índice do mundo.");
     }
 
     private static void joinIntroVideo(File root) throws Exception {

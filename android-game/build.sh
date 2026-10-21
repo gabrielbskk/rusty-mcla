@@ -18,6 +18,10 @@ fi
 library=../mcla-rs/target/aarch64-linux-android/release/libmcla_android.so
 if [[ ! -f "$library" ]]; then echo "Missing $library" >&2; exit 1; fi
 mkdir -p build/classes build/package/lib/arm64-v8a
+index="${ANDROID_WORLD_INDEX:-}"
+if [[ ! -s "$index" ]]; then echo 'Set ANDROID_WORLD_INDEX to the generated data/cache/world_index.json.' >&2; exit 1; fi
+mkdir -p build/package/assets
+cp "$index" build/package/assets/world_index.json
 if command -v javac >/dev/null 2>&1; then
   javac --release 8 -encoding UTF-8 -classpath "$android_jar" -d build/classes src/org/rustymcla/game/MainActivity.java
 elif [[ -n "${ECJ_JAR:-}" ]]; then
@@ -30,7 +34,8 @@ fi
 cp "$library" build/package/lib/arm64-v8a/libmcla_android.so
 cp "$ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" build/package/lib/arm64-v8a/libc++_shared.so
 "$tools/aapt2" link -o build/unsigned.apk -I "$android_jar" --manifest AndroidManifest.xml --min-sdk-version 30 --target-sdk-version 30
-(cd build/package && zip -q -u ../unsigned.apk classes.dex lib/arm64-v8a/libmcla_android.so lib/arm64-v8a/libc++_shared.so)
+package_files=(classes.dex lib/arm64-v8a/libmcla_android.so lib/arm64-v8a/libc++_shared.so assets/world_index.json)
+(cd build/package && zip -q -u ../unsigned.apk "${package_files[@]}")
 "$tools/zipalign" -f 4 build/unsigned.apk build/aligned.apk
 if [[ ! -f build/debug.keystore ]]; then
   keytool -genkeypair -keystore build/debug.keystore -storepass android -keypass android -alias androiddebugkey -dname 'CN=Android Debug,O=Android,C=US' -keyalg RSA -keysize 2048 -validity 10000 >/dev/null 2>&1

@@ -22,3 +22,5 @@ aes.workspace = true
 png = "0.17"
 hashbrown.workspace = true
 glam.workspace = true
+serde.workspace = true
+serde_json.workspace = true

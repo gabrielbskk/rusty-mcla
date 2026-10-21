@@ -10,6 +10,7 @@
 
 mod cmds;
 mod swfcmd;
+mod world_index;
 
 use anyhow::{bail, Context, Result};
 use mcla_formats::iso::Xiso;
@@ -37,6 +38,7 @@ fn main() -> Result<()> {
         "xmemtest" => cmd_xmemtest(&args[2..]),
         "sector" => cmd_sector(&args[2..]),
         "citymap" => cmd_citymap(&args[2..]),
+        "world-index" => world_index::build(&args[2..]),
         "drawable" => cmds::cmd_drawable(&args[2..]),
         "uimesh" => cmds::cmd_uimesh(&args[2..]),
         "shaders" => cmds::cmd_shaders(&args[2..]),

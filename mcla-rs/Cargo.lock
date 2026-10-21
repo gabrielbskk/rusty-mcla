@@ -1714,6 +1714,8 @@ dependencies = [
  "memmap2",
  "png",
  "rayon",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
