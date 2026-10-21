@@ -1,6 +1,10 @@
 package org.rustymcla.game;
 
 import android.app.Activity;
+import android.app.ActivityManager;
+import android.app.ApplicationExitInfo;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Intent;
 import android.net.Uri;
 import android.os.Build;
@@ -14,15 +18,21 @@ import android.widget.TextView;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.PrintWriter;
+import java.io.RandomAccessFile;
+import java.util.List;
 
 /** Launches the native engine directly from the user's shared Rusty folder. */
 public final class MainActivity extends Activity {
     private TextView status;
     private Button permission;
     private Button play;
+    private TextView diagnostic;
+    private String diagnosticText = "";
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
+        installCrashRecorder();
         LinearLayout panel = new LinearLayout(this);
         panel.setOrientation(LinearLayout.VERTICAL);
         int pad = (int) (20 * getResources().getDisplayMetrics().density);
@@ -46,10 +56,33 @@ public final class MainActivity extends Activity {
         status = new TextView(this);
         status.setTextSize(16);
         panel.addView(status);
+        Button copyDiagnostic = new Button(this);
+        copyDiagnostic.setText("Copiar diagnóstico");
+        copyDiagnostic.setOnClickListener(v -> {
+            ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+            clipboard.setPrimaryClip(ClipData.newPlainText("Rusty MCLA diagnóstico", diagnosticText));
+            status.setText("Diagnóstico copiado. Cole o texto na conversa.");
+        });
+        panel.addView(copyDiagnostic);
+        diagnostic = new TextView(this);
+        diagnostic.setTextIsSelectable(true);
+        panel.addView(diagnostic);
         ScrollView scroll = new ScrollView(this);
         scroll.addView(panel);
         setContentView(scroll);
         refresh();
+    }
+
+    private void installCrashRecorder() {
+        Thread.UncaughtExceptionHandler previous = Thread.getDefaultUncaughtExceptionHandler();
+        Thread.setDefaultUncaughtExceptionHandler((thread, error) -> {
+            try (PrintWriter output = new PrintWriter(new FileOutputStream(
+                    new File(getFilesDir(), "last-java-crash.txt")))) {
+                output.println("Thread: " + thread.getName());
+                error.printStackTrace(output);
+            } catch (Throwable ignored) { }
+            if (previous != null) previous.uncaughtException(thread, error);
+        });
     }
 
     @Override protected void onResume() {
@@ -98,6 +131,8 @@ public final class MainActivity extends Activity {
         status.setText(!granted ? "Autorize o acesso a todos os arquivos para ler a pasta Rusty na memória interna."
             : found ? "Dados encontrados em " + installRoot().getAbsolutePath() + ". Pode iniciar."
             : "Pasta ainda não encontrada. Crie Rusty na raiz da memória interna e extraia ali todos os ZIPs. Procuro Rusty/RustyMCLA/manifest.local.json e Rusty/RustyMCLA/data/cache.");
+        diagnosticText = buildDiagnostic();
+        diagnostic.setText(diagnosticText);
     }
 
     private void prepareAndPlay() {
@@ -110,6 +145,8 @@ public final class MainActivity extends Activity {
                 joinIntroVideo(root);
                 runOnUiThread(() -> {
                     refresh();
+                    getSharedPreferences("diagnostics", MODE_PRIVATE).edit()
+                        .putLong("last_native_launch", System.currentTimeMillis()).apply();
                     startActivity(new Intent().setClassName(getPackageName(), "android.app.NativeActivity"));
                 });
             } catch (Exception error) {
@@ -119,6 +156,63 @@ public final class MainActivity extends Activity {
                 });
             }
         }, "mcla-prepare").start();
+    }
+
+    private String buildDiagnostic() {
+        StringBuilder text = new StringBuilder("Diagnóstico Rusty MCLA 0.4\n");
+        text.append("Android: ").append(Build.VERSION.RELEASE).append("; aparelho: ")
+            .append(Build.MANUFACTURER).append(' ').append(Build.MODEL).append('\n');
+        text.append("Acesso aos arquivos: ").append(hasFilesAccess()).append('\n');
+        File root = installRoot();
+        text.append("Pasta: ").append(root == null ? "não encontrada" : root.getAbsolutePath()).append('\n');
+        long started = getSharedPreferences("diagnostics", MODE_PRIVATE).getLong("last_native_launch", 0);
+        if (Build.VERSION.SDK_INT >= 30 && started != 0) {
+            try {
+                ActivityManager manager = (ActivityManager) getSystemService(ACTIVITY_SERVICE);
+                List<ApplicationExitInfo> exits = manager.getHistoricalProcessExitReasons(getPackageName(), 0, 5);
+                for (ApplicationExitInfo exit : exits) {
+                    if (exit.getTimestamp() >= started - 1000) {
+                        text.append("Última saída: motivo=").append(exit.getReason())
+                            .append(", status=").append(exit.getStatus())
+                            .append(", descrição=").append(exit.getDescription()).append('\n');
+                        break;
+                    }
+                }
+            } catch (Exception error) {
+                text.append("Histórico de saída indisponível: ").append(error).append('\n');
+            }
+        }
+        File javaCrash = new File(getFilesDir(), "last-java-crash.txt");
+        if (javaCrash.isFile()) {
+            text.append("\nExceção Java:\n");
+            appendFileTail(text, javaCrash);
+        }
+        File logs = new File(getFilesDir(), "user/logs");
+        for (String prefix : new String[] {"crash-", "game-"}) {
+            File latest = null;
+            File[] files = logs.listFiles();
+            if (files != null) for (File file : files) {
+                if (file.getName().startsWith(prefix) && (latest == null || file.lastModified() > latest.lastModified()))
+                    latest = file;
+            }
+            if (latest != null) {
+                text.append("\n").append(latest.getName()).append(":\n");
+                appendFileTail(text, latest);
+            }
+        }
+        return text.toString();
+    }
+
+    private static void appendFileTail(StringBuilder text, File file) {
+        try (RandomAccessFile input = new RandomAccessFile(file, "r")) {
+            long length = input.length();
+            input.seek(Math.max(0, length - 12000));
+            byte[] bytes = new byte[(int) (length - input.getFilePointer())];
+            input.readFully(bytes);
+            text.append(new String(bytes, java.nio.charset.StandardCharsets.UTF_8));
+        } catch (Exception error) {
+            text.append("Não consegui ler: ").append(error).append('\n');
+        }
     }
 
     private static void joinIntroVideo(File root) throws Exception {

@@ -1,6 +1,6 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="org.rustymcla.game"
-    android:versionCode="2" android:versionName="0.2-dev">
+    android:versionCode="4" android:versionName="0.4-diagnostic">
     <uses-sdk android:minSdkVersion="30" android:targetSdkVersion="30" />
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
     <uses-feature android:glEsVersion="0x00030000" android:required="false" />
