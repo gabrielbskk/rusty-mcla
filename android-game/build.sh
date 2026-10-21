@@ -33,7 +33,9 @@ fi
 "$tools/d8" --min-api 26 --lib "$android_jar" --output build/package build/classes/org/rustymcla/game/*.class
 cp "$library" build/package/lib/arm64-v8a/libmcla_android.so
 cp "$ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" build/package/lib/arm64-v8a/libc++_shared.so
-"$tools/aapt2" link -o build/unsigned.apk -I "$android_jar" --manifest AndroidManifest.xml --min-sdk-version 30 --target-sdk-version 30
+mkdir -p build/res-compiled
+"$tools/aapt2" compile res/drawable/cover.jpg -o build/res-compiled
+"$tools/aapt2" link -o build/unsigned.apk -I "$android_jar" --manifest AndroidManifest.xml --min-sdk-version 30 --target-sdk-version 30 -R build/res-compiled/drawable_cover.jpg.flat
 package_files=(classes.dex lib/arm64-v8a/libmcla_android.so lib/arm64-v8a/libc++_shared.so assets/world_index.json)
 (cd build/package && zip -q -u ../unsigned.apk "${package_files[@]}")
 "$tools/zipalign" -f 4 build/unsigned.apk build/aligned.apk

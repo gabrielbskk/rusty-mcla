@@ -18,9 +18,15 @@ Version 0.2 reads a converted install directly from
 Activity requests Android's all-files access permission and checks the folder
 before starting the native engine. The converted install is not copied into
 app-private storage. The Activity joins the two `intro.mcv.part0x` files from
-the Drive package in place on the first launch. Save data remains in the
-app-private directory. The original split ZIP files are not a converted
+the Drive package in place on the first launch. Game saves are written beside
+the converted data under `data/cache`. The original split ZIP files are not a converted
 install; all 154 converted ZIPs must be extracted first.
+
+The supplied cover is displayed on the setup screen and used as the launcher
+icon. On Android, the city streamer starts with a 210 m radius and at most
+three sector decodes at once. The full city map is built only when requested.
+The setup screen's diagnostic includes recent frame and sector progress and,
+when Android provides one, the start of an ANR trace.
 
 ## Current mobile input
 

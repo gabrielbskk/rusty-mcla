@@ -797,6 +797,10 @@ fn sector_list_line(s: String) {
 }
 
 pub fn decode_sector(id: usize, path: &Path) -> Result<CpuSector> {
+    decode_sector_with_collision(id, path, true)
+}
+
+pub(crate) fn decode_sector_with_collision(id: usize, path: &Path, include_collision: bool) -> Result<CpuSector> {
     let res = load_resource_file(path)?;
     let sec = Sector::parse(&res)?;
     let mut batches = Vec::with_capacity(sec.batches.len());
@@ -805,7 +809,7 @@ pub fn decode_sector(id: usize, path: &Path) -> Result<CpuSector> {
     for b in &sec.batches {
         let m = &b.mesh;
         let n = m.positions.len();
-        {
+        if include_collision {
             let sname = sec.shaders[b.shader].name.to_ascii_lowercase();
             use crate::physics::collision::Surface;
             let surf = Surface::from_material(&sec.shaders[b.shader].source_path, &sec.shaders[b.shader].name, sec.shaders[b.shader].diffuse().unwrap_or(""));
@@ -995,8 +999,9 @@ pub struct World {
     far_hidden: HashMap<usize, GpuSector>,
     last_fade: std::time::Instant,
     pub pending: hashbrown::HashSet<usize>,
-    tx: Sender<Result<CpuSector>>,
-    rx: Receiver<Result<CpuSector>>,
+    pub failed: hashbrown::HashSet<usize>,
+    tx: Sender<(usize, Result<CpuSector>)>,
+    rx: Receiver<(usize, Result<CpuSector>)>,
     pub load_radius: f32,
     pub unload_radius: f32,
     pub tex_fail: hashbrown::HashSet<u32>,
@@ -1070,7 +1075,7 @@ impl World {
                 Ok(list) => {
                     log::info!("far city: {} sector models, {} triangles", list.len(), list.iter().flat_map(|c| c.batches.iter()).map(|b| b.indices.len() / 3).sum::<usize>());
                     for cs in list {
-                        let _ = tx.send(Ok(cs));
+                        let _ = tx.send((cs.id, Ok(cs)));
                     }
                 }
                 Err(e) => log::warn!("far city: {:#}", e),
@@ -1104,10 +1109,11 @@ impl World {
             far_hidden: HashMap::new(),
             last_fade: std::time::Instant::now(),
             pending: Default::default(),
+            failed: Default::default(),
             tx,
             rx,
-            load_radius: 450.0,
-            unload_radius: 540.0,
+            load_radius: if cfg!(target_os = "android") { 210.0 } else { 450.0 },
+            unload_radius: if cfg!(target_os = "android") { 300.0 } else { 540.0 },
             tex_fail: Default::default(),
             stats_tris: 0,
             collider,
@@ -1157,7 +1163,7 @@ impl World {
 
     /// Are the sectors around `p` resident (so physics can run)?
     pub fn ready_at(&self, p: Vec3) -> bool {
-        self.index.sectors.iter().enumerate().all(|(id, s)| Self::dist_to(s, p) > 60.0 || self.loaded.contains_key(&id))
+        self.index.sectors.iter().enumerate().all(|(id, s)| Self::dist_to(s, p) > 60.0 || self.loaded.contains_key(&id) || self.failed.contains(&id))
     }
 
     fn dist_to(info: &SectorInfo, p: Vec3) -> f32 {
@@ -1183,6 +1189,9 @@ impl World {
         // here they swap. MCLA_SECTOR_DIST=<metres> overrides.
         let lens_deg = crate::props::lens().to_degrees();
         let detail = 300.0 * (1.5 - 0.5 * ((lens_deg - 25.0) * 0.04).clamp(0.0, 1.0));
+        // Mobile GPUs have much less texture memory. Stream a smaller nearby
+        // neighbourhood while retaining the same distance override for tests.
+        let detail = if cfg!(target_os = "android") { detail.min(210.0) } else { detail };
         let detail = std::env::var("MCLA_SECTOR_DIST").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(detail);
         // (the lens widens with speed: keep to the larger distance for a while rather than drop and reload)
         self.load_radius = detail.max(self.load_radius - 2.0);
@@ -1210,24 +1219,25 @@ impl World {
             .sectors
             .iter()
             .enumerate()
-            .filter(|(id, _)| !self.loaded.contains_key(id) && !self.pending.contains(id))
+            .filter(|(id, _)| !self.loaded.contains_key(id) && !self.pending.contains(id) && !self.failed.contains(id))
             .map(|(id, s)| (Self::dist_to(s, pos), id))
             .filter(|(d, _)| *d < self.load_radius)
             .collect();
         want.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        let max_inflight: usize = 12;
+        let max_inflight: usize = if cfg!(target_os = "android") { 3 } else { 12 };
         for (_, id) in want.into_iter().take(max_inflight.saturating_sub(self.pending.len())) {
             self.pending.insert(id);
             let path = self.assets.path(&self.index.sectors[id].file);
             let tx = self.tx.clone();
+            let include_collision = !self.own_bound;
             rayon::spawn(move || {
-                let r = decode_sector(id, &path);
-                let _ = tx.send(r);
+                let r = decode_sector_with_collision(id, &path, include_collision);
+                let _ = tx.send((id, r));
             });
         }
         // upload finished (time-boxed)
         let t0 = std::time::Instant::now();
-        while let Ok(r) = self.rx.try_recv() {
+        while let Ok((requested_id, r)) = self.rx.try_recv() {
             match r {
                 Ok(cs) if cs.id >= FAR_ID => {
                     let id = cs.id;
@@ -1251,21 +1261,39 @@ impl World {
                     self.sets.insert(id, gs);
                     self.collider.sectors.insert(id, SectorMesh::build(col));
                 }
-                Ok(cs) => {
+                Ok(mut cs) => {
                     self.pending.remove(&cs.id);
                     if Self::dist_to(&self.index.sectors[cs.id], pos) <= self.unload_radius {
                         let id = cs.id;
-                        let col = std::mem::take(&mut { cs.collision.clone() });
-                        let mats = cs.collision_mat.clone();
+                        let upload_started = std::time::Instant::now();
+                        // The disc's own collision is normally resident already. Do not
+                        // duplicate thousands of triangles just to discard the copy.
+                        let mesh_collision = if self.own_bound {
+                            None
+                        } else {
+                            Some(SectorMesh::build_with(
+                                std::mem::take(&mut cs.collision),
+                                std::mem::take(&mut cs.collision_mat),
+                            ))
+                        };
                         let gs = self.upload(gpu, cs);
                         self.stats_tris += gs.tris as u64;
                         self.loaded.insert(id, gs);
-                        if !self.own_bound {
-                            self.collider.sectors.insert(id, SectorMesh::build_with(col, mats));
+                        if let Some(mesh) = mesh_collision {
+                            self.collider.sectors.insert(id, mesh);
+                        }
+                        if cfg!(target_os = "android") {
+                            log::info!("city sector {} ready: {} loaded, {} pending, {:.0} ms upload+collision", id, self.loaded.len(), self.pending.len(), upload_started.elapsed().as_secs_f32() * 1000.0);
                         }
                     }
                 }
-                Err(e) => log::warn!("sector load failed: {:#}", e),
+                Err(e) => {
+                    self.pending.remove(&requested_id);
+                    if requested_id < SET_ID {
+                        self.failed.insert(requested_id);
+                    }
+                    log::warn!("sector {} load failed: {:#}", requested_id, e);
+                }
             }
             if t0.elapsed().as_secs_f32() * 1000.0 > budget_ms {
                 break;
@@ -1347,7 +1375,8 @@ impl World {
     pub fn request_set(&self, k: usize, path: PathBuf) {
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(decode_set(SET_ID + k, &path));
+            let id = SET_ID + k;
+            let _ = tx.send((id, decode_set(id, &path)));
         });
     }
 

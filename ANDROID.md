@@ -4,7 +4,9 @@ The original repository builds a Windows PC game and launcher. The
 `android-game/` work now cross-compiles the Rust engine and packages an
 experimental Android APK. Version 0.5 reached the Vulkan renderer and began
 building the city index on a an Android device; gameplay remains
-unverified. Version 0.6 includes a precomputed index. The engine
+unverified. Version 0.6 includes a precomputed index. Version 0.7 reduces
+initial sector streaming work and defers the full city map on Android; it has
+device coverage remains limited. The engine
 reads converted data from a user-supplied Xbox 360 Complete Edition disc
 image. The APK contains engine code and reads the converted data from the
 shared `Rusty` directory on Android after the user grants all-files access.
@@ -24,8 +26,8 @@ Activity also rejoins the large intro video, which is split into two files.
 ## Next milestones
 
 - **Data:** The converted data is prepared outside the phone and extracted into
-  the shared `Rusty` directory. The engine reads it directly, while saves and
-  settings remain private to the app. The installer uses desktop tools such as
+  the shared `Rusty` directory. The engine reads it directly; game saves are
+  written in `data/cache`, while settings remain private to the app. The installer uses desktop tools such as
   ffmpeg; an on-device conversion workflow remains separate work.
 - **Renderer:** Verify Vulkan support, render-target formats, texture limits,
   memory use and shader compilation on actual devices. The renderer already

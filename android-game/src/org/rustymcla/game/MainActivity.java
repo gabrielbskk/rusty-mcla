@@ -12,6 +12,7 @@ import android.os.Bundle;
 import android.os.Environment;
 import android.provider.Settings;
 import android.widget.Button;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -38,6 +39,11 @@ public final class MainActivity extends Activity {
         panel.setOrientation(LinearLayout.VERTICAL);
         int pad = (int) (20 * getResources().getDisplayMetrics().density);
         panel.setPadding(pad, pad, pad, pad);
+        ImageView cover = new ImageView(this);
+        cover.setImageResource(getResources().getIdentifier("cover", "drawable", getPackageName()));
+        cover.setAdjustViewBounds(true);
+        cover.setMaxHeight((int) (300 * getResources().getDisplayMetrics().density));
+        panel.addView(cover);
         TextView title = new TextView(this);
         title.setText("Rusty MCLA — Android experimental");
         title.setTextSize(23);
@@ -161,7 +167,7 @@ public final class MainActivity extends Activity {
     }
 
     private String buildDiagnostic() {
-        StringBuilder text = new StringBuilder("Diagnóstico Rusty MCLA 0.6\n");
+        StringBuilder text = new StringBuilder("Diagnóstico Rusty MCLA 0.7\n");
         text.append("Android: ").append(Build.VERSION.RELEASE).append("; aparelho: ")
             .append(Build.MANUFACTURER).append(' ').append(Build.MODEL).append('\n');
         text.append("Acesso aos arquivos: ").append(hasFilesAccess()).append('\n');
@@ -174,12 +180,30 @@ public final class MainActivity extends Activity {
             try {
                 ActivityManager manager = (ActivityManager) getSystemService(ACTIVITY_SERVICE);
                 List<ApplicationExitInfo> exits = manager.getHistoricalProcessExitReasons(getPackageName(), 0, 5);
+                int shown = 0;
                 for (ApplicationExitInfo exit : exits) {
                     if (exit.getTimestamp() >= started - 1000) {
-                        text.append("Última saída: motivo=").append(exit.getReason())
+                        text.append("Saída ").append(++shown).append(": motivo=").append(exit.getReason())
                             .append(", status=").append(exit.getStatus())
                             .append(", descrição=").append(exit.getDescription()).append('\n');
-                        break;
+                        if (exit.getReason() == ApplicationExitInfo.REASON_ANR) {
+                            try (InputStream trace = exit.getTraceInputStream()) {
+                                if (trace != null) {
+                                    text.append("Rastreamento ANR (início):\n");
+                                    byte[] bytes = new byte[20480];
+                                    int count = 0;
+                                    while (count < bytes.length) {
+                                        int read = trace.read(bytes, count, bytes.length - count);
+                                        if (read <= 0) break;
+                                        count += read;
+                                    }
+                                    text.append(new String(bytes, 0, count, java.nio.charset.StandardCharsets.UTF_8)).append('\n');
+                                }
+                            } catch (Exception error) {
+                                text.append("Rastreamento ANR indisponível: ").append(error).append('\n');
+                            }
+                        }
+                        if (shown >= 3) break;
                     }
                 }
             } catch (Exception error) {

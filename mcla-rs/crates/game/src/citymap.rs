@@ -5,7 +5,7 @@
 //! flies a camera over a mesh built from the two.
 use crate::assets::Assets;
 use crate::render::{MatMode, Vertex};
-use crate::world::{decode_sector, SectorInfo, SharedTextures};
+use crate::world::{decode_sector_with_collision, SectorInfo, SharedTextures};
 use glam::Vec3;
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -150,7 +150,7 @@ impl CityMap {
             .par_iter()
             .enumerate()
             .filter_map(|(id, info)| {
-                let cs = decode_sector(id, &assets.path(&info.file)).ok()?;
+                let cs = decode_sector_with_collision(id, &assets.path(&info.file), false).ok()?;
                 let mut means: HashMap<u32, Option<[u8; 3]>> = HashMap::new();
                 for (hsh, t) in &cs.textures {
                     means.insert(*hsh, Some(t.mean_color().0));

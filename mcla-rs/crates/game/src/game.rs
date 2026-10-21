@@ -3407,6 +3407,9 @@ impl Game {
                 self.flash_popup = crate::flash_ui::FlashMenu::load(&self.data_dir, crate::flash_ui::POPUP_MOVIE, [0.0, 0.0], &shared);
                 self.ui_shared = Some(shared);
             }
+            if cfg!(target_os = "android") {
+                log::info!("Android UI assets ready");
+            }
         }
         if !matches!(self.mode, Mode::Paused | Mode::Results) && !(self.mode == Mode::RaceSelect && self.hangout_key.is_some()) {
             if let Some(fm) = self.flash_menu.as_mut() {

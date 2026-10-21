@@ -4983,6 +4983,14 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
         for _ in 0..ticks {
             self.update_gameplay(fixed_step::DT);
         }
+        #[cfg(target_os = "android")]
+        if (self.game.show_map || self.game.mode == Mode::RaceSelect)
+            && self.citymap.is_none() && self.citymap_rx.is_none()
+        {
+            let world = self.world.as_ref().unwrap();
+            log::info!("Android map requested; starting city map build");
+            self.citymap_rx = Some(citymap::spawn(world.assets.clone(), world.index.sectors.clone(), world.shared.clone()));
+        }
         self.vehicles.render_alpha = if self.opt.fixed_dt > 0.0 { 1.0 } else { self.sim_clock.alpha() };
         let world = self.world.take().unwrap();
         let mut gpu = self.gpu.take().unwrap();
@@ -7467,6 +7475,12 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
         }
         self.world = Some(world);
         self.gpu = Some(gpu);
+        #[cfg(target_os = "android")]
+        if self.frame_no <= 10 || self.frame_no % 60 == 0 || now.elapsed().as_secs_f32() > 1.0 {
+            if let Some(world) = self.world.as_ref() {
+                log::info!("Android frame {}: {:.0} ms, city sectors {} loaded / {} pending / {} failed, simulation loading {}", self.frame_no, now.elapsed().as_secs_f32() * 1000.0, world.loaded.len(), world.streaming(), world.failed.len(), loading);
+            }
+        }
         let action = std::mem::replace(&mut self.pending_action, MenuAction::None);
         self.handle_action(action);
     }
@@ -8242,7 +8256,7 @@ impl ApplicationHandler for App {
                 }
             }
         }
-        if std::env::var("MCLA_NO_CITYMAP").is_err() && std::env::var("MCLA_SIM_TEST").is_err() {
+        if !cfg!(target_os = "android") && std::env::var("MCLA_NO_CITYMAP").is_err() && std::env::var("MCLA_SIM_TEST").is_err() {
             self.citymap_rx = Some(citymap::spawn(world.assets.clone(), world.index.sectors.clone(), world.shared.clone()));
         }
         self.spawn_player(&mut gpu, &mut world);
@@ -8561,6 +8575,8 @@ impl ApplicationHandler for App {
         self.world = Some(world);
         self.window = Some(window);
         self.last = Instant::now();
+        #[cfg(target_os = "android")]
+        log::info!("Android scene initialization complete; entering render loop");
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
