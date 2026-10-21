@@ -12,11 +12,14 @@ needed for the data import Activity; `ECJ_JAR` can point to the Eclipse Java
 compiler instead. The output is `android-game/build/rusty-mcla-android-dev.apk`.
 
 The APK contains engine code only. It does not contain the commercial game.
-The Activity accepts a folder already prepared by `mcla-tool install`, copies
-it into app-private storage, then permits starting the engine. That copy can
-exceed 14 GB, so the phone needs more space than the source folder alone.
-The original split ZIP files are not a converted install and cannot be
-selected in this Activity.
+Version 0.2 reads a converted install directly from
+`/storage/emulated/0/Rusty/RustyMCLA` (or directly from `Rusty`). Its setup
+Activity requests Android's all-files access permission and checks the folder
+before starting the native engine. The converted install is not copied into
+app-private storage. The Activity joins the two `intro.mcv.part0x` files from
+the Drive package in place on the first launch. Save data remains in the
+app-private directory. The original split ZIP files are not a converted
+install; all 154 converted ZIPs must be extracted first.
 
 ## Current mobile input
 

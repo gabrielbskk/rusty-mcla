@@ -8970,8 +8970,14 @@ static ANDROID_APP: std::sync::OnceLock<winit::platform::android::activity::Andr
 fn android_main(app: winit::platform::android::activity::AndroidApp) {
     if let Some(root) = app.internal_data_path() {
         std::env::set_var("RUSTY_MCLA_USER_DIR", root.join("user"));
-        std::env::set_var("MCLA_DATA", root.join("data/cache"));
     }
+    let shared = std::path::Path::new("/storage/emulated/0/Rusty");
+    let install = if shared.join("manifest.local.json").is_file() {
+        shared.to_path_buf()
+    } else {
+        shared.join("RustyMCLA")
+    };
+    std::env::set_var("MCLA_DATA", install.join("data/cache"));
     let _ = ANDROID_APP.set(app);
     let _ = hooks::run(run_game);
 }

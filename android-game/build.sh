@@ -28,7 +28,7 @@ else
 fi
 "$tools/d8" --min-api 26 --lib "$android_jar" --output build/package build/classes/org/rustymcla/game/*.class
 cp "$library" build/package/lib/arm64-v8a/libmcla_android.so
-"$tools/aapt2" link -o build/unsigned.apk -I "$android_jar" --manifest AndroidManifest.xml --min-sdk-version 26 --target-sdk-version 28
+"$tools/aapt2" link -o build/unsigned.apk -I "$android_jar" --manifest AndroidManifest.xml --min-sdk-version 30 --target-sdk-version 30
 (cd build/package && zip -q -u ../unsigned.apk classes.dex lib/arm64-v8a/libmcla_android.so)
 "$tools/zipalign" -f 4 build/unsigned.apk build/aligned.apk
 if [[ ! -f build/debug.keystore ]]; then

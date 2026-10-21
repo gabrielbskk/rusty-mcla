@@ -4,7 +4,8 @@ The original repository builds a Windows PC game and launcher. The
 `android-game/` work now cross-compiles the Rust engine and packages an
 experimental Android APK; device execution is not yet verified. The engine
 reads converted data from a user-supplied Xbox 360 Complete Edition disc
-image. The APK contains engine code and imports the converted data separately.
+image. The APK contains engine code and reads the converted data from the
+shared `Rusty` directory on Android after the user grants all-files access.
 During local testing, `mcla-tool install` converted a checksum-verified original
 image into 13.5 GB of game data. `tools/pack-android-data.py` split that
 install into independent ZIPs below the Drive upload limit. The import
@@ -20,9 +21,10 @@ Activity also rejoins the large intro video, which is split into two files.
 
 ## Next milestones
 
-- **Data:** The converted data is prepared outside the phone and copied by the
-  Android Activity into app-private storage. The installer uses desktop tools
-  such as ffmpeg; an on-device conversion workflow remains separate work.
+- **Data:** The converted data is prepared outside the phone and extracted into
+  the shared `Rusty` directory. The engine reads it directly, while saves and
+  settings remain private to the app. The installer uses desktop tools such as
+  ffmpeg; an on-device conversion workflow remains separate work.
 - **Renderer:** Verify Vulkan support, render-target formats, texture limits,
   memory use and shader compilation on actual devices. The renderer already
   decodes BC textures to RGBA when BC compression is absent, but the memory
