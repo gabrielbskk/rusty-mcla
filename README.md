@@ -1,5 +1,7 @@
 # Rusty MCLA
 
+> **Android port in this fork:** Work is in the [android-experimental branch](https://github.com/gabrielbskk/rusty-mcla/tree/android-experimental). The current APK is experimental and is being tested on a Samsung Galaxy S23 (SM-S911B, Android 16, Adreno 740). It has shown partial graphics, but black screens and input timeouts remain. See the branch README for progress, source code and how to contribute. You need your own legally obtained game data.
+
 ![Rust lines](https://img.shields.io/endpoint?url=https%3A%2F%2Fghloc.dev%2Fapi%2Fholdmysocks%2Frusty-mcla%2Fbadge%3Ffilter%3D.rs%24&label=Rust%20lines)
 ![License](https://img.shields.io/github/license/holdmysocks/rusty-mcla)
 ![Status](https://img.shields.io/badge/status-early%20development-orange)
