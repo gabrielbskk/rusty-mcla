@@ -22,11 +22,13 @@ the Drive package in place on the first launch. Game saves are written beside
 the converted data under `data/cache`. The original split ZIP files are not a converted
 install; all 154 converted ZIPs must be extracted first.
 
-The supplied cover is displayed on the setup screen and used as the launcher
-icon. On Android, the city streamer starts with a 210 m radius and at most
+The tester-supplied cover is displayed on the setup screen and used as the launcher
+icon. Its third-party artwork rights have not been independently verified. On Android, the city streamer starts with a 210 m radius and at most
 three sector decodes at once. The full city map is built only when requested.
-The setup screen's diagnostic includes recent frame and sector progress and,
-when Android provides one, the start of an ANR trace.
+The setup screen reports recent frame and sector progress. Version 0.8 can share
+its diagnostic as a text file, with a short summary that prioritizes the native
+`android_main` thread and an available ANR trace of up to 4 MiB. This improves
+troubleshooting; it does not establish a fix for the ANRs.
 
 ## Current mobile input
 
@@ -36,9 +38,19 @@ the top strip sends Back. Multitouch lets steering and pedals work together.
 Menus receive touch events through egui. Android controllers are not yet
 connected to the engine.
 
+## Physical test status
+
+The tester uses a Android device Android device, Android 16, with an Adreno 740
+Vulkan GPU. Version 0.6 showed a vehicle and parts of the city, but the ground
+was white or absent. Version 0.7 still produced black screens and input ANRs.
+One trace showed the Java main thread waiting during `NativeActivity.onPause`;
+the native game thread was not present in the excerpt. The cause remains under
+investigation. RAM readings in the supplied traces do not establish an OOM.
+Please attach a full version 0.8 text diagnostic when reporting Android issues.
+
 ## Verification still needed
 
-- Install and launch on a physical ARM64 device with Vulkan support.
+- Confirm a complete playable session on a physical ARM64 device with Vulkan support.
 - Measure shader and texture compatibility, memory use and frame rate.
 - Check audio, cutscenes, save/load, suspend/resume and all touch menus.
 - Provide an Android or cloud conversion path for an original split archive.

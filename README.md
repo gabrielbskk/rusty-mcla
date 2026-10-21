@@ -4,13 +4,16 @@
 ![License](https://img.shields.io/github/license/holdmysocks/rusty-mcla)
 ![Status](https://img.shields.io/badge/status-early%20development-orange)
 ![Platform](https://img.shields.io/badge/platform-Windows-blue)
+![Android port](https://img.shields.io/badge/Android-experimental-orange)
 
-An unofficial PC port of *Midnight Club: Los Angeles* (Complete Edition), written in Rust.
+An unofficial port of *Midnight Club: Los Angeles* (Complete Edition), written in Rust.
+
+> **Android port:** Experimental ARM64 work is maintained on this branch. See the Android build and test notes; game data must be user-supplied.
 
 ![The Rusty MCLA launcher, ready to play](assets/launcher-home.png)
 
 It is a new game engine that reads the original game's own data from **your copy of the disc** and runs the game natively on PC
-(Vulkan, DirectX 12 and Metal through wgpu). Nothing of the original game is included in this repository or in its releases.
+(Vulkan, DirectX 12 and Metal through wgpu). The original game's data is not included in this repository. The Android test install uses data converted separately from the tester's own copy of the game.
 
 > **Status: early development.** The game runs from data extracted from a disc image, and the launcher that will automate the
 > setup is being built. There is no stable release yet.
@@ -51,8 +54,8 @@ Please **do not post or ask for game files or disc images** in issues.
 ## Licence and notice
 
 The code is licensed under the **GNU General Public License, version 3 only** (see `LICENSE`). Contributions are accepted under the same licence.
-The licences of the third-party software compiled into the programs are listed in [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md).
+The licences of the third-party software compiled into the programs are listed in [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md). The Android branch contains a tester-supplied cover image used by its launcher. Its rights have not been independently verified, and the code licence does not grant rights to third-party game names or artwork. If you hold rights to material here, please open an issue so it can be reviewed.
 
 This is an unofficial fan project. It is not affiliated with, authorised or endorsed by Rockstar Games or Take-Two Interactive.
 "Midnight Club" and "Midnight Club: Los Angeles" and related names and artwork belong to their owners and are used here only to say which game this
-project works with. No game data, art, audio or video is distributed with it, and no game-specific keys: the only key material in the source is two public console constants (the Xbox 360 retail XEX key and the PS3 save-data key); the game's own key is derived on your machine from your own copy.
+project works with. No original game data, audio or video is distributed in this repository, and no game-specific keys: the only key material in the source is two public console constants (the Xbox 360 retail XEX key and the PS3 save-data key); the game's own key is derived on your machine from your own copy.
