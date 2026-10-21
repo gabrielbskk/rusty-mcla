@@ -55,6 +55,7 @@ words!(Intro { Normal = "normal", Fast = "fast", Skip = "skip" });
 words!(Aspect { Auto = "auto", Wide21x9 = "21:9", Wide32x9 = "32:9", Fit16x9 = "16:9" });
 words!(Upscaler { Off = "off", Bilinear = "bilinear", Fsr = "fsr" });
 words!(Aa { Off = "off", Fxaa = "fxaa", Msaa2 = "msaa2", Msaa4 = "msaa4" });
+words!(GraphicsPreset { Default = "default", Performance = "performance", Custom = "custom" });
 
 /// A window size in pixels. Written as `"1600x900"`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,8 +88,17 @@ pub struct Display {
     pub vsync: bool,
     /// frames per second, 0 = no cap
     pub fps_cap: u32,
+    pub graphics_preset: GraphicsPreset,
     pub upscaler: Upscaler,
     pub render_scale: f32,
+    /// Strength of motion blur and depth-of-field effects (0 = disabled, 1 = full).
+    pub blur_strength: f32,
+    /// Fraction of particle effects to simulate (0 = off, 1 = full).
+    pub effects_scale: f32,
+    /// Pedestrian population multiplier (0 = none, 1 = full).
+    pub pedestrian_density: f32,
+    /// World and object draw distance multiplier.
+    pub draw_distance: f32,
     pub aa: Aa,
     /// index of the monitor, 0 = the primary one
     pub monitor: u32,
@@ -135,8 +145,13 @@ impl Default for Settings {
                 aspect: Aspect::Auto,
                 vsync: true,
                 fps_cap: 0,
+                graphics_preset: GraphicsPreset::Default,
                 upscaler: Upscaler::Off,
                 render_scale: 1.0,
+                blur_strength: 1.0,
+                effects_scale: 1.0,
+                pedestrian_density: 1.0,
+                draw_distance: 1.0,
                 aa: Aa::Off,
                 monitor: 0,
             },
@@ -215,8 +230,13 @@ impl Settings {
         s.display.aspect = r.word(dt, "display.aspect", "aspect", d.display.aspect, Aspect::parse, Aspect::WORDS);
         s.display.vsync = r.boolean(dt, "display.vsync", "vsync", d.display.vsync);
         s.display.fps_cap = r.uint(dt, "display.fps_cap", "fps_cap", d.display.fps_cap, |n| n == 0 || (20..=1000).contains(&n), "0 (no cap) or 20..1000");
+        s.display.graphics_preset = r.word(dt, "display.graphics_preset", "graphics_preset", d.display.graphics_preset, GraphicsPreset::parse, GraphicsPreset::WORDS);
         s.display.upscaler = r.word(dt, "display.upscaler", "upscaler", d.display.upscaler, Upscaler::parse, Upscaler::WORDS);
         s.display.render_scale = r.float(dt, "display.render_scale", "render_scale", d.display.render_scale, 0.5, 2.0);
+        s.display.blur_strength = r.float(dt, "display.blur_strength", "blur_strength", d.display.blur_strength, 0.0, 1.0);
+        s.display.effects_scale = r.float(dt, "display.effects_scale", "effects_scale", d.display.effects_scale, 0.0, 1.0);
+        s.display.pedestrian_density = r.float(dt, "display.pedestrian_density", "pedestrian_density", d.display.pedestrian_density, 0.0, 1.0);
+        s.display.draw_distance = r.float(dt, "display.draw_distance", "draw_distance", d.display.draw_distance, 0.5, 1.0);
         s.display.aa = r.word(dt, "display.aa", "aa", d.display.aa, Aa::parse, Aa::WORDS);
         s.display.monitor = r.uint(dt, "display.monitor", "monitor", d.display.monitor, |n| n < 16, "0..15");
         let gt = sub(t, "game");
@@ -252,9 +272,14 @@ impl Settings {
         put(&mut t, "display", "aspect", d.aspect.word().into());
         put(&mut t, "display", "vsync", d.vsync.into());
         put(&mut t, "display", "fps_cap", Value::Integer(d.fps_cap as i64));
+        put(&mut t, "display", "graphics_preset", d.graphics_preset.word().into());
         put(&mut t, "display", "upscaler", d.upscaler.word().into());
         // (f32 -> f64 directly would write 0.800000011920929)
         put(&mut t, "display", "render_scale", Value::Float(format!("{}", d.render_scale).parse::<f64>().unwrap_or(1.0)));
+        put(&mut t, "display", "blur_strength", Value::Float(format!("{}", d.blur_strength).parse::<f64>().unwrap_or(1.0)));
+        put(&mut t, "display", "effects_scale", Value::Float(format!("{}", d.effects_scale).parse::<f64>().unwrap_or(1.0)));
+        put(&mut t, "display", "pedestrian_density", Value::Float(format!("{}", d.pedestrian_density).parse::<f64>().unwrap_or(1.0)));
+        put(&mut t, "display", "draw_distance", Value::Float(format!("{}", d.draw_distance).parse::<f64>().unwrap_or(1.0)));
         put(&mut t, "display", "aa", d.aa.word().into());
         put(&mut t, "display", "monitor", Value::Integer(d.monitor as i64));
         put(&mut t, "game", "intro", g.intro.word().into());
@@ -278,8 +303,8 @@ impl Settings {
     pub fn summary(&self) -> String {
         let (d, g) = (&self.display, &self.game);
         format!(
-            "window_mode={} resolution={} vsync={} fps_cap={} intro={} (aspect={} upscaler={} render_scale={} aa={} monitor={})",
-            d.window_mode.word(), d.resolution.text(), d.vsync, d.fps_cap, g.intro.word(), d.aspect.word(), d.upscaler.word(), d.render_scale, d.aa.word(), d.monitor
+            "window_mode={} resolution={} vsync={} fps_cap={} intro={} (aspect={} preset={} upscaler={} render_scale={} blur={} effects={} pedestrians={} draw_distance={} aa={} monitor={})",
+            d.window_mode.word(), d.resolution.text(), d.vsync, d.fps_cap, g.intro.word(), d.aspect.word(), d.graphics_preset.word(), d.upscaler.word(), d.render_scale, d.blur_strength, d.effects_scale, d.pedestrian_density, d.draw_distance, d.aa.word(), d.monitor
         )
     }
 }

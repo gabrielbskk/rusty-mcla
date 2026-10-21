@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 420" role="img" aria-labelledby="title desc">
+  <title id="title">Rusty MCLA Android fork</title>
+  <desc id="desc">Original night city illustration with a stylized car and Android ARM64 experimental status.</desc>
+  <defs>
+    <linearGradient id="sky" x2="1" y2="1">
+      <stop stop-color="#101a2a"/>
+      <stop offset=".62" stop-color="#1d2941"/>
+      <stop offset="1" stop-color="#422343"/>
+    </linearGradient>
+    <linearGradient id="road" x2="0" y2="1">
+      <stop stop-color="#293447"/>
+      <stop offset="1" stop-color="#0b111b"/>
+    </linearGradient>
+    <linearGradient id="car" x2="1" y2="1">
+      <stop stop-color="#ff725c"/>
+      <stop offset="1" stop-color="#b72f37"/>
+    </linearGradient>
+    <filter id="glow" x="-.5" y="-.5" width="2" height="2">
+      <feGaussianBlur stdDeviation="7" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect width="1440" height="420" rx="28" fill="url(#sky)"/>
+  <circle cx="1160" cy="94" r="44" fill="#ffbe69" opacity=".92"/>
+  <path d="M0 275 96 275V178h68v97h31V143h83v132h28V205h70v70h34V162h88v113h44V193h73v82h30V120h89v155h34V177h75v98h31V143h91v132h33V197h66v78h48V159h82v116h55V195h71v80h52v145H0Z" fill="#111c2a"/>
+  <path d="M0 304 155 279l111-2 99 27 166 8 132-31 87-5 154 27 109-7 105-18 122 31 100-6v117H0Z" fill="url(#road)"/>
+  <path d="m0 342 404-16m103 12 207-10m103 7 215-7m95 5 313-5" fill="none" stroke="#ffbd68" stroke-width="3" opacity=".55"/>
+  <path d="M493 320 946 320m-281 44 421-1m-593 39 560 1" stroke="#dce5ed" stroke-width="3" stroke-dasharray="38 34" opacity=".35"/>
+  <g filter="url(#glow)" opacity=".9">
+    <path d="M174 220v-45m31 45v-78m82 79v-54m235 48v-86m263 90v-66m155 70v-93m229 100v-65" stroke="#6ee7f2" stroke-width="4"/>
+    <circle cx="174" cy="171" r="5" fill="#6ee7f2"/><circle cx="205" cy="137" r="5" fill="#ffbd68"/>
+    <circle cx="287" cy="163" r="5" fill="#ffbd68"/><circle cx="522" cy="130" r="5" fill="#6ee7f2"/>
+    <circle cx="785" cy="151" r="5" fill="#ffbd68"/><circle cx="940" cy="124" r="5" fill="#6ee7f2"/>
+    <circle cx="1169" cy="151" r="5" fill="#ffbd68"/>
+  </g>
+  <g transform="translate(845 251)">
+    <ellipse cx="190" cy="103" rx="213" ry="21" fill="#05080e" opacity=".65"/>
+    <path d="m29 74 23-45q8-14 29-18l77-9 46 7 54 34 63 13q19 4 25 22l10 31H12l5-25q2-8 12-10Z" fill="url(#car)" stroke="#ffb18a" stroke-width="3"/>
+    <path d="m91 18 70-8 38 7 43 31H72l11-21q2-6 8-9Z" fill="#182b3d" stroke="#83deef" stroke-width="3"/>
+    <path d="m20 77 47-7m253 12 29 7" stroke="#ffcf91" stroke-width="6" stroke-linecap="round"/>
+    <circle cx="86" cy="105" r="27" fill="#0a0e16" stroke="#76879a" stroke-width="6"/>
+    <circle cx="280" cy="105" r="27" fill="#0a0e16" stroke="#76879a" stroke-width="6"/>
+    <circle cx="86" cy="105" r="10" fill="#9aa9b5"/><circle cx="280" cy="105" r="10" fill="#9aa9b5"/>
+  </g>
+  <g font-family="Inter,Segoe UI,Arial,sans-serif" fill="#f5f7fb">
+    <text x="86" y="98" font-size="20" font-weight="700" letter-spacing="5" fill="#ffbd68">COMMUNITY FORK · ANDROID</text>
+    <text x="82" y="169" font-size="57" font-weight="800" letter-spacing="-2">RUSTY MCLA</text>
+    <text x="86" y="211" font-size="23" fill="#c2cfdd">Native ARM64 work in progress</text>
+    <rect x="84" y="235" width="295" height="42" rx="21" fill="#ffbd68"/>
+    <text x="105" y="263" font-size="17" font-weight="800" fill="#172131" letter-spacing="1.2">EXPERIMENTAL · STABILITY WORK</text>
+  </g>
+</svg>

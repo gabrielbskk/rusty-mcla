@@ -702,6 +702,7 @@ struct Tuning {
 }
 
 pub struct Peds {
+    density_scale: f32,
     districts: Distribution,
     hour: f32,
     dirs: Vec<(String, PathBuf, PathBuf)>,
@@ -766,7 +767,9 @@ fn wrap_angle(mut d: f32) -> f32 {
 
 impl Peds {
     pub fn new() -> Peds {
+        let density_scale = crate::hooks::graphics_settings().pedestrian_density.clamp(0.0, 1.0);
         Peds {
+            density_scale,
             districts: Distribution::default(),
             hour: 12.0,
             dirs: Vec::new(),
@@ -1087,7 +1090,7 @@ impl Peds {
         self.cands = spawn_candidates(mesh, focus, self.tune.spawn_outer);
         let total: f32 = self.cands.iter().map(|c| c.1).sum();
         // area times the density, times the focus district's density at this hour
-        self.target = total * self.tune.density * self.districts.density_at(focus, self.hour);
+        self.target = total * self.tune.density * self.density_scale * self.districts.density_at(focus, self.hour);
         if self.list.len() as f32 >= self.target || self.cands.is_empty() {
             return;
         }
@@ -1732,22 +1735,25 @@ impl Peds {
     pub fn prepare(&mut self, gpu: &Gpu, cam: Vec3, frustum: &Frustum) {
         self.buf.clear();
         let mut local: Vec<(Quat, Vec3)> = Vec::new();
+        let graphics = crate::hooks::graphics_settings();
         for p in self.list.iter_mut() {
             let Some(Some(ty)) = self.types.get(&p.ty) else { continue };
             let dist = p.pos.distance(cam);
-            let visible = dist < 160.0 && frustum.intersects_aabb(p.pos - Vec3::new(1.2, 0.2, 1.2), p.pos + Vec3::new(1.2, 2.1, 1.2));
+            let visible = dist < graphics.pedestrian_distance_m
+                && frustum.intersects_aabb(p.pos - Vec3::new(1.2, 0.2, 1.2), p.pos + Vec3::new(1.2, 2.1, 1.2));
+            if !visible {
+                p.cur.clear();
+                continue;
+            }
             let (clip, looped) = ty.clip(p.state);
             clip.local(&ty.model.bones, clip.frame(p.time, looped), &mut local);
             if p.blend > 0.0 && p.from.len() == local.len() {
                 blend_pose(&mut local, &p.from, (p.blend / 0.25).clamp(0.0, 1.0));
             }
             p.cur.clone_from(&local);
-            if !visible {
-                continue;
-            }
-            let lod = if dist < ty.lod_switch[0] {
+            let lod = if dist < ty.lod_switch[0] * graphics.lod_distance_scale {
                 0
-            } else if dist < ty.lod_switch[1] {
+            } else if dist < ty.lod_switch[1] * graphics.lod_distance_scale {
                 1
             } else {
                 2

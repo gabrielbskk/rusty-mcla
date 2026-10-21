@@ -207,6 +207,7 @@ impl Rng {
 }
 
 pub struct Particles {
+    quality: f32,
     list: Vec<Particle>,
     /// sprite sheets: the port's own `KINDS` first, then those of the effect list's rules
     binds: Vec<Option<Arc<wgpu::BindGroup>>>,
@@ -305,7 +306,9 @@ fn v3(a: [f32; 4]) -> Vec3 {
 
 impl Particles {
     pub fn new() -> Particles {
+        let quality = crate::hooks::effects_scale();
         Particles {
+            quality,
             list: Vec::new(),
             binds: vec![None; KINDS],
             depth_bg: None,
@@ -619,7 +622,7 @@ impl Particles {
             _ => 1.0,
         };
         let rate = ev(0, 0, er.spawn_rate.eval(te));
-        let r = rng.range(rate[0], rate[1]).max(0.0);
+        let r = rng.range(rate[0], rate[1]).max(0.0) * self.quality;
         let mut n = if er.one_shot {
             em.t = 1.0;
             r as i32
@@ -811,6 +814,9 @@ impl Particles {
     }
 
     fn push(&mut self, p: Particle) {
+        if self.quality <= 0.0 || (self.quality < 1.0 && self.rand() >= self.quality) {
+            return;
+        }
         if self.list.len() < MAX {
             self.list.push(p);
         }

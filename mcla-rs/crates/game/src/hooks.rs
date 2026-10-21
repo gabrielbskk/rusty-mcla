@@ -13,7 +13,7 @@
 
 use crate::App;
 use mcla_config::paths::{self, DataDir, DataInputs, DataSource};
-use mcla_config::{Intro, Settings, Status, WindowMode};
+use mcla_config::{GraphicsPreset, Intro, Settings, Status, WindowMode};
 use std::collections::VecDeque;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -93,6 +93,103 @@ pub fn intro_film() -> bool {
 
 pub fn intro_scene() -> bool {
     intro_mode() != Intro::Skip
+}
+
+/// A single immutable snapshot of the graphics policy used throughout a frame.
+/// Distance values are in metres; collision residency remains independent.
+#[derive(Clone, Copy, Debug)]
+pub struct GraphicsSettings {
+    pub preset: GraphicsPreset,
+    pub render_scale: f32,
+    pub sector_detail_distance_m: f32,
+    pub world_draw_distance_m: f32,
+    pub vehicle_distance_m: f32,
+    pub pedestrian_distance_m: f32,
+    pub prop_distance_scale: f32,
+    /// Multiplies asset-authored high-detail LOD thresholds; lower values switch sooner.
+    pub lod_distance_scale: f32,
+    pub blur_strength: f32,
+    pub effects_scale: f32,
+    pub pedestrian_density: f32,
+    pub shadows_enabled: bool,
+    pub reflections_enabled: bool,
+}
+
+/// Resolve the selected preset once into the values consumed by the engine.
+pub fn graphics_settings() -> GraphicsSettings {
+    let display = get()
+        .filter(|runtime| !runtime.settings_ignored)
+        .map(|runtime| runtime.settings.display.clone())
+        .unwrap_or_else(|| Settings::default().display);
+    let android = cfg!(target_os = "android");
+    match display.graphics_preset {
+        GraphicsPreset::Default => GraphicsSettings {
+            preset: GraphicsPreset::Default,
+            render_scale: if android { 2.0 / 3.0 } else { display.render_scale.clamp(0.5, 2.0) },
+            sector_detail_distance_m: if android { 210.0 } else { 450.0 * display.draw_distance.clamp(0.5, 1.0) },
+            world_draw_distance_m: if android { 450.0 } else { 450.0 },
+            vehicle_distance_m: 450.0,
+            pedestrian_distance_m: 160.0,
+            prop_distance_scale: 1.0,
+            lod_distance_scale: 1.0,
+            blur_strength: if android { 0.35 } else { display.blur_strength.clamp(0.0, 1.0) },
+            effects_scale: if android { 0.5 } else { display.effects_scale.clamp(0.0, 1.0) },
+            pedestrian_density: if android { 0.25 } else { display.pedestrian_density.clamp(0.0, 1.0) },
+            // The mobile shadow and planar-reflection passes remain off until the
+            // Android GPU path is verified across devices.
+            shadows_enabled: !android,
+            reflections_enabled: !android,
+        },
+        GraphicsPreset::Performance => GraphicsSettings {
+            preset: GraphicsPreset::Performance,
+            render_scale: 0.5,
+            sector_detail_distance_m: 100.0,
+            world_draw_distance_m: 100.0,
+            vehicle_distance_m: 100.0,
+            pedestrian_distance_m: 100.0,
+            // Props' far-cell default reach is 2600 m; scale it to the preset's 100 m.
+            prop_distance_scale: 100.0 / 2600.0,
+            lod_distance_scale: 0.5,
+            blur_strength: 0.0,
+            effects_scale: 0.0,
+            pedestrian_density: 0.0,
+            shadows_enabled: false,
+            reflections_enabled: false,
+        },
+        GraphicsPreset::Custom => {
+            let distance = display.draw_distance.clamp(0.5, 1.0);
+            GraphicsSettings {
+                preset: GraphicsPreset::Custom,
+                render_scale: display.render_scale.clamp(0.5, 2.0),
+                sector_detail_distance_m: (if android { 210.0 } else { 450.0 }) * distance,
+                world_draw_distance_m: 450.0 * distance,
+                vehicle_distance_m: 450.0 * distance,
+                pedestrian_distance_m: 160.0 * distance,
+                prop_distance_scale: distance,
+                lod_distance_scale: 1.0,
+                blur_strength: display.blur_strength.clamp(0.0, 1.0),
+                effects_scale: display.effects_scale.clamp(0.0, 1.0),
+                pedestrian_density: display.pedestrian_density.clamp(0.0, 1.0),
+                shadows_enabled: !android,
+                reflections_enabled: !android,
+            }
+        }
+    }
+}
+
+/// Configured world/object range, with a conservative full-distance fallback.
+pub fn draw_distance_scale() -> f32 {
+    graphics_settings().prop_distance_scale
+}
+
+/// Configured particle emission multiplier.
+pub fn effects_scale() -> f32 {
+    graphics_settings().effects_scale
+}
+
+/// Configured blur multiplier.
+pub fn blur_strength() -> f32 {
+    graphics_settings().blur_strength
 }
 
 // ---------------------------------------------------------------- logging

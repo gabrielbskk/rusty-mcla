@@ -1,33 +1,35 @@
-# Android port: known issues and useful contributions
+# Known Android issues
 
-This branch is experimental. The APK has not been verified as playable.
+The Android port is experimental and is not verified as a playable release.
+For the full evidence and release blockers, see
+[TESTING-STATUS.md](TESTING-STATUS.md).
 
-## Startup ANR and missing ground on the Galaxy S23
+## Performance
 
-Physical test device: one Android 16 ARM64 phone,
-using the system Vulkan driver and converted data from the tester's own copy.
+Retained traces from one Android 16 ARM64 phone show sustained frame times of
+roughly 1.7–1.9 seconds per frame after loading, or about 0.5–0.6 FPS. A test
+screen showed about 2 FPS. The graphics preset, scene scale, draw distance,
+effects, and sector streaming controls are implemented, but have not delivered
+playable performance on that device.
 
-- Version 0.6 displayed the vehicle and parts of the city, but the ground was
-  white or absent. Another run showed a black screen.
-- Version 0.7 still produced 10-second input dispatch ANRs for touch and key
-  events. The last shared game log reached UI/map asset loading, before the
-  `Android scene initialization complete` and first-frame messages.
-- In one excerpt the Java main thread waited inside `android_activity` during
-  `NativeActivity.onPause`. Another excerpt showed it idle in the Looper.
-  Neither excerpt contained the native `android_main` stack, so the blocking
-  operation is unknown. The reported memory values do not establish OOM.
+## Input ANR
 
-`ApplicationHandler::resumed` in `mcla-rs/crates/game/src/main.rs` initializes
-Vulkan, loads subsystems, and uploads scene assets synchronously before it
-returns to the Android event loop. A pause arriving during this work may wait
-for the native thread. This is a hypothesis to test, not a confirmed cause.
+An earlier physical run recorded a 10-second input-dispatch ANR while the game
+activity was active. Later logs reached the render loop and loaded city sectors,
+but the available evidence does not confirm the ANR has been fixed. Full
+play-through, suspend/resume, audio, save/load, and sustained-session checks are
+still open.
 
-Version 0.8 can export a `.txt` report with the recent game log, a summary that
-prioritizes `android_main`, and the available ANR trace up to 4 MiB. The native
-engine is the same as in 0.7. Useful next work: analyze the complete trace;
-measure initialization stages; make long startup work responsive to lifecycle
-events; verify the first rendered frame and ground geometry; test pause/resume.
+## GPU compatibility
 
-Please share technical logs without commercial game data, personal information,
-or third-party driver files. Testing requires a legally obtained copy of the
-game. Pull requests can target `android-experimental`.
+The Android build enables wgpu's system Vulkan and GLES backends. Only one
+Adreno-based device has been tested. Compatibility with Mali, Xclipse, other
+Adreno models, and older Android versions is unverified.
+
+## Contributing useful reports
+
+Please include the APK version, Android version, device/GPU family, the steps
+that trigger the issue, and a short relevant log excerpt. Remove account data,
+storage paths, serial numbers, unrelated notifications, and other personal
+details before sharing. Do not attach converted game data, raw driver packages,
+or full unreviewed diagnostic dumps.

@@ -1473,8 +1473,10 @@ impl Props {
         let card_model = |card: usize| imp.map_or(card, |i| if scene { i.card(card) } else { i.shadow_card(card) });
         pass.set_vertex_buffer(1, ibuf.slice(..));
         let lens = lens();
+        let graphics = crate::hooks::graphics_settings();
+        let draw_scale = graphics.prop_distance_scale;
         // fine cells: what is only seen close by; coarse cells: lamps, masts, trees
-        for (cell, size, reach) in [(cell_of(cam), CELL, NEAR_DIST), (far_cell_of(cam), FAR_CELL, FAR_DIST)] {
+        for (cell, size, reach) in [(cell_of(cam), CELL, NEAR_DIST * draw_scale), (far_cell_of(cam), FAR_CELL, FAR_DIST * draw_scale)] {
             let r = (reach / size).ceil() as i32;
             for dx in -r..=r {
                 for dz in -r..=r {
@@ -1483,6 +1485,7 @@ impl Props {
                         let model = &self.models[run.model];
                         let d = dist_to_box(cam, run.min, run.max);
                         let (near, far) = model.reach(run.scale, lens);
+                        let (near, far) = (near * graphics.lod_distance_scale, far * draw_scale);
                         if d > far || !frustum.intersects_aabb(run.min, run.max) || occluded.map_or(false, |o| o.hides_aabb(run.min, run.max)) {
                             continue;
                         }
@@ -1509,6 +1512,7 @@ impl Props {
                                 for sub in &run.subs {
                                     let ds = dist_to_box(cam, sub.min, sub.max);
                                     let (near, far) = model.reach(sub.scale, lens);
+                                    let (near, far) = (near * graphics.lod_distance_scale, far * draw_scale);
                                     if ds > far || !frustum.intersects_aabb(sub.min, sub.max) || occluded.map_or(false, |o| o.hides_aabb(sub.min, sub.max)) {
                                         continue;
                                     }

@@ -106,7 +106,9 @@ use std::time::Instant;
 use vehicles::Vehicles;
 use game::{Game, HudInfo, MenuAction, Mode};
 use winit::application::ApplicationHandler;
-use winit::event::{DeviceEvent, ElementState, MouseButton, WindowEvent};
+use winit::event::{ElementState, WindowEvent};
+#[cfg(not(target_os = "android"))]
+use winit::event::{DeviceEvent, MouseButton};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
@@ -116,8 +118,11 @@ use world::World;
 struct Input {
     keys: hashbrown::HashSet<KeyCode>,
     pending_keys: hashbrown::HashSet<KeyCode>,
+    #[cfg(not(target_os = "android"))]
     mouse_dx: f32,
+    #[cfg(not(target_os = "android"))]
     mouse_dy: f32,
+    #[cfg(not(target_os = "android"))]
     rmb: bool,
     #[cfg(target_os = "android")]
     touch_keys: hashbrown::HashSet<KeyCode>,
@@ -199,6 +204,12 @@ struct App {
     orbit: f32,
     sim_time: f32,
     tick_no: u64,
+    /// Pause the first gameplay ticks after Play until nearby sectors and startup assets are ready.
+    world_load_pending: bool,
+    /// Free roam's ambient and police models are loaded a frame at a time on Android.
+    free_roam_model_queue: Vec<std::path::PathBuf>,
+    free_roam_model_total: usize,
+    loading_screen_frames: u32,
     /// frames the race-over menu has offered RACE BACK (test hooks, althk.rs)
     alt_menu_frames: u32,
     /// the freeway men's scripts have made the police units (althk.rs)
@@ -625,6 +636,10 @@ impl App {
             orbit,
             sim_time: 0.0,
             tick_no: 0,
+            world_load_pending: false,
+            free_roam_model_queue: Vec::new(),
+            free_roam_model_total: 0,
+            loading_screen_frames: 0,
             alt_menu_frames: 0,
             alt_units_made: false,
             sim_clock: fixed_step::Clock::default(),
@@ -1714,12 +1729,15 @@ impl App {
         self.tick_no += 1;
         self.vehicles.begin_tick();
         // --- input / simulation -------------------------------------------------
-        if self.input.rmb {
-            self.cam.yaw += self.input.mouse_dx * 0.0025;
-            self.cam.pitch = (self.cam.pitch - self.input.mouse_dy * 0.0025).clamp(-1.5, 1.5);
+        #[cfg(not(target_os = "android"))]
+        {
+            if self.input.rmb {
+                self.cam.yaw += self.input.mouse_dx * 0.0025;
+                self.cam.pitch = (self.cam.pitch - self.input.mouse_dy * 0.0025).clamp(-1.5, 1.5);
+            }
+            self.input.mouse_dx = 0.0;
+            self.input.mouse_dy = 0.0;
         }
-        self.input.mouse_dx = 0.0;
-        self.input.mouse_dy = 0.0;
         if self.input.down(KeyCode::BracketRight) {
             self.time_of_day = (self.time_of_day + dt * 2.0) % 24.0;
         }
@@ -4949,12 +4967,132 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
         self.handle_action(action);
     }
 
+    #[cfg(target_os = "android")]
+    fn render_loading_screen(&mut self, window: &Window, progress: (usize, usize, usize, usize, usize)) {
+        let Some(gpu) = self.gpu.as_mut() else { return };
+        let frame = match gpu.surface.get_current_texture() {
+            Ok(frame) => frame,
+            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                gpu.resize(gpu.config.width, gpu.config.height);
+                return;
+            }
+            Err(error) => {
+                log::error!("loading screen surface: {error:?}");
+                return;
+            }
+        };
+        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(gpu.config.format.remove_srgb_suffix()),
+            ..Default::default()
+        });
+        let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("loading screen"),
+        });
+        {
+            let _clear = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("loading screen background"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.025, g: 0.035, b: 0.055, a: 1.0 }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+        }
+
+        let (ready, required, failed, models_ready, models_total) = progress;
+        let finished = ready + failed;
+        let tasks_total = required + models_total;
+        let tasks_finished = finished + models_ready;
+        let fraction = if tasks_total == 0 { 1.0 } else { tasks_finished as f32 / tasks_total as f32 };
+        let mut egui_jobs = None;
+        if let Some(egui) = self.egui.as_mut() {
+            let raw = egui.state.take_egui_input(window);
+            let output = egui.ctx.run(raw, |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::new().fill(egui::Color32::from_rgb(6, 9, 14)))
+                    .show(ctx, |ui| {
+                        ui.centered_and_justified(|ui| {
+                            egui::Frame::new()
+                                .fill(egui::Color32::from_rgb(17, 24, 34))
+                                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(52, 68, 85)))
+                                .corner_radius(12.0)
+                                .inner_margin(egui::Margin::symmetric(28, 24))
+                                .show(ui, |ui| {
+                                    ui.set_width(400.0);
+                                    ui.vertical_centered(|ui| {
+                                        ui.heading("Preparando o mundo");
+                                        ui.add_space(10.0);
+                                        ui.label("Carregando a área ao redor do carro...");
+                                        ui.add_space(12.0);
+                                        ui.add(egui::ProgressBar::new(fraction.clamp(0.0, 1.0))
+                                            .desired_width(400.0)
+                                            .text(format!("{finished}/{required} setores · {models_ready}/{models_total} veículos")));
+                                        if failed > 0 {
+                                            ui.add_space(4.0);
+                                            ui.small(format!("{failed} setor(es) indisponível(is)"));
+                                        }
+                                    });
+                                });
+                        });
+                    });
+            });
+            egui.state.handle_platform_output(window, output.platform_output);
+            let jobs = egui.ctx.tessellate(output.shapes, output.pixels_per_point);
+            for (id, delta) in &output.textures_delta.set {
+                egui.renderer.update_texture(&gpu.device, &gpu.queue, *id, delta);
+            }
+            let desc = egui_wgpu::ScreenDescriptor {
+                size_in_pixels: [gpu.config.width, gpu.config.height],
+                pixels_per_point: output.pixels_per_point,
+            };
+            egui.renderer.update_buffers(&gpu.device, &gpu.queue, &mut encoder, &jobs, &desc);
+            egui_jobs = Some((jobs, desc, output.textures_delta.free));
+        }
+        if let (Some(egui), Some((jobs, desc, _))) = (self.egui.as_mut(), egui_jobs.as_ref()) {
+            let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("loading progress"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                })],
+                // The egui renderer was created with Depth32Float, so every pass
+                // that runs its pipeline (including this progress overlay) must
+                // expose the matching depth attachment even when the UI does not
+                // read or write depth.
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &gpu.ui_depth,
+                    depth_ops: None,
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            let mut pass = pass.forget_lifetime();
+            egui.renderer.render(&mut pass, jobs, desc);
+        }
+        gpu.queue.submit([encoder.finish()]);
+        frame.present();
+        if let (Some(egui), Some((_, _, free))) = (self.egui.as_mut(), egui_jobs) {
+            for id in free {
+                egui.renderer.free_texture(&id);
+            }
+        }
+    }
+
     fn render(&mut self) {
         let Some(window) = self.window.clone() else { return };
         if self.gpu.is_none() || self.world.is_none() {
             return;
         }
         let now = Instant::now();
+        let graphics = hooks::graphics_settings();
         let wall_seconds = (now - self.last).as_secs_f64();
         let wall_dt = wall_seconds as f32;
         let render_seconds = self.test_render_dt.unwrap_or(wall_seconds.min(0.1));
@@ -4966,16 +5104,55 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
         self.frame_no += 1;
 
         self.gamepad_buttons();
-        // Do not spend the launch/countdown clock before the initial physics world
-        // exists. Sector decode completion is asynchronous and can take different
-        // numbers of render frames. UI/rendering continue while it loads.
-        let loading = if self.tick_no == 0 && self.drive {
+        // Pause gameplay ticks after Play until nearby physics sectors and free-roam assets are ready.
+        let loading = if self.world_load_pending || (self.tick_no == 0 && self.drive) {
             if let Some(car) = self.vehicles.player() {
                 let pos = car.state.pos;
                 let world = self.world.as_mut().unwrap();
-                if !world.ready_at(pos) { world.update(self.gpu.as_mut().unwrap(), pos, 6.0); }
-                !world.ready_at(pos)
-            } else { false }
+                if !world.ready_at(pos) {
+                    // Give the nearby sectors priority while the lightweight loading
+                    // screen is up; this avoids spending the same frame budget on the city.
+                    world.update(self.gpu.as_mut().unwrap(), pos, 12.0);
+                }
+                let mut waiting = !world.ready_at(pos);
+                #[cfg(target_os = "android")]
+                {
+                    // Draw at least one progress frame before beginning any costly
+                    // vehicle uploads, so Play responds immediately on screen.
+                    if self.loading_screen_frames > 0 && !waiting {
+                        if !self.free_roam_model_queue.is_empty() {
+                            let path = self.free_roam_model_queue.remove(0);
+                            let started = Instant::now();
+                            if let Err(error) = self.vehicles.load_model(self.gpu.as_mut().unwrap(), world, &path) {
+                                log::warn!("Android deferred vehicle model {}: {error}", path.display());
+                            }
+                            log::info!("Android vehicle asset ready in {:.0} ms: {}", started.elapsed().as_secs_f32() * 1000.0, path.display());
+                        }
+                    }
+                    waiting = waiting || !self.free_roam_model_queue.is_empty();
+                    if waiting {
+                        let sectors = world.load_progress_at(pos);
+                        let models_ready = self.free_roam_model_total - self.free_roam_model_queue.len();
+                        if self.frame_no <= 10 || self.frame_no % 30 == 0 {
+                            log::info!(
+                                "Android loading frame {}: sectors {}/{}, vehicles {}/{}, {} failed, {} pending",
+                                self.frame_no, sectors.0, sectors.1, models_ready, self.free_roam_model_total, sectors.2, world.streaming()
+                            );
+                        }
+                        self.loading_screen_frames += 1;
+                        self.render_loading_screen(&window, (sectors.0, sectors.1, sectors.2, models_ready, self.free_roam_model_total));
+                        return;
+                    }
+                }
+                if !waiting {
+                    self.world_load_pending = false;
+                    self.loading_screen_frames = 0;
+                }
+                waiting
+            } else {
+                self.world_load_pending = false;
+                false
+            }
         } else { false };
         let ticks = if loading { self.sim_clock.reset(); 0 }
             else if self.opt.fixed_dt > 0.0 { 1 }
@@ -5934,7 +6111,11 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
         let occluded = occluder::frame(&self.opt.data_dir, vp, &frustum);
         let mut globals = self.lighting(vp);
         // sun shadow map: an orthographic box around the area in front of the camera
-        let shadow_on = globals.shadow_params[0] > 0.0 && !self.opt.no_shadows && !map3d && self.game.mode != Mode::Garage;
+        // The mobile path deliberately avoids the full-resolution cascaded shadow
+        // collector. At 720p it was costing more GPU time than the main scene on
+        // Adreno 740, and its long presents starved Android's input dispatcher.
+        let shadow_on = graphics.shadows_enabled && globals.shadow_params[0] > 0.0 && !self.opt.no_shadows && !map3d && self.game.mode != Mode::Garage
+            && !cfg!(target_os = "android");
         if map3d {
             // from the air: only a thin haze
             let d = self.cam.pos.distance(self.chase.look);
@@ -6007,7 +6188,11 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
         }
         // the environment cube map's cameras: six square 90 degree views from just above the
         // player's car (cube maps are left-handed: the picture is mirrored left to right)
-        let env_on = self.drive && !map3d && self.vehicles.player().is_some() && std::env::var("MCLA_NO_ENV").is_err();
+        // Keep dynamic environment captures off on Android. Even one city capture
+        // repeats a large scene render and adds GPU queue pressure on mobile.
+        let env_on = self.drive && !map3d && self.vehicles.player().is_some()
+            && std::env::var("MCLA_NO_ENV").is_err()
+            && !cfg!(target_os = "android");
         // (the original's map is taken from exactly 2 m above the car's origin - c15 of its
         // environment passes and c51 of its sky, 819.61 19.572 -808.409 with the car at 17.572,
         // at every hour recorded; 1.1 m here until 2026-10-14. MCLA_ENV_EYE=<m> for A/B.)
@@ -6015,7 +6200,11 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
         let env_eye = self.vehicles.player().map_or(self.cam.pos, |c| c.render_pose(self.vehicles.render_alpha).pos + Vec3::Y * env_up);
         // Only one face is rendered this frame. Avoid allocating two vectors and
         // building five unused view matrices/frusta, including when env is off.
-        let env_face = (self.frame_no % 6) as usize;
+        let env_face = if cfg!(target_os = "android") {
+            ((self.frame_no / 6) % 6) as usize
+        } else {
+            (self.frame_no % 6) as usize
+        };
         let env_frustum = if env_on {
             let mut ec = self.cam.clone();
             ec.fov_y = std::f32::consts::FRAC_PI_2;
@@ -6042,7 +6231,7 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
             gpu.queue.write_buffer(&gpu.env_globals[env_face], 0, bytemuck::bytes_of(&eg));
             // (the paraboloid half drawn this frame - city.wgsl vs_env_dp: moon_dir.w = 1 the half
             // looking along the world's -z, 2 the other)
-            let dp_half = (self.frame_no % 2) as usize;
+            let dp_half = if cfg!(target_os = "android") { ((self.frame_no / 6) % 2) as usize } else { (self.frame_no % 2) as usize };
             eg.moon_dir[3] = 1.0 + dp_half as f32;
             gpu.queue.write_buffer(&gpu.env_globals[6 + dp_half], 0, bytemuck::bytes_of(&eg));
             globals.shadow_params[3] = 1.0;
@@ -6055,7 +6244,7 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
         // (MCLA_DEBUG_VIEW=63: without it - the older stand-in, the cars' map)
         // (water work, 2026-10-14: in the GPS map too - the original's map frame draws the pass, its mirror at the
         // player's height from the map's own camera, and the sea's program reads it; MCLA_MAP_NO_REFL=1: not there, as before)
-        let refl_on = (!map3d || std::env::var("MCLA_MAP_NO_REFL").is_err()) && (globals.params[3] - 63.0).abs() > 0.5 && std::env::var("MCLA_NO_REFL").is_err();
+        let refl_on = graphics.reflections_enabled && (!map3d || std::env::var("MCLA_MAP_NO_REFL").is_err()) && (globals.params[3] - 63.0).abs() > 0.5 && std::env::var("MCLA_NO_REFL").is_err();
         if refl_on {
             globals.collector[3] = 1.0;
         }
@@ -6247,6 +6436,7 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
         let clear = if map_baked { [0.012, 0.018, 0.028, 1.0] } else { globals.fog_color };
         let t_sim = now.elapsed().as_secs_f32() * 1000.0;
 
+        let acquire_started = now.elapsed().as_secs_f32() * 1000.0;
         let frame = match gpu.surface.get_current_texture() {
             Ok(f) => f,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
@@ -6263,6 +6453,7 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                 return;
             }
         };
+        let acquire_done = now.elapsed().as_secs_f32() * 1000.0;
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor { format: Some(gpu.config.format), ..Default::default() });
         // The UI blends in gamma space, as the original does: through an sRGB view a
         // 30% white pane over a dark scene comes out about twice as bright and a 77%
@@ -6321,6 +6512,15 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                         }
                     });
                 }
+                #[cfg(feature = "android-fps-counter")]
+                egui::Area::new(egui::Id::new("android_fps_counter"))
+                    .anchor(egui::Align2::RIGHT_TOP, [-12.0, 12.0])
+                    .order(egui::Order::Foreground)
+                    .show(ctx, |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            ui.label(format!("FPS {:.0}  |  {:.1} ms", fps, ms));
+                        });
+                    });
             });
             if action != MenuAction::None {
                 self.pending_action = action;
@@ -6612,7 +6812,8 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
             gpu.collector_pass(&mut enc, fc_cam, fc_dir.normalize_or(Vec3::Z), to_light, light_vp, world.far_models());
         }
         // --- the wet road's planar reflection (the far city mirrored, the sky dome behind) ---
-        if refl_on {
+        // Wet-road reflections repeat much of the city pass; omit them on Android.
+        if refl_on && !cfg!(target_os = "android") {
             // the mirror's height (gReflectionParams.z): recorded 17.572 with the car standing
             // on ground at 17.58 - exactly 2 m under the centre of the cars' environment map
             // (c51.y 19.572): the height of the car's own place. (MCLA_REFL_PLANE: another.)
@@ -7167,7 +7368,7 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                     stat_props = draws - d0;
                     pass.set_pipeline(&gpu.pipeline_opaque);
                     let d1 = draws;
-                    self.vehicles.draw(&mut pass, &gpu, false, &mut draws, Some((cam_pos, 450.0)), Some(&frustum));
+                    self.vehicles.draw(&mut pass, &gpu, false, &mut draws, Some((cam_pos, graphics.vehicle_distance_m)), Some(&frustum));
                     stat_cars = draws - d1;
                     pass.set_pipeline(&gpu.pipeline_opaque);
                     self.peds.draw(&mut pass, &gpu, false, &mut draws);
@@ -7181,6 +7382,18 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                 let pane_zw = phase == 1 && std::env::var("MCLA_DEBUG_VIEW").map_or(true, |v| v.trim() != "330");
                 let mut pane_pipe = false;
                 for sec in world.loaded.values().chain(world.sets.values()) {
+                    if !map3d {
+                        let closest = cam_pos.clamp(sec.bounds_min, sec.bounds_max);
+                        let dx = closest.x - cam_pos.x;
+                        let dz = closest.z - cam_pos.z;
+                        if dx.hypot(dz) > graphics.world_draw_distance_m
+                            || !frustum.intersects_aabb(sec.bounds_min, sec.bounds_max)
+                        {
+                            continue;
+                        }
+                    } else if !frustum.intersects_aabb(sec.bounds_min, sec.bounds_max) {
+                        continue;
+                    }
                     let (Some(vb), Some(ib)) = (sec.vb.as_ref(), sec.ib.as_ref()) else { continue };
                     if occluded.hides_all(sec.batches.iter().map(|b| (b.min, b.max))) {
                         continue;
@@ -7260,7 +7473,7 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                     self.props.draw_glass(&mut pass, &gpu, self.cam.pos, &frustum, Some(&occluded), &mut draws);
                     pass.set_pipeline(&gpu.pipeline_blend);
                 }
-                self.vehicles.draw(&mut pass, &gpu, true, &mut draws, Some((cam_pos, 200.0)), Some(&frustum));
+                self.vehicles.draw(&mut pass, &gpu, true, &mut draws, Some((cam_pos, graphics.vehicle_distance_m.min(200.0))), Some(&frustum));
                 if self.time_of_day > 18.0 || self.time_of_day < 6.0 {
                     self.props.draw_glows(&mut pass, &gpu);
                 }
@@ -7286,8 +7499,10 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                 occlusion_query_set: None,
             });
             pass.set_bind_group(0, &gpu.globals_bg, &[]);
-            self.fx.draw(&mut pass, &gpu);
-            rain::draw(&mut pass);
+            if hooks::effects_scale() > 0.0 {
+                self.fx.draw(&mut pass, &gpu);
+                rain::draw(&mut pass);
+            }
         }
         {
             // the original's post chain, tuned by the weather's keys; the radial blur follows the speed
@@ -7301,7 +7516,8 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
             radial += self.ability.fx() * 0.05;
             let mut tune = self.post_tune(&self.sky_now());
             tune.dt = dt;
-            tune.radial = if post_on { radial } else { 0.0 };
+            let blur_strength = hooks::blur_strength();
+            tune.radial = if post_on { radial * blur_strength } else { 0.0 };
             tune.center = [0.5, 0.46];
             tune.plain = !post_on;
             // (test hook: MCLA_LUM = the adapted luminance to expose by, instead of the measured one)
@@ -7344,6 +7560,7 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                     tune.dof = [x, x + 73.0, 0.8, 1.0];
                 }
             }
+            tune.dof[2] *= blur_strength;
             tune.inv_view_proj = globals.inv_view_proj;
             tune.cam_pos = [globals.cam_pos[0], globals.cam_pos[1], globals.cam_pos[2]];
             gpu.post.run(&gpu.device, &gpu.queue, &mut enc, &view, &gpu.depth, &tune);
@@ -7355,7 +7572,7 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &ui_view, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })],
                     // (read-only: egui writes no depth, and the GPS map's x-ray callbacks sample it - hudmap_gpu.rs)
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: &gpu.depth,
+                        view: &gpu.ui_depth,
                         depth_ops: None,
                         stencil_ops: None,
                     }),
@@ -7398,10 +7615,27 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
             }
         }
         let t_enc = now.elapsed().as_secs_f32() * 1000.0;
+        let log_gpu_timing = self.frame_no <= 10 || self.frame_no % 60 == 0;
+        if log_gpu_timing {
+            log::info!(
+                "Android frame {} queue.submit begin: acquire {:.2} ms, encode {:.2} ms",
+                self.frame_no,
+                acquire_done - acquire_started,
+                t_enc - acquire_done,
+            );
+        }
         gpu.queue.submit([enc.finish()]);
+        let submit_done = now.elapsed().as_secs_f32() * 1000.0;
+        if log_gpu_timing {
+            log::info!("Android frame {} queue.submit end: {:.2} ms", self.frame_no, submit_done - t_enc);
+            log::info!("Android frame {} present begin", self.frame_no);
+        }
         window.pre_present_notify();
         frame.present();
         let t_end = now.elapsed().as_secs_f32() * 1000.0;
+        if log_gpu_timing {
+            log::info!("Android frame {} present end: {:.2} ms", self.frame_no, t_end - submit_done);
+        }
         if self.frame_no % 240 == 0 {
             log::info!("phases: sim {:.2} ms, acquire+ui {:.2}, passes {:.2}, submit+present {:.2}", t_sim, t_ui - t_sim, t_enc - t_ui, t_end - t_enc);
         }
@@ -7473,12 +7707,46 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                 eg.renderer.free_texture(&id);
             }
         }
+        #[cfg(target_os = "android")]
+        if self.frame_no % 120 == 0 {
+            let (bind_groups, textures) = gpu.trim_texture_cache();
+            if bind_groups != 0 || textures != 0 {
+                log::info!(
+                    "Android GPU cache trim: {} inactive bind groups, {} inactive textures dropped; {} groups and {} textures remain",
+                    bind_groups,
+                    textures,
+                    gpu.texture_cache_counts().1,
+                    gpu.texture_cache_counts().0,
+                );
+            }
+        }
         self.world = Some(world);
         self.gpu = Some(gpu);
         #[cfg(target_os = "android")]
-        if self.frame_no <= 10 || self.frame_no % 60 == 0 || now.elapsed().as_secs_f32() > 1.0 {
+        if self.frame_no <= 10 || self.frame_no % 60 == 0 || now.elapsed().as_secs_f32() > 0.5 {
             if let Some(world) = self.world.as_ref() {
-                log::info!("Android frame {}: {:.0} ms, city sectors {} loaded / {} pending / {} failed, simulation loading {}", self.frame_no, now.elapsed().as_secs_f32() * 1000.0, world.loaded.len(), world.streaming(), world.failed.len(), loading);
+                let elapsed_ms = now.elapsed().as_secs_f32() * 1000.0;
+                log::info!("Android frame {}: {:.0} ms, city sectors {} loaded / {} pending / {} failed, simulation loading {}", self.frame_no, elapsed_ms, world.loaded.len(), world.streaming(), world.failed.len(), loading);
+                if elapsed_ms > 500.0 {
+                    let (sectors, textures, bind_groups) = self.gpu.as_ref().map_or((0, 0, 0), |gpu| {
+                        let (textures, binds) = gpu.texture_cache_counts();
+                        (world.loaded.len(), textures, binds)
+                    });
+                    log::warn!(
+                        "Android slow frame {} phases: simulation {:.0} ms, acquire+UI {:.0} ms (surface acquire {:.0} ms), scene encode {:.0} ms, queue submit {:.0} ms, present {:.0} ms; draws {}, sectors {}, GPU texture cache {} textures / {} bind groups",
+                        self.frame_no,
+                        t_sim,
+                        t_ui - t_sim,
+                        acquire_done - acquire_started,
+                        t_enc - t_ui,
+                        submit_done - t_enc,
+                        t_end - submit_done,
+                        self.draws,
+                        sectors,
+                        textures,
+                        bind_groups,
+                    );
+                }
             }
         }
         let action = std::mem::replace(&mut self.pending_action, MenuAction::None);
@@ -7553,18 +7821,39 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                         })).collect())
                         .unwrap_or_default();
                     dirs.sort();
+                    #[cfg(target_os = "android")]
+                    {
+                        self.free_roam_model_queue.clear();
+                        self.free_roam_model_queue.extend(
+                            dirs.iter().enumerate()
+                                .filter(|(i, _)| i % 4 == 1)
+                                .take(9)
+                                .map(|(_, path)| path.clone()),
+                        );
+                    }
+                    #[cfg(not(target_os = "android"))]
+                    {
                     let mut loaded = 0;
                     for (i, d) in dirs.iter().enumerate() {
                         if i % 4 == 1 && loaded < 9 && self.vehicles.load_model(gpu, world, d).is_ok() {
                             loaded += 1;
                         }
                     }
+                    }
                 }
                 if !self.vehicles.models.iter().any(|m| m.name == police::COP_CAR) {
                     let d = world.assets.path("resources/vehicle").join(police::COP_CAR);
+                    #[cfg(target_os = "android")]
+                    self.free_roam_model_queue.push(d);
+                    #[cfg(not(target_os = "android"))]
                     if let Err(e) = self.vehicles.load_model(gpu, world, &d) {
                         log::warn!("police car: {e}");
                     }
+                }
+                #[cfg(target_os = "android")]
+                {
+                    self.free_roam_model_total = self.free_roam_model_queue.len();
+                    self.loading_screen_frames = 0;
                 }
                 self.police.reset(&mut self.vehicles);
                 self.vehicles.cars.retain(|c| c.is_player);
@@ -7572,6 +7861,7 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                 self.vehicles.parked_target = 36;
                 self.game.mode = Mode::FreeRoam;
                 self.game.menu_sel = 0;
+                self.world_load_pending = true;
             }
             // (a tournament's first race and a payback open their panel first: `mc4_event_panel_first`)
             MenuAction::StartRace if self.game.mc4_event_panel_first() => {}
@@ -8713,6 +9003,7 @@ impl ApplicationHandler for App {
                     }
                 }
             }
+            #[cfg(not(target_os = "android"))]
             WindowEvent::MouseInput { state, button: MouseButton::Right, .. } => {
                 self.input.rmb = state == ElementState::Pressed;
                 if let Some(w) = self.window.as_ref() {
@@ -8722,14 +9013,12 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => {
                 self.render();
                 self.after_frame();
-                if let Some(w) = self.window.as_ref() {
-                    w.request_redraw();
-                }
             }
             _ => {}
         }
     }
 
+    #[cfg(not(target_os = "android"))]
     fn device_event(&mut self, _event_loop: &ActiveEventLoop, _device_id: winit::event::DeviceId, event: DeviceEvent) {
         if let DeviceEvent::MouseMotion { delta } = event {
             self.input.mouse_dx += delta.0 as f32;
@@ -8741,6 +9030,27 @@ impl ApplicationHandler for App {
         if self.quit {
             event_loop.exit();
         }
+        #[cfg(target_os = "android")]
+        {
+            let cap = hooks::get().map_or(0, |rt| rt.settings.display.fps_cap).clamp(0, 1000);
+            let now = Instant::now();
+            if cap == 0 {
+                // Vsync (when enabled) paces this path; with vsync disabled this is truly uncapped.
+                event_loop.set_control_flow(ControlFlow::Wait);
+                if let Some(w) = self.window.as_ref() { w.request_redraw(); }
+            } else {
+                let frame = std::time::Duration::from_secs_f64(1.0 / cap.max(20) as f64);
+                let deadline = self.last + frame;
+                if now >= deadline {
+                    // Drop missed deadlines instead of rendering a burst of catch-up frames.
+                    event_loop.set_control_flow(ControlFlow::Wait);
+                    if let Some(w) = self.window.as_ref() { w.request_redraw(); }
+                } else {
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+                }
+            }
+        }
+        #[cfg(not(target_os = "android"))]
         if let Some(w) = self.window.as_ref() {
             w.request_redraw();
         }
@@ -9651,6 +9961,13 @@ fn run_game() -> Result<()> {
     };
     #[cfg(not(target_os = "android"))]
     let event_loop = EventLoop::new()?;
+    // A finite wait avoids a busy Android event loop while ensuring lifecycle
+    // commands are serviced even if no redraw/input event wakes the looper.
+    // An indefinite Wait can leave NativeActivity teardown waiting on the
+    // activity reference held by poll_events during configuration changes.
+    #[cfg(target_os = "android")]
+    event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now()));
+    #[cfg(not(target_os = "android"))]
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App::new(opt);
     event_loop.run_app(&mut app)?;

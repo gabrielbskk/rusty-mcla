@@ -1,65 +1,66 @@
-# Android game build (experimental)
+# Android build
 
-This folder packages the **actual Rust game engine** as a 64-bit Android
-`NativeActivity`. It is a development build, not a verified playable release.
+This directory packages the Rust engine as an Android `arm64-v8a` app. It is
+an experimental community port and is not a stable or release candidate build.
+See [the test status](TESTING-STATUS.md) before trying it.
 
-## Build
+## Graphics and platform
 
-Install Rust with the `aarch64-linux-android` target, Android SDK platform 35,
-build tools 35.0.0, and NDK 27.2.12479018. Set `ANDROID_HOME` and run
-`bash android-game/build.sh` from the repository root. A JDK with `javac` is
-needed for the data import Activity; `ECJ_JAR` can point to the Eclipse Java
-compiler instead. The output is `android-game/build/rusty-mcla-android-dev.apk`.
+The engine is compiled for `aarch64-linux-android` and renders through wgpu.
+The Android build enables the system Vulkan and GLES backends so wgpu can use a
+compatible adapter exposed by Android. The APK does not include a custom GPU
+driver, and no GPU vendor is hard-coded. This is native ARM64 code; the Android
+path does not execute the PC's DirectX renderer or translate x86 instructions.
 
-The APK contains engine code and a small index derived from the user's converted
-city files. It does not contain the commercial game assets.
-Version 0.2 reads a converted install directly from
-`/storage/emulated/0/Rusty/RustyMCLA` (or directly from `Rusty`). Its setup
-Activity requests Android's all-files access permission and checks the folder
-before starting the native engine. The converted install is not copied into
-app-private storage. The Activity joins the two `intro.mcv.part0x` files from
-the Drive package in place on the first launch. Game saves are written beside
-the converted data under `data/cache`. The original split ZIP files are not a converted
-install; all 154 converted ZIPs must be extracted first.
+This approach aims for broad Android compatibility, but it has only been tried
+on one ARM64 Android 16 phone. It does not establish support for every Android
+version or for Mali, Adreno, Xclipse, or other GPU families.
 
-The tester-supplied cover is displayed on the setup screen and used as the launcher
-icon. Its third-party artwork rights have not been independently verified. On Android, the city streamer starts with a 210 m radius and at most
-three sector decodes at once. The full city map is built only when requested.
-The setup screen reports recent frame and sector progress. Version 0.8 can share
-its diagnostic as a text file, with a short summary that prioritizes the native
-`android_main` thread and an available ANR trace of up to 4 MiB. This improves
-troubleshooting; it does not establish a fix for the ANRs.
+## Build on Termux
 
-## Current mobile input
+The build script uses the Android Rust target and local Android tools. You need
+Rust with `aarch64-linux-android`, Clang/NDK support, an Android API jar, AAPT2,
+D8, `zipalign`, `apksigner`, Java, and the converted game data prepared from your
+own copy. Set `ANDROID_WORLD_INDEX` to the generated `world_index.json`, then
+run from the repository root:
 
-While driving, the left half of the screen steers (left quarter = left,
-second quarter = right). The upper right accelerates, lower right brakes, and
-the top strip sends Back. Multitouch lets steering and pedals work together.
-Menus receive touch events through egui. Android controllers are not yet
-connected to the engine.
+```sh
+bash android-game/build.sh
+```
 
-## Physical test status
+For an SDK/NDK Linux host, set `ANDROID_HOME` and install the Android platform,
+build tools, and NDK versions noted by the script. Environment overrides for
+the API level, resource table, D8, package name, and output name are documented
+in [`build.sh`](build.sh).
 
-The tester uses a Android device Android device, Android 16, with an Adreno 740
-Vulkan GPU. Version 0.6 showed a vehicle and parts of the city, but the ground
-was white or absent. Version 0.7 still produced black screens and input ANRs.
-One trace showed the Java main thread waiting during `NativeActivity.onPause`;
-the native game thread was not present in the excerpt. The cause remains under
-investigation. RAM readings in the supplied traces do not establish an OOM.
-Please attach a full version 0.8 text diagnostic when reporting Android issues.
-See [known issues and useful contributions](KNOWN-ISSUES.md).
+The signed development APK is written under `android-game/build/`. It uses a
+local debug key and is not suitable for publishing as a release. Build outputs,
+signing keys, converted game data, and full device diagnostics are intentionally
+excluded from Git.
 
-## Verification still needed
+## Data and setup
 
-- Confirm a complete playable session on a physical ARM64 device with Vulkan support.
-- Measure shader and texture compatibility, memory use and frame rate.
-- Check audio, cutscenes, save/load, suspend/resume and all touch menus.
-- Provide an Android or cloud conversion path for an original split archive.
+The APK does not contain the commercial game. Prepare and convert your own
+legally obtained copy using the project's tools. Place the converted files in
+the expected `Rusty/RustyMCLA` shared-storage folder and grant the app the file
+access permission it requests. The small world index is packaged separately to
+avoid scanning all city files on the phone at startup. Saves are kept beside
+the converted data under `data/cache`.
 
-The project does not distribute game data. The user must provide their own
-copy. The APK uses a locally generated debug key and is not a release build.
+## Android controls and settings
 
-Before building the APK, run `mcla-tool world-index /path/to/data/cache` on the
-converted installation and set `ANDROID_WORLD_INDEX` to the resulting
-`world_index.json`. The setup Activity installs the index to the shared game
-folder on first launch. This skips scanning all city files on the phone.
+The setup screen includes a default or performance preset and controls for
+render scale, frame cap, blur, effects, pedestrian density, and draw distance.
+The values are read when the game starts. The driving touch layout supports
+steering and pedals at the same time. Android controller events are bridged to
+the Rust input path, but physical controller mapping has not been fully tested.
+
+The loading screen reports startup progress. The launcher can export a text
+diagnostic with recent engine logs and an available Android ANR trace. Please
+review and redact device-specific or personal content before sharing a report.
+
+## Test status
+
+See [TESTING-STATUS.md](TESTING-STATUS.md) for build evidence, the latest saved
+frame-time results, known failures, and remaining checks. The current evidence
+does not support calling this port stable or playable at normal frame rates.

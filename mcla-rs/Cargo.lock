@@ -1126,7 +1126,7 @@ dependencies = [
  "log",
  "presser",
  "thiserror 1.0.69",
- "windows 0.58.0",
+ "windows 0.54.0",
 ]
 
 [[package]]
@@ -1605,6 +1605,7 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "chrono",
+ "cpal",
  "egui",
  "egui-wgpu",
  "egui-winit",

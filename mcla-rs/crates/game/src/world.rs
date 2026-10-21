@@ -145,6 +145,10 @@ pub struct GpuSector {
     pub vb: Option<wgpu::Buffer>,
     pub ib: Option<wgpu::Buffer>,
     pub batches: Vec<SectorBatch>,
+    /// Aggregate world-space bounds let the main pass reject a whole sector before
+    /// iterating its material batches.
+    pub bounds_min: Vec3,
+    pub bounds_max: Vec3,
     /// index range of the plain opaque shadow casters (they come first in the buffer)
     pub caster_count: u32,
     pub caster_min: Vec3,
@@ -1112,8 +1116,8 @@ impl World {
             failed: Default::default(),
             tx,
             rx,
-            load_radius: if cfg!(target_os = "android") { 210.0 } else { 450.0 },
-            unload_radius: if cfg!(target_os = "android") { 300.0 } else { 540.0 },
+            load_radius: if cfg!(target_os = "android") { crate::hooks::graphics_settings().sector_detail_distance_m } else { 450.0 },
+            unload_radius: if cfg!(target_os = "android") { crate::hooks::graphics_settings().sector_detail_distance_m + 90.0 } else { 540.0 },
             tex_fail: Default::default(),
             stats_tris: 0,
             collider,
@@ -1163,7 +1167,28 @@ impl World {
 
     /// Are the sectors around `p` resident (so physics can run)?
     pub fn ready_at(&self, p: Vec3) -> bool {
-        self.index.sectors.iter().enumerate().all(|(id, s)| Self::dist_to(s, p) > 60.0 || self.loaded.contains_key(&id) || self.failed.contains(&id))
+        let (resident, total, failed) = self.load_progress_at(p);
+        resident + failed >= total
+    }
+
+    /// Number of nearby physics sectors that are resident, required, or failed.
+    /// The tuple is (resident, required, failed); failed sectors still count as
+    /// finished because `ready_at` has always allowed gameplay to continue.
+    pub fn load_progress_at(&self, p: Vec3) -> (usize, usize, usize) {
+        let mut resident = 0;
+        let mut required = 0;
+        let mut failed = 0;
+        for (id, sector) in self.index.sectors.iter().enumerate() {
+            if Self::dist_to(sector, p) <= 60.0 {
+                required += 1;
+                if self.loaded.contains_key(&id) {
+                    resident += 1;
+                } else if self.failed.contains(&id) {
+                    failed += 1;
+                }
+            }
+        }
+        (resident, required, failed)
     }
 
     fn dist_to(info: &SectorInfo, p: Vec3) -> f32 {
@@ -1191,8 +1216,11 @@ impl World {
         let detail = 300.0 * (1.5 - 0.5 * ((lens_deg - 25.0) * 0.04).clamp(0.0, 1.0));
         // Mobile GPUs have much less texture memory. Stream a smaller nearby
         // neighbourhood while retaining the same distance override for tests.
-        let detail = if cfg!(target_os = "android") { detail.min(210.0) } else { detail };
-        let detail = std::env::var("MCLA_SECTOR_DIST").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(detail);
+        let detail = if cfg!(target_os = "android") {
+            crate::hooks::graphics_settings().sector_detail_distance_m
+        } else { detail };
+        let detail = std::env::var("MCLA_SECTOR_DIST").ok().and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(detail * crate::hooks::draw_distance_scale());
         // (the lens widens with speed: keep to the larger distance for a while rather than drop and reload)
         self.load_radius = detail.max(self.load_radius - 2.0);
         self.unload_radius = self.load_radius + 90.0;
@@ -1224,7 +1252,14 @@ impl World {
             .filter(|(d, _)| *d < self.load_radius)
             .collect();
         want.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        let max_inflight: usize = if cfg!(target_os = "android") { 3 } else { 12 };
+        // Decode the small set around the car concurrently. During the initial
+        // loading screen, allow two extra workers; normal streaming keeps the
+        // lower memory footprint after gameplay begins.
+        let max_inflight: usize = if cfg!(target_os = "android") {
+            if budget_ms >= 12.0 { 6 } else { 4 }
+        } else {
+            12
+        };
         for (_, id) in want.into_iter().take(max_inflight.saturating_sub(self.pending.len())) {
             self.pending.insert(id);
             let path = self.assets.path(&self.index.sectors[id].file);
@@ -1382,6 +1417,15 @@ impl World {
 
     fn upload(&mut self, gpu: &mut Gpu, cs: CpuSector) -> GpuSector {
         let sector_id = cs.id;
+        let (bounds_min, bounds_max) = cs.batches.iter().fold(
+            (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY)),
+            |(min, max), batch| (min.min(batch.min), max.max(batch.max)),
+        );
+        let (bounds_min, bounds_max) = if bounds_min.is_finite() && bounds_max.is_finite() {
+            (bounds_min, bounds_max)
+        } else {
+            (Vec3::ZERO, Vec3::ZERO)
+        };
         // local textures first
         let mut local: HashMap<u32, Arc<GpuTexture>> = HashMap::new();
         // An interior set's OWN textures (the garages' dictionaries) keep to the set: the GPU's
@@ -1580,7 +1624,7 @@ impl World {
         // (a detailed sector comes in over a third of a second; interiors and far models are just there)
         let u = if sector_id < SET_ID { 0.0 } else { 1.0 };
         let obj = Some((gpu.new_object(&sector_uniform(u, false)), gpu.new_object(&sector_uniform(u, true))));
-        GpuSector { vb, ib, batches, caster_count, caster_min, caster_max, caster_batches, tris, obj, u, shown: u, leaving: false }
+        GpuSector { vb, ib, batches, bounds_min, bounds_max, caster_count, caster_min, caster_max, caster_batches, tris, obj, u, shown: u, leaving: false }
     }
 }
 

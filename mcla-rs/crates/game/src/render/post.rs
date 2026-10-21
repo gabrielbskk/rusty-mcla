@@ -1,8 +1,9 @@
 //! Post-processing chain, laid out as the original's (rage_postfx; see LIGHTING_WORK.md): the
 //! scene is drawn into an HDR target; half and quarter size copies feed the log-average
 //! luminance (128 -> 64 -> 16 -> 4 -> 1, adapted over time) and the bloom (bright pass and two
-//! Gauss passes at quarter size); the tone map writes the display. The composite also carries
-//! this port's speed-dependent radial blur.
+//! Gauss passes at quarter size); the tone map writes the display. Android refreshes exposure and
+//! bloom every other frame but still tone-maps and draws current lamp glow each frame. The composite
+//! also carries this port's speed-dependent radial blur.
 
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
@@ -162,6 +163,8 @@ pub struct Post {
     bufs: Vec<wgpu::Buffer>,
     /// [adapted target of this frame][step]
     groups: [Vec<wgpu::BindGroup>; 2],
+    mobile_frame: std::cell::Cell<u64>,
+    elapsed_since_chain: std::cell::Cell<f32>,
 }
 
 impl Post {
@@ -283,6 +286,8 @@ impl Post {
             sampler,
             bufs,
             groups: [Vec::new(), Vec::new()],
+            mobile_frame: std::cell::Cell::new(0),
+            elapsed_since_chain: std::cell::Cell::new(0.0),
         };
         p.rebuild_groups(device);
         p
@@ -344,6 +349,10 @@ impl Post {
         self.halo = target(device, w, h, SCENE_FORMAT, "halo");
         self.dof = target(device, dof_size(w, h).0, dof_size(w, h).1, SCENE_FORMAT, "dof");
         self.rebuild_groups(device);
+        self.flip.set(0);
+        self.first.set(true);
+        self.mobile_frame.set(0);
+        self.elapsed_since_chain.set(0.0);
     }
 
     /// Diagnostics (MCLA_POST_DUMP=<file>): the bright pass's input (the quarter-size scene) and
@@ -402,14 +411,23 @@ impl Post {
     /// Run the chain and write the result to `out`. `depth`: the scene's depth buffer (the depth of
     /// field's distance).
     pub fn run(&self, device: &wgpu::Device, queue: &wgpu::Queue, enc: &mut wgpu::CommandEncoder, out: &wgpu::TextureView, depth: &wgpu::TextureView, t: &Tune) {
-        let now = self.flip.get();
-        self.flip.set(1 - now);
-        let first = self.first.replace(false);
+        self.elapsed_since_chain.set((self.elapsed_since_chain.get() + t.dt.max(0.0)).min(0.5));
+        let first_pending = self.first.get();
+        let frame_no = self.mobile_frame.get();
+        let update_chain = !cfg!(target_os = "android") || first_pending || frame_no % 2 == 0;
+        self.mobile_frame.set(frame_no.wrapping_add(1));
+        let first = first_pending && update_chain;
+        let mut now = self.flip.get();
+        if update_chain {
+            if !first { now = 1 - now; }
+            self.flip.set(now);
+            self.first.set(false);
+        }
         let aspect = self.scene.w as f32 / self.scene.h as f32;
         let texel = |t: &Target| [1.0 / t.w as f32, 1.0 / t.h as f32, 0.0, 0.0];
         // The depth of field (PSStreakMotionBlur + PSToneMap instr. 6 - 9, LIGHTING_WORK.md): not under
         // --no-post, not without the weather's key.
-        let dof_on = t.dof[2] > 0.0 && !t.plain && dof_enabled();
+        let dof_on = !cfg!(target_os = "android") && t.dof[2] > 0.0 && !t.plain && dof_enabled();
         let grade = Params {
             a: [t.middle_grey, t.bright[0], t.bright[1], t.bright[2]],
             b: [t.limits[0], t.limits[1], t.white, t.saturation],
@@ -418,24 +436,30 @@ impl Post {
             e: [if dof_on { 1.0 } else { 0.0 }, dof_view() as f32, 0.5 / self.dof.w as f32, 0.5 / self.dof.h as f32],
         };
         let only = |a: [f32; 4]| Params { a, ..Default::default() };
-        let ps = [
+        let mut ps = [
             only([0.0; 4]),
             only([0.0; 4]),
             only(texel(&self.quarter)),
             only(texel(&self.lum[0])),
             only(texel(&self.lum[1])),
             only(texel(&self.lum[2])),
-            only([1.0 - (-t.dt.clamp(0.0, 0.5) * t.lambda).exp(), if first { 1.0 } else { 0.0 }, 0.0, 0.0]),
+            only([1.0 - (-self.elapsed_since_chain.get() * t.lambda).exp(), if first { 1.0 } else { 0.0 }, 0.0, 0.0]),
             grade,
             only([1.0 / self.bloom_a.w as f32, 0.0, 0.0, 0.0]),
             only([0.0, 1.0 / self.bloom_b.h as f32, 0.0, 0.0]),
             grade,
         ];
         // (the 4 -> 1 step reads its 16 taps from the 4x4 target, a texel apart)
-        let mut ps = ps;
         ps[6].b = texel(&self.lum[3]);
-        for (b, p) in self.bufs.iter().zip(ps.iter()) {
-            queue.write_buffer(b, 0, bytemuck::bytes_of(p));
+        if update_chain {
+            for (b, p) in self.bufs.iter().zip(ps.iter()) {
+                queue.write_buffer(b, 0, bytemuck::bytes_of(p));
+            }
+            self.elapsed_since_chain.set(0.0);
+        } else {
+            // Exposure and bloom stay resident from the preceding frame. Refresh only the
+            // per-frame tone-map controls and current lamp glow on this Android frame.
+            queue.write_buffer(&self.bufs[10], 0, bytemuck::bytes_of(&ps[10]));
         }
         let steps: [(&wgpu::TextureView, &wgpu::RenderPipeline, usize); 11] = [
             (&self.half.view, &self.pipe_scale, 0),
@@ -450,7 +474,7 @@ impl Post {
             (&self.bloom_a.view, &self.pipe_gauss, 9),
             (out, &self.pipe_tonemap, 10),
         ];
-        if dof_on {
+        if update_chain && dof_on {
             let u = DofU {
                 inv_view_proj: t.inv_view_proj,
                 cam: [t.cam_pos[0], t.cam_pos[1], t.cam_pos[2], dof_view() as f32],
@@ -480,7 +504,8 @@ impl Post {
             pass.set_bind_group(0, &bg, &[]);
             pass.draw(0..3, 0..1);
         }
-        for (view, pipe, g) in steps {
+        for (step, (view, pipe, group)) in steps.iter().enumerate() {
+            if !update_chain && step != 10 { continue; }
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("post"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment { view, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
@@ -489,7 +514,7 @@ impl Post {
                 occlusion_query_set: None,
             });
             pass.set_pipeline(pipe);
-            pass.set_bind_group(0, &self.groups[now][g], &[]);
+            pass.set_bind_group(0, &self.groups[now][*group], &[]);
             pass.draw(0..3, 0..1);
         }
     }

@@ -453,12 +453,37 @@ pub struct GpuTexture {
     pub height: u32,
 }
 
+struct CachedTextureBind {
+    bind: Arc<wgpu::BindGroup>,
+    // Keep the Rust-side texture handles alive for as long as a cached bind group
+    // can still be used by a scene object. This also lets the cache identify
+    // textures that became unreachable after a streamed sector was unloaded.
+    _textures: [Arc<GpuTexture>; 4],
+}
+
+fn scaled_render_size(width: u32, height: u32, scale: f32, max_dimension: u32) -> (u32, u32) {
+    let (width, height) = (width.max(1), height.max(1));
+    let max_dimension = max_dimension.max(1);
+    let allowed_scale = (max_dimension as f32 / width as f32)
+        .min(max_dimension as f32 / height as f32);
+    let scale = scale.clamp(0.5, 2.0).min(allowed_scale);
+    (
+        ((width as f32 * scale).round() as u32).clamp(1, max_dimension),
+        ((height as f32 * scale).round() as u32).clamp(1, max_dimension),
+    )
+}
+
 pub struct Gpu {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub surface: wgpu::Surface<'static>,
     pub config: wgpu::SurfaceConfiguration,
+    /// Internal 3D scene scale; the swapchain stays at the display's native size.
+    render_scale: f32,
     pub depth: wgpu::TextureView,
+    /// Full-resolution depth attachment for the display-sized egui pass.
+    /// The scene depth above can be smaller when render_scale is below 100%.
+    pub ui_depth: wgpu::TextureView,
     /// off-screen scene target + bloom / motion blur chain
     pub post: post::Post,
     pub globals_buf: wgpu::Buffer,
@@ -580,35 +605,45 @@ pub struct Gpu {
     pub sampler: wgpu::Sampler,
     pub white: Arc<GpuTexture>,
     pub textures: HashMap<u32, Arc<GpuTexture>>,
-    pub bind_cache: HashMap<(u32, u32, u32), Arc<wgpu::BindGroup>>,
+    bind_cache: HashMap<(u32, u32, u32), CachedTextureBind>,
     /// 1x1 transparent texture (no grime layer)
     pub clear_tex: Arc<GpuTexture>,
     pub bc_supported: bool,
     pub max_tex: u32,
+    texture_limit: u32,
 }
 
 impl Gpu {
     pub async fn new(window: Arc<winit::window::Window>) -> Result<Gpu> {
         // (the game's own sky / road / sea programs: translated from the disc at install time, read once here - xs.rs)
         xs::load(&crate::hooks::get().map(|r| r.data.path.clone()).unwrap_or_else(|| std::path::PathBuf::from(".")));
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY,
-            ..Default::default()
-        });
-        let surface = instance.create_surface(window.clone()).context("create surface")?;
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            })
+        #[cfg(target_os = "android")]
+        let (_instance, surface, adapter) = {
+            log::info!("Android renderer: letting wgpu select a system Vulkan or GLES adapter");
+            request_adapter(
+                window.clone(),
+                wgpu::Backends::VULKAN | wgpu::Backends::GL,
+            )
             .await
-            .context("no suitable GPU adapter")?;
+            .context("no compatible Android system Vulkan or GLES adapter")?
+        };
+        #[cfg(not(target_os = "android"))]
+        let (_instance, surface, adapter) = request_adapter(window.clone(), wgpu::Backends::PRIMARY).await?;
         let info = adapter.get_info();
         log::info!("GPU: {} ({:?}, {:?})", info.name, info.backend, info.device_type);
         crate::hooks::set_adapter(&info);
+        let surface_caps = surface.get_capabilities(&adapter);
+        log::info!(
+            "surface capabilities: formats={:?}, present_modes={:?}, alpha_modes={:?}, usages={:?}",
+            surface_caps.formats,
+            surface_caps.present_modes,
+            surface_caps.alpha_modes,
+            surface_caps.usages,
+        );
         let feats = adapter.features();
         let bc_supported = feats.contains(wgpu::Features::TEXTURE_COMPRESSION_BC);
+        #[cfg(target_os = "android")]
+        log::info!("Android texture policy: max 1024 px per side; BC compression supported={bc_supported}");
         let mut required = wgpu::Features::empty();
         if bc_supported {
             required |= wgpu::Features::TEXTURE_COMPRESSION_BC;
@@ -628,20 +663,76 @@ impl Gpu {
             )
             .await
             .context("request device")?;
+        #[cfg(target_os = "android")]
+        {
+            device.on_uncaptured_error(Box::new(|error| {
+                log::error!("wgpu uncaptured device error: {error}");
+            }));
+            device.set_device_lost_callback(|reason, message| {
+                log::error!("wgpu device lost: {reason:?}: {message}");
+            });
+        }
         let size = window.inner_size();
         let mut config = surface
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
             .context("surface config")?;
-        // (settings.toml display.vsync - `hooks::present_mode`)
-        config.present_mode = crate::hooks::present_mode();
+        // Android's Vulkan driver may advertise shared-refresh modes that wgpu
+        // does not recognize. Use the guaranteed FIFO mode instead of asking
+        // AutoVsync/AutoNoVsync to choose from that mixed list.
+        #[cfg(target_os = "android")]
+        {
+            config.present_mode = wgpu::PresentMode::Fifo;
+            config.desired_maximum_frame_latency = 2;
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            // (settings.toml display.vsync - `hooks::present_mode`)
+            config.present_mode = crate::hooks::present_mode();
+        }
         config.format = if config.format.is_srgb() { config.format } else { config.format.add_srgb_suffix() };
         // (the UI pass writes through the plain view of the same surface, so that its alpha
         // blending happens on the encoded values as the original's does - see main.rs "ui")
         config.view_formats = vec![config.format, config.format.remove_srgb_suffix()];
         config.usage |= wgpu::TextureUsages::COPY_SRC;
+        let graphics = crate::hooks::graphics_settings();
+        let render_scale = graphics.render_scale;
+        // Performance mode uses a smaller source texture mip on Android too.
+        // This cuts the largest RGBA fallback textures by up to 4x in memory.
+        let texture_limit = if cfg!(target_os = "android") {
+            if graphics.preset == mcla_config::GraphicsPreset::Performance { 512 } else { 1024 }
+        } else {
+            limits.max_texture_dimension_2d
+        };
+        if cfg!(target_os = "android") {
+            log::info!("Android asset texture limit: {} px", texture_limit);
+        }
+        let (render_width, render_height) = scaled_render_size(
+            config.width,
+            config.height,
+            render_scale,
+            limits.max_texture_dimension_2d,
+        );
+        log::info!(
+            "surface config: {}x{}, format={:?}, present_mode={:?}, alpha_mode={:?}, usage={:?}",
+            config.width,
+            config.height,
+            config.format,
+            config.present_mode,
+            config.alpha_mode,
+            config.usage,
+        );
+        log::info!(
+            "render scale: {:.0}% (3D/post targets {}x{}, display {}x{})",
+            render_scale * 100.0,
+            render_width,
+            render_height,
+            config.width,
+            config.height,
+        );
         surface.configure(&device, &config);
-        let depth = create_depth(&device, config.width, config.height);
-        let post = post::Post::new(&device, config.format, config.width, config.height);
+        let depth = create_depth(&device, render_width, render_height);
+        let ui_depth = create_depth(&device, config.width, config.height);
+        let post = post::Post::new(&device, config.format, render_width, render_height);
 
         let globals_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("globals"),
@@ -1713,7 +1804,9 @@ impl Gpu {
             queue,
             surface,
             config,
+            render_scale,
             depth,
+            ui_depth,
             post,
             globals_buf,
             lights_buf,
@@ -1802,6 +1895,7 @@ impl Gpu {
             bind_cache: HashMap::new(),
             bc_supported,
             max_tex,
+            texture_limit,
         })
     }
 
@@ -1812,8 +1906,10 @@ impl Gpu {
         self.config.width = w;
         self.config.height = h;
         self.surface.configure(&self.device, &self.config);
-        self.depth = create_depth(&self.device, w, h);
-        self.post.resize(&self.device, w, h);
+        let (render_width, render_height) = scaled_render_size(w, h, self.render_scale, self.max_tex);
+        self.depth = create_depth(&self.device, render_width, render_height);
+        self.ui_depth = create_depth(&self.device, w, h);
+        self.post.resize(&self.device, render_width, render_height);
     }
 
     pub fn new_object(&self, u: &ObjectUniform) -> ObjectBinding {
@@ -1971,7 +2067,7 @@ impl Gpu {
         if let Some(t) = self.textures.get(&key) {
             return t.clone();
         }
-        let t = Arc::new(upload(&self.device, &self.queue, tex, self.bc_supported));
+        let t = Arc::new(upload_limited(&self.device, &self.queue, tex, self.bc_supported, self.texture_limit));
         self.textures.insert(key, t.clone());
         t
     }
@@ -2494,7 +2590,7 @@ impl Gpu {
         if let Some(t) = self.textures.get(&key) {
             return t.clone();
         }
-        let t = Arc::new(upload_as(&self.device, &self.queue, tex, self.bc_supported, false));
+        let t = Arc::new(upload_as_limited(&self.device, &self.queue, tex, self.bc_supported, false, self.texture_limit));
         self.textures.insert(key, t.clone());
         t
     }
@@ -2522,7 +2618,7 @@ impl Gpu {
     pub fn texture_bind_group4(&mut self, diffuse: &Arc<GpuTexture>, second: &Arc<GpuTexture>, third: &Arc<GpuTexture>, fourth: &Arc<GpuTexture>, k0: u32, k1: u32, k2: u32, k3: u32) -> Arc<wgpu::BindGroup> {
         let k2 = k2 ^ k3.rotate_left(7);
         if let Some(b) = self.bind_cache.get(&(k0, k1, k2)) {
-            return b.clone();
+            return b.bind.clone();
         }
         let bg = Arc::new(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
@@ -2535,9 +2631,46 @@ impl Gpu {
                 wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&fourth.view) },
             ],
         }));
-        self.bind_cache.insert((k0, k1, k2), bg.clone());
+        self.bind_cache.insert((k0, k1, k2), CachedTextureBind {
+            bind: bg.clone(),
+            _textures: [diffuse.clone(), second.clone(), third.clone(), fourth.clone()],
+        });
         bg
     }
+
+    /// Drop cached textures whose scene owners have gone away. The frame loop
+    /// calls this occasionally after sector streaming has completed.
+    pub fn trim_texture_cache(&mut self) -> (usize, usize) {
+        let binds_before = self.bind_cache.len();
+        self.bind_cache.retain(|_, entry| Arc::strong_count(&entry.bind) > 1);
+        let textures_before = self.textures.len();
+        self.textures.retain(|_, texture| Arc::strong_count(texture) > 1);
+        (binds_before - self.bind_cache.len(), textures_before - self.textures.len())
+    }
+
+    pub fn texture_cache_counts(&self) -> (usize, usize) {
+        (self.textures.len(), self.bind_cache.len())
+    }
+}
+
+async fn request_adapter(
+    window: Arc<winit::window::Window>,
+    backends: wgpu::Backends,
+) -> Result<(wgpu::Instance, wgpu::Surface<'static>, wgpu::Adapter)> {
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        backends,
+        ..Default::default()
+    });
+    let surface = instance.create_surface(window).context("create surface")?;
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: Some(&surface),
+            force_fallback_adapter: false,
+        })
+        .await
+        .context("no suitable GPU adapter")?;
+    Ok((instance, surface, adapter))
 }
 
 fn make_object_binding(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, u: &ObjectUniform) -> ObjectBinding {
@@ -2612,10 +2745,19 @@ pub fn upload(device: &wgpu::Device, queue: &wgpu::Queue, tex: &Texture, bc: boo
     upload_as(device, queue, tex, bc, true)
 }
 
+fn upload_limited(device: &wgpu::Device, queue: &wgpu::Queue, tex: &Texture, bc: bool, max_dimension: u32) -> GpuTexture {
+    upload_as_limited(device, queue, tex, bc, true, max_dimension)
+}
+
 /// `gamma`: the texels are colours to be decoded on sampling, as the game does for its city
 /// textures (their fetch constants ask for gamma on red, green and blue); false for those it
 /// reads as they are - the sky dome's noise, stars and galaxy, the cars' vinyls ...
 pub fn upload_as(device: &wgpu::Device, queue: &wgpu::Queue, tex: &Texture, bc: bool, gamma: bool) -> GpuTexture {
+    let max_dimension = if cfg!(target_os = "android") { 1024 } else { u32::MAX };
+    upload_as_limited(device, queue, tex, bc, gamma, max_dimension)
+}
+
+fn upload_as_limited(device: &wgpu::Device, queue: &wgpu::Queue, tex: &Texture, bc: bool, gamma: bool, max_dimension: u32) -> GpuTexture {
     let (fmt, direct) = match tex.format {
         TexFormat::Dxt1 if bc => (wgpu::TextureFormat::Bc1RgbaUnormSrgb, true),
         TexFormat::Dxt3 if bc => (wgpu::TextureFormat::Bc2RgbaUnormSrgb, true),
@@ -2625,14 +2767,23 @@ pub fn upload_as(device: &wgpu::Device, queue: &wgpu::Queue, tex: &Texture, bc: 
         _ => (wgpu::TextureFormat::Rgba8UnormSrgb, false),
     };
     let fmt = if gamma { fmt } else { fmt.remove_srgb_suffix() };
-    let w = tex.width.max(1);
-    let h = tex.height.max(1);
+    let mut first_mip = 0usize;
+    #[cfg(target_os = "android")]
+    while first_mip + 1 < tex.levels.len()
+        && (tex.width >> first_mip).max(tex.height >> first_mip) > max_dimension.max(1)
+    {
+        first_mip += 1;
+    }
+    #[cfg(not(target_os = "android"))]
+    let _ = max_dimension;
+    let w = (tex.width >> first_mip).max(1);
+    let h = (tex.height >> first_mip).max(1);
     let (bw, bpb) = tex.format.block();
     // usable mip count
     let mut levels = 0u32;
     let (mut lw, mut lh) = (w, h);
-    for (i, l) in tex.levels.iter().enumerate() {
-        if direct && (lw < 4 || lh < 4) && i > 0 {
+    for (i, l) in tex.levels.iter().enumerate().skip(first_mip) {
+        if direct && (lw < 4 || lh < 4) && i > first_mip {
             break;
         }
         let need = if direct {
@@ -2660,7 +2811,7 @@ pub fn upload_as(device: &wgpu::Device, queue: &wgpu::Queue, tex: &Texture, bc: 
     });
     let (mut lw, mut lh) = (w, h);
     for level in 0..levels {
-        let data = &tex.levels[level as usize];
+        let data = &tex.levels[first_mip + level as usize];
         let (bytes, bpr, rows) = if direct {
             let bx = (lw + 3) / 4;
             let by = (lh + 3) / 4;
