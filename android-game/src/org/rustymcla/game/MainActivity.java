@@ -33,23 +33,23 @@ import java.util.ArrayList;
 /** Launches the native engine directly from the user's shared Rusty folder. */
 public final class MainActivity extends Activity {
     private static final String[] PROFILE_LABELS = {
-        "Desempenho: 30 FPS", "Equilibrado: 60 FPS", "Sem limite de quadros"
+        "Performance: 30 FPS", "Balanced: 60 FPS", "Uncapped"
     };
     private static final String[] GRAPHICS_PRESET_LABELS = {
-        "Padrão — 720p e maior distância", "Desempenho — 540p e 100 m", "Personalizado"
+        "Default — 720p and longer draw distance", "Performance — 540p and 100 m", "Custom"
     };
     private static final String[] RENDER_SCALE_LABELS = {
-        "540p — desempenho", "720p — equilibrado", "1080p — mais nítido"
+        "540p — performance", "720p — balanced", "1080p — sharper"
     };
     // The game's internal target follows the device's current aspect ratio.
     private static final float[] RENDER_SCALE_VALUES = {0.5f, 2.0f / 3.0f, 1.0f};
-    private static final String[] BLUR_LABELS = {"Desligado", "Reduzido", "Normal"};
+    private static final String[] BLUR_LABELS = {"Off", "Reduced", "Normal"};
     private static final float[] BLUR_VALUES = {0.0f, 0.35f, 1.0f};
-    private static final String[] EFFECTS_LABELS = {"Desligados", "Reduzidos (50%)", "Completos"};
+    private static final String[] EFFECTS_LABELS = {"Off", "Reduced (50%)", "Full"};
     private static final float[] EFFECTS_VALUES = {0.0f, 0.5f, 1.0f};
-    private static final String[] PEDESTRIAN_LABELS = {"Nenhum", "Poucos (25%)", "Metade (50%)", "Normal (100%)"};
+    private static final String[] PEDESTRIAN_LABELS = {"None", "Low (25%)", "Half (50%)", "Normal (100%)"};
     private static final float[] PEDESTRIAN_VALUES = {0.0f, 0.25f, 0.5f, 1.0f};
-    private static final String[] DISTANCE_LABELS = {"Curta (50%)", "Média (75%)", "Longa (100%)"};
+    private static final String[] DISTANCE_LABELS = {"Short (50%)", "Medium (75%)", "Long (100%)"};
     private static final float[] DISTANCE_VALUES = {0.5f, 0.75f, 1.0f};
     private Spinner graphicsPresetSpinner, profileSpinner, renderScaleSpinner, blurSpinner, effectsSpinner, pedestrianSpinner, distanceSpinner;
     private TextView graphicsStatus;
@@ -95,32 +95,32 @@ public final class MainActivity extends Activity {
         styleText(title, 24, true, Color.rgb(246, 247, 250));
         heroText.addView(title);
         TextView subtitle = new TextView(this);
-        subtitle.setText("ANDROID NATIVO  •  ARM64-V8A");
+        subtitle.setText("NATIVE ANDROID  •  ARM64-V8A");
         styleText(subtitle, 11, true, Color.rgb(232, 73, 62));
         subtitle.setPadding(0, dp(4), 0, 0);
         heroText.addView(subtitle);
         hero.addView(heroText, new LinearLayout.LayoutParams(0, -2, 1));
 
         LinearLayout introCard = card(panel);
-        addHeading(introCard, "Preparação");
+        addHeading(introCard, "Setup");
         TextView explanation = new TextView(this);
-        explanation.setText("Extraia as partes ZIP em Rusty/RustyMCLA na memória interna. O jogo precisa encontrar manifest.local.json e data/cache. Os dados são lidos dessa pasta sem copiar o pacote inteiro para o APK.");
+        explanation.setText("Extract the ZIP parts to Rusty/RustyMCLA in internal storage. The game looks for manifest.local.json and data/cache. Data is read from that folder without copying the full package into the APK.");
         styleText(explanation, 14, false, Color.rgb(190, 199, 210));
         introCard.addView(explanation);
 
         LinearLayout graphicsCard = card(panel);
         TextView graphicsTitle = new TextView(this);
-        graphicsTitle.setText("Gráficos e desempenho");
+        graphicsTitle.setText("Graphics and performance");
         styleText(graphicsTitle, 19, true, Color.rgb(246, 247, 250));
         graphicsCard.addView(graphicsTitle);
         graphicsPresetSpinner = new Spinner(this);
         graphicsPresetSpinner.setAdapter(adapter(GRAPHICS_PRESET_LABELS));
-        addSpinnerRow(graphicsCard, "Predefinição gráfica", graphicsPresetSpinner);
+        addSpinnerRow(graphicsCard, "Graphics preset", graphicsPresetSpinner);
         profileSpinner = new Spinner(this);
         profileSpinner.setAdapter(adapter(PROFILE_LABELS));
-        addSpinnerRow(graphicsCard, "Limite de quadros", profileSpinner);
+        addSpinnerRow(graphicsCard, "Frame rate limit", profileSpinner);
         TextView renderScaleTitle = new TextView(this);
-        renderScaleTitle.setText("Resolução interna da cena");
+        renderScaleTitle.setText("Internal render resolution");
         styleText(renderScaleTitle, 13, true, Color.rgb(194, 204, 216));
         renderScaleTitle.setPadding(0, dp(10), 0, 0);
         graphicsCard.addView(renderScaleTitle);
@@ -128,20 +128,20 @@ public final class MainActivity extends Activity {
         renderScaleSpinner.setAdapter(adapter(RENDER_SCALE_LABELS));
         addSpinnerRow(graphicsCard, null, renderScaleSpinner);
         blurSpinner = new Spinner(this);
-        addNamedSetting(graphicsCard, "Blur de movimento e foco", blurSpinner, BLUR_LABELS);
+        addNamedSetting(graphicsCard, "Motion and focus blur", blurSpinner, BLUR_LABELS);
         effectsSpinner = new Spinner(this);
-        addNamedSetting(graphicsCard, "Partículas e chuva", effectsSpinner, EFFECTS_LABELS);
+        addNamedSetting(graphicsCard, "Particles and rain", effectsSpinner, EFFECTS_LABELS);
         pedestrianSpinner = new Spinner(this);
-        addNamedSetting(graphicsCard, "Quantidade de pedestres", pedestrianSpinner, PEDESTRIAN_LABELS);
+        addNamedSetting(graphicsCard, "Pedestrian density", pedestrianSpinner, PEDESTRIAN_LABELS);
         distanceSpinner = new Spinner(this);
-        addNamedSetting(graphicsCard, "Distância de renderização", distanceSpinner, DISTANCE_LABELS);
+        addNamedSetting(graphicsCard, "Draw distance", distanceSpinner, DISTANCE_LABELS);
         TextView graphicsNote = new TextView(this);
-        graphicsNote.setText("540p reduz o trabalho da GPU; 720p acompanha a resolução-alvo do Xbox 360; 1080p prioriza nitidez. A interface permanece nítida.");
+        graphicsNote.setText("540p reduces GPU workload; 720p matches the Xbox 360 target resolution; 1080p favors sharpness. The interface stays crisp.");
         styleText(graphicsNote, 12, false, Color.rgb(145, 158, 173));
         graphicsNote.setPadding(0, dp(10), 0, 0);
         graphicsCard.addView(graphicsNote);
         Button recommended = new Button(this);
-        recommended.setText("Aplicar perfil de desempenho");
+        recommended.setText("Apply performance preset");
         styleButton(recommended);
         recommended.setBackground(tintedButton(Color.rgb(42, 81, 76)));
         recommended.setOnClickListener(v -> applyRecommendedPerformanceProfile());
@@ -155,14 +155,14 @@ public final class MainActivity extends Activity {
         initializeGraphicsControls();
 
         LinearLayout launchCard = card(panel);
-        addHeading(launchCard, "Arquivos e inicialização");
+        addHeading(launchCard, "Files and launch");
         permission = new Button(this);
-        permission.setText("Permitir acesso aos arquivos");
+        permission.setText("Allow file access");
         permission.setOnClickListener(v -> requestFilesAccess());
         styleButton(permission);
         launchCard.addView(permission);
         play = new Button(this);
-        play.setText("Preparar e iniciar motor");
+        play.setText("Prepare and launch game");
         play.setOnClickListener(v -> prepareAndPlay());
         styleButton(play);
         play.setBackground(tintedButton(Color.rgb(190, 53, 47)));
@@ -173,25 +173,25 @@ public final class MainActivity extends Activity {
         launchCard.addView(status);
 
         LinearLayout diagnosticsCard = card(panel);
-        addHeading(diagnosticsCard, "Diagnóstico");
+        addHeading(diagnosticsCard, "Diagnostics");
         copyDiagnostic = new Button(this);
-        copyDiagnostic.setText("Copiar diagnóstico");
+        copyDiagnostic.setText("Copy diagnostics");
         copyDiagnostic.setOnClickListener(v -> {
             ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
-            clipboard.setPrimaryClip(ClipData.newPlainText("Rusty MCLA diagnóstico", diagnosticText));
-            status.setText("Diagnóstico copiado. Cole o texto na conversa.");
+            clipboard.setPrimaryClip(ClipData.newPlainText("Rusty MCLA diagnostics", diagnosticText));
+            status.setText("Diagnostics copied to clipboard.");
         });
         styleButton(copyDiagnostic);
         diagnosticsCard.addView(copyDiagnostic);
         shareDiagnostic = new Button(this);
-        shareDiagnostic.setText("Compartilhar diagnóstico (.txt)");
+        shareDiagnostic.setText("Share diagnostics (.txt)");
         shareDiagnostic.setOnClickListener(v -> {
             Uri uri = Uri.parse("content://" + getPackageName() + ".diagnostics/report.txt");
             Intent send = new Intent(Intent.ACTION_SEND).setType("text/plain");
             send.putExtra(Intent.EXTRA_STREAM, uri);
-            send.setClipData(ClipData.newRawUri("Diagnóstico", uri));
+            send.setClipData(ClipData.newRawUri("Diagnostics", uri));
             send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-            startActivity(Intent.createChooser(send, "Enviar diagnóstico"));
+            startActivity(Intent.createChooser(send, "Share diagnostics"));
         });
         styleButton(shareDiagnostic);
         diagnosticsCard.addView(shareDiagnostic);
@@ -372,7 +372,7 @@ public final class MainActivity extends Activity {
         loadingGraphics = false;
         setSetting("display", "vsync", "true"); setSetting("display", "fps_cap", "30");
         refreshGraphicsStatus();
-        status.setText("Perfil de desempenho salvo. Feche e inicie o jogo para aplicar as opções.");
+        status.setText("Performance preset saved. Close and relaunch the game to apply the settings.");
     }
 
     private void applyGraphicsPreset(String preset, float scale, float blur, float effects, float pedestrians, float distance) {
@@ -472,10 +472,10 @@ public final class MainActivity extends Activity {
                 out.getFD().sync();
             }
             File target = settingsFile();
-            if (target.exists() && !target.delete()) throw new java.io.IOException("não foi possível substituir settings.toml");
-            if (!temp.renameTo(target)) throw new java.io.IOException("não foi possível gravar settings.toml");
+            if (target.exists() && !target.delete()) throw new java.io.IOException("Could not replace settings.toml");
+            if (!temp.renameTo(target)) throw new java.io.IOException("Could not write settings.toml");
         } catch (Exception error) {
-            if (graphicsStatus != null) graphicsStatus.setText("Falha ao salvar as opções: " + error.getMessage());
+            if (graphicsStatus != null) graphicsStatus.setText("Could not save graphics settings: " + error.getMessage());
         }
     }
 
@@ -483,15 +483,15 @@ public final class MainActivity extends Activity {
         if (graphicsStatus == null) return;
         String scale = renderScaleSpinner == null ? "720p" : RENDER_SCALE_LABELS[renderScaleSpinner.getSelectedItemPosition()];
         String blur = blurSpinner == null ? "Normal" : BLUR_LABELS[blurSpinner.getSelectedItemPosition()];
-        String effects = effectsSpinner == null ? "Completos" : EFFECTS_LABELS[effectsSpinner.getSelectedItemPosition()];
+        String effects = effectsSpinner == null ? "Full" : EFFECTS_LABELS[effectsSpinner.getSelectedItemPosition()];
         String pedestrians = pedestrianSpinner == null ? "Normal" : PEDESTRIAN_LABELS[pedestrianSpinner.getSelectedItemPosition()];
-        String distance = distanceSpinner == null ? "Longa" : DISTANCE_LABELS[distanceSpinner.getSelectedItemPosition()];
-        graphicsStatus.setText("Renderizador: Vulkan do sistema Android (nativo)\n"
-            + "Fallback: OpenGL ES do sistema Android\n"
-            + "Sem driver externo ou camada de tradução.\n"
-            + "Cena: " + scale + "  •  Blur: " + blur
-            + "\nEfeitos: " + effects + "  •  Pedestres: " + pedestrians + "\nDistância: " + distance
-            + "\nAs opções entram em vigor ao iniciar o jogo.");
+        String distance = distanceSpinner == null ? "Long" : DISTANCE_LABELS[distanceSpinner.getSelectedItemPosition()];
+        graphicsStatus.setText("Renderer: native Android system Vulkan\n"
+            + "Fallback: native Android system OpenGL ES\n"
+            + "No external driver or translation layer.\n"
+            + "Scene: " + scale + "  •  Blur: " + blur
+            + "\nEffects: " + effects + "  •  Pedestrians: " + pedestrians + "\nDraw distance: " + distance
+            + "\nSettings take effect when the game starts.");
     }
 
     private void installCrashRecorder() {
@@ -551,13 +551,13 @@ public final class MainActivity extends Activity {
         if (granted && !sharedRoot().exists()) sharedRoot().mkdirs();
         boolean found = granted && ready(installRoot());
         play.setEnabled(found);
-        status.setText(!granted ? "Autorize o acesso a todos os arquivos para ler a pasta Rusty na memória interna."
-            : found ? "Dados encontrados em " + installRoot().getAbsolutePath() + ". Pode iniciar."
-            : "Pasta ainda não encontrada. Crie Rusty na raiz da memória interna e extraia ali todos os ZIPs. Procuro Rusty/RustyMCLA/manifest.local.json e Rusty/RustyMCLA/data/cache.");
+        status.setText(!granted ? "Allow access to all files to read the Rusty folder in internal storage."
+            : found ? "Game data found at " + installRoot().getAbsolutePath() + ". Ready to launch."
+            : "Game folder not found. Create Rusty in the root of internal storage and extract all ZIP files there. Looking for Rusty/RustyMCLA/manifest.local.json and Rusty/RustyMCLA/data/cache.");
         final int generation = ++reportGeneration;
         copyDiagnostic.setEnabled(false);
         shareDiagnostic.setEnabled(false);
-        diagnostic.setText("Lendo diagnóstico…");
+        diagnostic.setText("Reading diagnostics…");
         reports.execute(() -> {
             String report = buildDiagnostic();
             boolean saved = false;
@@ -565,7 +565,7 @@ public final class MainActivity extends Activity {
                 out.write(report.getBytes(java.nio.charset.StandardCharsets.UTF_8));
                 File trace = new File(getFilesDir(), "diagnostic-anr.txt");
                 if (trace.isFile()) {
-                    out.write("\n\nANR completo (limite de 4 MiB):\n".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                    out.write("\n\nFull ANR trace (4 MiB limit):\n".getBytes(java.nio.charset.StandardCharsets.UTF_8));
                     try (InputStream in = new FileInputStream(trace)) {
                         byte[] bytes = new byte[8192]; int n;
                         while ((n = in.read(bytes)) != -1) out.write(bytes, 0, n);
@@ -573,7 +573,7 @@ public final class MainActivity extends Activity {
                 }
                 out.flush();
                 saved = new File(getFilesDir(), "diagnostic-report.tmp").renameTo(new File(getFilesDir(), "diagnostic-report.txt"));
-            } catch (Exception error) { report += "\nFalha ao salvar relatório: " + error; }
+            } catch (Exception error) { report += "\nCould not save report: " + error; }
             if (saved && hasFilesAccess()) {
                 try {
                     File external = new File(sharedRoot(), "Rusty-MCLA-diagnostico.txt");
@@ -603,7 +603,7 @@ public final class MainActivity extends Activity {
         File root = installRoot();
         if (!hasFilesAccess() || !ready(root)) { refresh(); return; }
         play.setEnabled(false);
-        status.setText("Preparando os dados. Mantenha o aplicativo aberto.");
+        status.setText("Preparing game data. Keep the app open.");
         new Thread(() -> {
             try {
                 installWorldIndex(root);
@@ -617,24 +617,24 @@ public final class MainActivity extends Activity {
             } catch (Exception error) {
                 runOnUiThread(() -> {
                     refresh();
-                    status.setText("Preparação falhou: " + error.getMessage());
+                    status.setText("Setup failed: " + error.getMessage());
                 });
             }
         }, "mcla-prepare").start();
     }
 
     private String buildDiagnostic() {
-        StringBuilder text = new StringBuilder("Diagnóstico Rusty MCLA 0.9\n");
-        text.append("Android: ").append(Build.VERSION.RELEASE).append("; aparelho: ")
+        StringBuilder text = new StringBuilder("Rusty MCLA diagnostics 0.9\n");
+        text.append("Android: ").append(Build.VERSION.RELEASE).append("; device: ")
             .append(Build.MANUFACTURER).append(' ').append(Build.MODEL).append('\n');
-        text.append("Acesso aos arquivos: ").append(hasFilesAccess()).append('\n');
+        text.append("File access: ").append(hasFilesAccess()).append('\n');
         File root = installRoot();
-        text.append("Pasta: ").append(root == null ? "não encontrada" : root.getAbsolutePath()).append('\n');
+        text.append("Folder: ").append(root == null ? "not found" : root.getAbsolutePath()).append('\n');
         File index = root == null ? null : new File(root, "data/cache/world_index.json");
-        text.append("Índice do mundo: ").append(index != null && index.isFile() ? index.length() + " bytes" : "ausente").append('\n');
+        text.append("World index: ").append(index != null && index.isFile() ? index.length() + " bytes" : "missing").append('\n');
         File javaCrash = new File(getFilesDir(), "last-java-crash.txt");
         if (javaCrash.isFile()) {
-            text.append("\nExceção Java:\n");
+            text.append("\nJava exception:\n");
             appendFileTail(text, javaCrash);
         }
         File logs = new File(getFilesDir(), "user/logs");
@@ -671,9 +671,9 @@ public final class MainActivity extends Activity {
                     long timestamp = ((Number) exitClass.getMethod("getTimestamp").invoke(exit)).longValue();
                     int reason = ((Number) exitClass.getMethod("getReason").invoke(exit)).intValue();
                     if (timestamp >= oldest) {
-                        text.append("Saída ").append(++shown).append(": motivo=").append(reason)
+                        text.append("Exit ").append(++shown).append(": reason=").append(reason)
                             .append(", status=").append(invokeInt(exitClass, exit, "getStatus"))
-                            .append(", descrição=").append(exitClass.getMethod("getDescription").invoke(exit)).append('\n');
+                            .append(", description=").append(exitClass.getMethod("getDescription").invoke(exit)).append('\n');
                         // A user-confirmed ANR can be recorded by Android as a
                         // subsequent force-stop (reason 10) while retaining its
                         // ANR trace. Prefer any available trace, not only reason 6.
@@ -688,20 +688,20 @@ public final class MainActivity extends Activity {
                                         }
                                     }
                                     traceCaptured = true;
-                                    text.append("\nResumo ANR:\n");
+                                    text.append("\nANR summary:\n");
                                     try (java.io.FileReader input = new java.io.FileReader(savedTrace)) {
                                         text.append(TraceSummary.read(input));
                                     }
                                 }
                             } catch (Exception error) {
-                                text.append("Rastreamento ANR indisponível: ").append(error).append('\n');
+                                text.append("ANR trace unavailable: ").append(error).append('\n');
                             }
                         }
                         if (shown >= 3) break;
                     }
                 }
             } catch (Exception error) {
-                text.append("Histórico de saída indisponível: ").append(error).append('\n');
+                text.append("Exit history unavailable: ").append(error).append('\n');
             }
         }
         return text.toString();
@@ -720,7 +720,7 @@ public final class MainActivity extends Activity {
             input.readFully(bytes);
             text.append(new String(bytes, java.nio.charset.StandardCharsets.UTF_8));
         } catch (Exception error) {
-            text.append("Não consegui ler: ").append(error).append('\n');
+            text.append("Could not read: ").append(error).append('\n');
         }
     }
 
@@ -733,7 +733,7 @@ public final class MainActivity extends Activity {
             int count;
             while ((count = in.read(bytes)) != -1) out.write(bytes, 0, count);
         }
-        if (!temp.renameTo(index)) throw new IllegalStateException("Não foi possível gravar o índice do mundo.");
+        if (!temp.renameTo(index)) throw new IllegalStateException("Could not write the world index.");
     }
 
     private static void joinIntroVideo(File root) throws Exception {
@@ -742,7 +742,7 @@ public final class MainActivity extends Activity {
         File first = new File(video.getPath() + ".part01");
         File second = new File(video.getPath() + ".part02");
         if (!first.isFile() || !second.isFile())
-            throw new IllegalArgumentException("Faltam as partes 153 e 154 do vídeo de abertura.");
+            throw new IllegalArgumentException("Intro video parts 153 and 154 are missing.");
         File temp = new File(video.getPath() + ".tmp");
         byte[] bytes = new byte[1024 * 1024];
         try (FileOutputStream out = new FileOutputStream(temp)) {
@@ -753,7 +753,7 @@ public final class MainActivity extends Activity {
                 }
             }
         }
-        if (!temp.renameTo(video)) throw new IllegalStateException("Não foi possível finalizar intro.mcv.");
-        if (!first.delete() || !second.delete()) throw new IllegalStateException("Não foi possível limpar partes do vídeo.");
+        if (!temp.renameTo(video)) throw new IllegalStateException("Could not finish intro.mcv.");
+        if (!first.delete() || !second.delete()) throw new IllegalStateException("Could not remove the video parts.");
     }
 }

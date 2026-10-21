@@ -5026,16 +5026,16 @@ log::info!("stuck2: car {} {} grounded {} up.y {:.2} speed {:.2} rpm {:.0} veh {
                                 .show(ui, |ui| {
                                     ui.set_width(400.0);
                                     ui.vertical_centered(|ui| {
-                                        ui.heading("Preparando o mundo");
+                                        ui.heading("Preparing the world");
                                         ui.add_space(10.0);
-                                        ui.label("Carregando a área ao redor do carro...");
+                                        ui.label("Loading the area around the car...");
                                         ui.add_space(12.0);
                                         ui.add(egui::ProgressBar::new(fraction.clamp(0.0, 1.0))
                                             .desired_width(400.0)
-                                            .text(format!("{finished}/{required} setores · {models_ready}/{models_total} veículos")));
+                                            .text(format!("{finished}/{required} sectors · {models_ready}/{models_total} vehicles")));
                                         if failed > 0 {
                                             ui.add_space(4.0);
-                                            ui.small(format!("{failed} setor(es) indisponível(is)"));
+                                            ui.small(format!("{failed} unavailable sector(s)"));
                                         }
                                     });
                                 });

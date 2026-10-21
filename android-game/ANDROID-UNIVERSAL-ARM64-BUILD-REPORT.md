@@ -1,57 +1,71 @@
-Relatório histórico - Rusty MCLA Android ARM64 (APK 0.9.5)
-Data: 2026-10-21
+# Historical build report — Rusty MCLA Android ARM64 (APK 0.9.5)
 
-Este relatório registra a build 0.9.5, não a compilação do estado atual do
-checkout. Os resultados de execução mais recentes estão em TESTING-STATUS.md;
-eles registram desempenho abaixo de 1 FPS e ainda não confirmam estabilidade.
+Date: 2026-10-21
 
-OBJETIVO
-Compilar o engine Rust para Android ARM64 usando APIs gráficas do sistema e sem
-seleção de fabricante de GPU, driver customizado ou tradução de instruções x86.
+This report covers build 0.9.5, not the current checkout. The latest runtime
+results are recorded in `TESTING-STATUS.md`; they show performance below 1 FPS
+and do not establish stability.
 
-ALTERAÇÕES
-- O wgpu recebe Vulkan e GLES simultaneamente no Android. Ele escolhe um adapter
-  compatível com a superfície; o backend escolhido é registrado no log do jogo.
-- O build Android do wgpu habilita Vulkan e GLES. A declaração desktop continua
-  separada; sdl3-sys não entra no target Android.
-- Entrada de mouse relativa e botão direito ficou condicionada a desktop. Os
-  caminhos compartilhados de teclado, toque e controle Android foram mantidos.
-- O cpal Android usa Oboe e libc++_shared. winit continua usando
-  android-activity via seu backend NativeActivity.
-- O build não seleciona Adreno/Qualcomm nem importa Turnip ou outro driver.
-- O empacotador Termux usa /system/framework/framework-res.apk para o link AAPT2,
-  pois o android.jar do Termux serve para javac/D8, mas não traz resources.arsc.
-  ANDROID_FRAMEWORK_RES pode substituir esse caminho.
+## Goal
 
-BUILD
-Target: aarch64-linux-android (arm64-v8a)
-Comando Rust executado:
-  cargo build -p mcla --lib --target aarch64-linux-android --release --features android-fps-counter
+Build the Rust engine for Android ARM64 using system graphics APIs, without GPU
+vendor selection, custom drivers, or x86 instruction translation.
 
-Saída:
-  mcla-rs/target/aarch64-linux-android/release/libmcla_android.so
-  android-game/build/Rusty-MCLA-Android-0.9.5-Universal-ARM64.apk
+## Changes
 
-VERIFICAÇÃO DE BUILD
-- cargo build terminou com sucesso em 15m18s no build final.
-- O .so é ELF64, shared object, máquina AArch64, direcionado ao Android API 24.
-- Tamanho final do .so: 155.371.200 bytes.
-- A árvore Cargo Android confirmou wgpu-core com backends gles e vulkan; não
-  encontrou SDL3, DX12, Metal, WinAPI, Adreno ou Turnip como dependência do alvo.
-- O script AAPT2 empacotou o APK e o apksigner verify passou.
-- O APK foi instalado por adb install -r e a atividade inicial foi acionada.
+- wgpu enables Vulkan and GLES simultaneously on Android. It chooses an adapter
+  compatible with the surface; the selected backend is recorded in the game log.
+- The Android wgpu build enables Vulkan and GLES. The desktop declaration remains
+  separate; `sdl3-sys` is not included in the Android target.
+- Relative mouse input and the right mouse button are desktop-only. Shared
+  keyboard paths, touch, and Android controller input remain available.
+- Android cpal uses Oboe and `libc++_shared`. winit continues to use
+  `android-activity` through its NativeActivity backend.
+- The build does not select Adreno/Qualcomm or import Turnip or another driver.
+- The Termux packager uses `/system/framework/framework-res.apk` for AAPT2
+  linking because Termux's `android.jar` supports javac/D8 but does not contain
+  `resources.arsc`. `ANDROID_FRAMEWORK_RES` can override this path.
 
-LIMITES CONHECIDOS
-- Isso confirma compilação nativa ARM64 e seleção gráfica sem hardcoding de
-  fabricante; não prova que funcione em todo aparelho Android.
-- O APK define minSdk 30 e requer GLES 3.0 como mínimo declarado. Compatibilidade
-  real depende dos recursos e da qualidade do driver Vulkan/GLES do sistema.
-- O teste foi feito apenas em um aparelho Android 16 ARM64. Não foi feita
-  sessão de jogo nesta build nem validação em GPUs Mali ou Xclipse.
-- O build Rust emitiu 151 avisos; javac emitiu 3 avisos sobre source/target 8.
-  Ambos terminaram sem erro.
+## Build
 
-OBSERVAÇÃO SOBRE ESTABILIDADE
-O sucesso do build e da instalação não é evidência de estabilidade, taxa de FPS
-ou ausência de ANR. Registrar um diagnóstico novo depois de uma sessão de jogo
-será necessário para confirmar esses pontos.
+Target: `aarch64-linux-android` (`arm64-v8a`)
+
+Rust command:
+
+```sh
+cargo build -p mcla --lib --target aarch64-linux-android --release --features android-fps-counter
+```
+
+Outputs:
+
+- `mcla-rs/target/aarch64-linux-android/release/libmcla_android.so`
+- `android-game/build/Rusty-MCLA-Android-0.9.5-Universal-ARM64.apk`
+
+## Build verification
+
+- The final `cargo build` completed successfully in 15m18s.
+- The `.so` is an ELF64 shared object for AArch64, targeting Android API 24.
+- Final `.so` size: 155,371,200 bytes.
+- The Android Cargo tree confirmed that wgpu-core includes GLES and Vulkan
+  backends; SDL3, DX12, Metal, WinAPI, Adreno, and Turnip were not dependencies
+  of the target.
+- AAPT2 packaged the APK and `apksigner verify` passed.
+- The APK was installed with `adb install -r` and its launch activity was
+  started.
+
+## Known limits
+
+- This confirms a native ARM64 build and backend selection without vendor
+  hardcoding; it does not prove compatibility with every Android device.
+- The APK declares minSdk 30 and GLES 3.0 as its minimum. Actual compatibility
+  depends on system Vulkan/GLES features and driver quality.
+- Testing was limited to one Android 16 ARM64 device. This build was not tested
+  in a gameplay session, and Mali or Xclipse GPUs were not validated.
+- The Rust build emitted 151 warnings; javac emitted 3 source/target 8 warnings.
+  Both completed without errors.
+
+## Stability note
+
+Successful compilation and installation do not demonstrate stability, frame
+rate, or freedom from ANRs. A new diagnostic after a gameplay session is needed
+to verify those points.

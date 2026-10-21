@@ -29,9 +29,9 @@ final class TraceSummary {
         }
         collect(header, section, motor, main, other);
         StringBuilder result = new StringBuilder();
-        result.append(motor.length() == 0 ? "Thread android_main não encontrada no rastreamento disponível.\n" : "Thread do motor:\n" + motor);
-        if (main.length() > 0) result.append("\nThread principal Android:\n").append(main);
-        if (other.length() > 0) result.append("\nOutras threads nativas relevantes:\n").append(other);
+        result.append(motor.length() == 0 ? "android_main thread not found in the available trace.\n" : "Game thread:\n" + motor);
+        if (main.length() > 0) result.append("\nAndroid main thread:\n").append(main);
+        if (other.length() > 0) result.append("\nOther relevant native threads:\n").append(other);
         return result.toString();
     }
 
