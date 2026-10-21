@@ -15,7 +15,7 @@ details, and screenshots are not published.
 | Engine startup | Logs show engine initialization, UI assets, and the world streaming path reached gameplay | One ARM64 phone running Android 16 |
 | Graphics backend | Build record shows wgpu Vulkan and GLES enabled for Android | No Mali or Xclipse device has been tested |
 
-The detailed [0.9.5 build report](ANDROID-UNIVERSAL-ARM64-BUILD-REPORT.txt) is
+The detailed [0.9.5 build report](ANDROID-UNIVERSAL-ARM64-BUILD-REPORT.md) is
 historical evidence for that APK only.
 
 ## Current device results
