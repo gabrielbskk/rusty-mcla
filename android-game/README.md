@@ -47,6 +47,7 @@ One trace showed the Java main thread waiting during `NativeActivity.onPause`;
 the native game thread was not present in the excerpt. The cause remains under
 investigation. RAM readings in the supplied traces do not establish an OOM.
 Please attach a full version 0.8 text diagnostic when reporting Android issues.
+See [known issues and useful contributions](KNOWN-ISSUES.md).
 
 ## Verification still needed
 
