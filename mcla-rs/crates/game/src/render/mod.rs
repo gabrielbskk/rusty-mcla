@@ -619,11 +619,9 @@ impl Gpu {
                 &wgpu::DeviceDescriptor {
                     label: Some("mcla"),
                     required_features: required,
-                    required_limits: wgpu::Limits {
-                        max_texture_dimension_2d: limits.max_texture_dimension_2d.max(4096),
-                        max_buffer_size: limits.max_buffer_size,
-                        ..wgpu::Limits::default()
-                    },
+                    // A mobile adapter can expose a smaller texture limit than the
+                    // desktop defaults. Never request limits above what it reports.
+                    required_limits: limits.clone(),
                     memory_hints: wgpu::MemoryHints::Performance,
                 },
                 None,

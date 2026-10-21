@@ -8,6 +8,13 @@ license.workspace = true
 name = "mcla"
 path = "src/main.rs"
 
+# Android NativeActivity loads this library; the desktop executable keeps its
+# existing entry point in the same source file.
+[lib]
+name = "mcla_android"
+path = "src/main.rs"
+crate-type = ["cdylib"]
+
 [dependencies]
 mcla-formats = { path = "../formats" }
 mcla-flash = { path = "../flash" }
@@ -25,12 +32,15 @@ hashbrown.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 wgpu = "24"
-winit = "0.30"
+winit = { version = "0.30", features = ["android-native-activity"] }
 pollster = "0.4"
 egui = "0.31"
 egui-wgpu = "0.31"
 egui-winit = { version = "0.31", default-features = false, features = ["links"] }
-# (game pads: SDL3's gamepad layer, built from source and linked in - pads.rs; audio only so SDL builds its DirectInput backend)
-sdl3-sys = { version = "0.7", default-features = false, features = ["build-from-source-static", "no-default-subsystems", "sdl-joystick", "sdl-audio", "sdl-haptic", "sdl-hidapi", "sdl-sensor"] }
 png = "0.17"
 rodio = { version = "0.20", default-features = false, features = ["symphonia-all"] }
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+# SDL's desktop controller backend needs its own Android Activity. Mobile input
+# is handled separately, so do not link that backend into NativeActivity.
+sdl3-sys = { version = "0.7", default-features = false, features = ["build-from-source-static", "no-default-subsystems", "sdl-joystick", "sdl-audio", "sdl-haptic", "sdl-hidapi", "sdl-sensor"] }

@@ -3,6 +3,10 @@
 mod ability;
 mod hooks;
 mod mc4;
+#[cfg(not(target_os = "android"))]
+mod pads;
+#[cfg(target_os = "android")]
+#[path = "pads_android.rs"]
 mod pads;
 mod rewards;
 mod vinyl;
@@ -115,11 +119,21 @@ struct Input {
     mouse_dx: f32,
     mouse_dy: f32,
     rmb: bool,
+    #[cfg(target_os = "android")]
+    touch_keys: hashbrown::HashSet<KeyCode>,
+    #[cfg(target_os = "android")]
+    touch_points: hashbrown::HashMap<u64, KeyCode>,
 }
 
 impl Input {
     fn down(&self, k: KeyCode) -> bool {
         self.keys.contains(&k) || self.pending_keys.contains(&k)
+            || {
+                #[cfg(target_os = "android")]
+                { self.touch_keys.contains(&k) }
+                #[cfg(not(target_os = "android"))]
+                { false }
+            }
     }
 }
 
@@ -8135,7 +8149,43 @@ impl App {
     }
 }
 
+#[cfg(target_os = "android")]
+impl App {
+    /// Minimal multi-touch driving controls until the mobile HUD is in place.
+    /// Left half steers, upper right accelerates, lower right brakes.
+    fn android_touch(&mut self, touch: winit::event::Touch) {
+        let Some(window) = self.window.as_ref() else { return };
+        let size = window.inner_size();
+        let x = touch.location.x / size.width.max(1) as f64;
+        let y = touch.location.y / size.height.max(1) as f64;
+        if y < 0.13 && touch.phase == winit::event::TouchPhase::Started {
+            self.game.nav_back = true;
+            return;
+        }
+        match touch.phase {
+            winit::event::TouchPhase::Started | winit::event::TouchPhase::Moved => {
+                let key = if x < 0.5 {
+                    if x < 0.25 { KeyCode::KeyA } else { KeyCode::KeyD }
+                } else if y < 0.55 { KeyCode::KeyW } else { KeyCode::KeyS };
+                self.input.touch_points.insert(touch.id, key);
+            }
+            winit::event::TouchPhase::Ended | winit::event::TouchPhase::Cancelled => {
+                self.input.touch_points.remove(&touch.id);
+            }
+        }
+        self.input.touch_keys = self.input.touch_points.values().copied().collect();
+    }
+}
+
 impl ApplicationHandler for App {
+    #[cfg(target_os = "android")]
+    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        // NativeActivity destroys its surface on pause. Rebuild GPU resources
+        // when it resumes rather than drawing to the invalid old surface.
+        let opt = self.opt.clone();
+        *self = App::new(opt);
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -8514,6 +8564,13 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        #[cfg(target_os = "android")]
+        if !self.game.in_menu() {
+            if let WindowEvent::Touch(ref touch) = event {
+                self.android_touch(touch.clone());
+                return;
+            }
+        }
         if let (Some(eg), Some(w)) = (self.egui.as_mut(), self.window.as_ref()) {
             let r = eg.state.on_window_event(w, &event);
             if r.consumed {
@@ -8902,6 +8959,21 @@ fn radio_ctx(vehicles: &vehicles::Vehicles, world: &world::World, hour: f32) -> 
 
 fn main() -> std::process::ExitCode {
     hooks::run(run_game)
+}
+
+#[cfg(target_os = "android")]
+static ANDROID_APP: std::sync::OnceLock<winit::platform::android::activity::AndroidApp> = std::sync::OnceLock::new();
+
+/// Entry point called by Android NativeActivity through android-activity.
+#[cfg(target_os = "android")]
+#[no_mangle]
+fn android_main(app: winit::platform::android::activity::AndroidApp) {
+    if let Some(root) = app.internal_data_path() {
+        std::env::set_var("RUSTY_MCLA_USER_DIR", root.join("user"));
+        std::env::set_var("MCLA_DATA", root.join("data/cache"));
+    }
+    let _ = ANDROID_APP.set(app);
+    let _ = hooks::run(run_game);
 }
 
 fn run_game() -> Result<()> {
@@ -9548,6 +9620,14 @@ fn run_game() -> Result<()> {
         return Ok(());
     }
     hooks::start_file_log();
+    #[cfg(target_os = "android")]
+    let event_loop = {
+        use winit::platform::android::EventLoopBuilderExtAndroid;
+        let mut builder = EventLoop::builder();
+        builder.with_android_app(ANDROID_APP.get().expect("Android app").clone());
+        builder.build()?
+    };
+    #[cfg(not(target_os = "android"))]
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App::new(opt);

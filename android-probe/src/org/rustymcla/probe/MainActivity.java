@@ -1,0 +1,107 @@
+package org.rustymcla.probe;
+
+import android.app.Activity;
+import android.content.Intent;
+import android.database.Cursor;
+import android.net.Uri;
+import android.os.Bundle;
+import android.provider.DocumentsContract;
+import android.view.View;
+import android.widget.Button;
+import android.widget.LinearLayout;
+import android.widget.ScrollView;
+import android.widget.TextView;
+
+/** Checks a locally converted Rusty MCLA install without copying game files into the APK. */
+public final class MainActivity extends Activity {
+    private static final int PICK_FOLDER = 1;
+    private TextView result;
+
+    @Override public void onCreate(Bundle state) {
+        super.onCreate(state);
+        LinearLayout panel = new LinearLayout(this);
+        panel.setOrientation(LinearLayout.VERTICAL);
+        int pad = (int) (20 * getResources().getDisplayMetrics().density);
+        panel.setPadding(pad, pad, pad, pad);
+        TextView title = new TextView(this);
+        title.setText("Midnight Club: LA — teste do port Android");
+        title.setTextSize(22);
+        panel.addView(title);
+        TextView note = new TextView(this);
+        note.setText("Este APK experimental ainda não roda o jogo. A pasta solicitada é gerada pelo instalador do projeto; os arquivos ZIP em partes no Drive ainda não são essa pasta. Você não precisa selecioná-la agora. O port Android do motor está em desenvolvimento.");
+        note.setTextSize(16);
+        panel.addView(note);
+        Button choose = new Button(this);
+        choose.setText("Verificar pasta convertida (opcional)");
+        choose.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View view) {
+                Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+                startActivityForResult(intent, PICK_FOLDER);
+            }
+        });
+        panel.addView(choose);
+        result = new TextView(this);
+        result.setTextSize(16);
+        panel.addView(result);
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(panel);
+        setContentView(scroll);
+        Uri saved = getPreferences(0).getString("tree", null) == null ? null : Uri.parse(getPreferences(0).getString("tree", null));
+        if (saved != null) inspect(saved);
+    }
+
+    @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != PICK_FOLDER || resultCode != RESULT_OK || data == null) return;
+        Uri tree = data.getData();
+        if (tree == null) return;
+        getContentResolver().takePersistableUriPermission(tree, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        getPreferences(0).edit().putString("tree", tree.toString()).apply();
+        inspect(tree);
+    }
+
+    private void inspect(Uri tree) {
+        try {
+            Uri root = DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree));
+            Uri data = child(tree, root, "data");
+            Uri cache = data == null ? child(tree, root, "cache") : child(tree, data, "cache");
+            Uri manifest = child(tree, root, "manifest.local.json");
+            Uri resources = cache == null ? null : child(tree, cache, "resources");
+            Uri tune = cache == null ? null : child(tree, cache, "tune");
+            Uri shaders = cache == null ? null : child(tree, cache, "shaders_wgsl");
+            Uri audio = data == null ? null : child(tree, data, "audio_pc");
+            Uri video = data == null ? null : child(tree, data, "video_pc");
+            String report = "Pasta selecionada: " + tree.getLastPathSegment() + "\n\n"
+                + line("manifest.local.json", manifest) + line("data/cache", cache)
+                + line("resources", resources) + line("tune", tune)
+                + line("shaders_wgsl", shaders) + line("audio_pc", audio)
+                + line("video_pc", video) + "\n";
+            if (manifest != null && resources != null && tune != null && shaders != null) {
+                report += "Estrutura básica encontrada. Ainda falta portar e compilar o motor para Android.";
+            } else {
+                report += "Dados incompletos ou pasta errada. O ZIP/ISO original ainda precisa ser convertido; as partes do Drive não são aceitas diretamente.";
+            }
+            result.setText(report);
+        } catch (Exception e) {
+            result.setText("Não foi possível ler a pasta: " + e.getMessage());
+        }
+    }
+
+    private static String line(String name, Uri found) {
+        return (found == null ? "✗ " : "✓ ") + name + "\n";
+    }
+
+    private Uri child(Uri tree, Uri parent, String name) {
+        Uri children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, DocumentsContract.getDocumentId(parent));
+        String[] columns = {DocumentsContract.Document.COLUMN_DOCUMENT_ID, DocumentsContract.Document.COLUMN_DISPLAY_NAME};
+        try (Cursor cursor = getContentResolver().query(children, columns, null, null, null)) {
+            if (cursor == null) return null;
+            while (cursor.moveToNext()) {
+                if (name.equals(cursor.getString(1)))
+                    return DocumentsContract.buildDocumentUriUsingTree(tree, cursor.getString(0));
+            }
+        }
+        return null;
+    }
+}
