@@ -159,7 +159,7 @@ public final class MainActivity extends Activity {
     }
 
     private String buildDiagnostic() {
-        StringBuilder text = new StringBuilder("Diagnóstico Rusty MCLA 0.4\n");
+        StringBuilder text = new StringBuilder("Diagnóstico Rusty MCLA 0.5\n");
         text.append("Android: ").append(Build.VERSION.RELEASE).append("; aparelho: ")
             .append(Build.MANUFACTURER).append(' ').append(Build.MODEL).append('\n');
         text.append("Acesso aos arquivos: ").append(hasFilesAccess()).append('\n');
