@@ -28,8 +28,9 @@ else
 fi
 "$tools/d8" --min-api 26 --lib "$android_jar" --output build/package build/classes/org/rustymcla/game/*.class
 cp "$library" build/package/lib/arm64-v8a/libmcla_android.so
+cp "$ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" build/package/lib/arm64-v8a/libc++_shared.so
 "$tools/aapt2" link -o build/unsigned.apk -I "$android_jar" --manifest AndroidManifest.xml --min-sdk-version 30 --target-sdk-version 30
-(cd build/package && zip -q -u ../unsigned.apk classes.dex lib/arm64-v8a/libmcla_android.so)
+(cd build/package && zip -q -u ../unsigned.apk classes.dex lib/arm64-v8a/libmcla_android.so lib/arm64-v8a/libc++_shared.so)
 "$tools/zipalign" -f 4 build/unsigned.apk build/aligned.apk
 if [[ ! -f build/debug.keystore ]]; then
   keytool -genkeypair -keystore build/debug.keystore -storepass android -keypass android -alias androiddebugkey -dname 'CN=Android Debug,O=Android,C=US' -keyalg RSA -keysize 2048 -validity 10000 >/dev/null 2>&1
