@@ -1,0 +1,15 @@
+VOIDBOOK CLOUD (SFTP)
+
+After this Codespace is rebuilt with this devcontainer configuration:
+1. Run `sudo tailscale up --accept-routes` once in its terminal if Tailscale asks for login, then open the URL it prints.
+2. Run `sftp voidbook-cloud` to browse or transfer files.
+3. The SFTP starting folder is `/Cloud`; it contains `Builds`, `Codespace-Backups`, and `GoogleDrive`.
+
+Useful SFTP commands:
+- `ls` — list folders
+- `cd Builds/rusty-mcla` — choose the APK output folder
+- `put ./path/to/file.apk` — upload a file from this Codespace
+- `get file.apk` — download a file to the Codespace's current directory
+- `exit` — close SFTP
+
+The connection uses user-level Codespaces secrets limited to the armazenamento and rusty-mcla repositories. The SFTP account is jailed to the netbook's `~/Cloud` folder and has no shell access.

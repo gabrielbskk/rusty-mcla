@@ -1,0 +1,10 @@
+{
+  "name": "Codespaces with VoidBook cloud storage",
+  "runArgs": ["--device=/dev/net/tun"],
+  "features": {
+    "ghcr.io/tailscale/codespace/tailscale": {
+      "version": "latest"
+    }
+  },
+  "postStartCommand": "bash .devcontainer/netbook-cloud-setup.sh"
+}
