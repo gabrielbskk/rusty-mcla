@@ -1,15 +1,23 @@
-VOIDBOOK CLOUD (SFTP)
+CLOUD DO VOIDBOOK PARA ESTE CODESPACE
 
-After this Codespace is rebuilt with this devcontainer configuration:
-1. Run `sudo tailscale up --accept-routes` once in its terminal if Tailscale asks for login, then open the URL it prints.
-2. Run `sftp voidbook-cloud` to browse or transfer files.
-3. The SFTP starting folder is `/Cloud`; it contains `Builds`, `Codespace-Backups`, and `GoogleDrive`.
+A configuração está no branch `netbook-cloud` do repositório `gabrielbskk/rusty-mcla`, que parte do backup do Codespace. O Codespace existente está parado no branch `android-experimental`; ele não recebe essa configuração automaticamente.
 
-Useful SFTP commands:
-- `ls` — list folders
-- `cd Builds/rusty-mcla` — choose the APK output folder
-- `put ./path/to/file.apk` — upload a file from this Codespace
-- `get file.apk` — download a file to the Codespace's current directory
-- `exit` — close SFTP
+Quando a cobrança do GitHub estiver resolvida:
+1. Inicie o Codespace existente.
+2. No terminal, rode `git fetch origin` e `git switch -c netbook-cloud --track origin/netbook-cloud`.
+3. No VS Code, use a paleta de comandos e escolha **Codespaces: Rebuild Container** para ativar Tailscale.
+4. Se Tailscale pedir autenticação, rode `sudo tailscale up --accept-routes` e abra o link exibido.
+5. Rode `sftp voidbook-cloud` para navegar ou transferir arquivos.
 
-The connection uses user-level Codespaces secrets limited to the armazenamento and rusty-mcla repositories. The SFTP account is jailed to the netbook's `~/Cloud` folder and has no shell access.
+A reconstrução mantém os arquivos do repositório em `/workspaces`, mas pode remover programas e caches instalados fora dessa pasta. Os READMEs e scripts de build do repositório documentam as ferramentas necessárias para reinstalação.
+
+A pasta inicial do SFTP é `/Cloud`; nela ficam `Builds`, `Codespace-Backups` e `GoogleDrive`.
+
+Comandos SFTP úteis:
+- `ls` — listar pastas
+- `cd Builds/rusty-mcla` — selecionar a pasta de APKs deste projeto
+- `put ./caminho/arquivo.apk` — enviar do Codespace ao VoidBook
+- `get arquivo.apk` — baixar para o diretório atual do Codespace
+- `exit` — fechar o SFTP
+
+A chave e o host SSH confiável são injetados por segredos de Codespaces com acesso limitado aos dois repositórios. A conta SFTP fica confinada à pasta `~/Cloud` do VoidBook e não tem acesso a um shell.
