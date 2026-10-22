@@ -1241,17 +1241,6 @@ impl World {
                 s.leaving = true;
             }
         }
-        // request loads, nearest first
-        let mut want: Vec<(f32, usize)> = self
-            .index
-            .sectors
-            .iter()
-            .enumerate()
-            .filter(|(id, _)| !self.loaded.contains_key(id) && !self.pending.contains(id) && !self.failed.contains(id))
-            .map(|(id, s)| (Self::dist_to(s, pos), id))
-            .filter(|(d, _)| *d < self.load_radius)
-            .collect();
-        want.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         // Decode the small set around the car concurrently. During the initial
         // loading screen, allow two extra workers; normal streaming keeps the
         // lower memory footprint after gameplay begins.
@@ -1260,15 +1249,42 @@ impl World {
         } else {
             12
         };
-        for (_, id) in want.into_iter().take(max_inflight.saturating_sub(self.pending.len())) {
-            self.pending.insert(id);
-            let path = self.assets.path(&self.index.sectors[id].file);
-            let tx = self.tx.clone();
-            let include_collision = !self.own_bound;
-            rayon::spawn(move || {
-                let r = decode_sector_with_collision(id, &path, include_collision);
-                let _ = tx.send((id, r));
-            });
+        // Only a handful of workers can be in flight, so keep only that many
+        // nearest candidates while scanning. Sorting every in-range sector on
+        // each frame needlessly allocates and costs O(n log n) during streaming.
+        let slots = max_inflight.saturating_sub(self.pending.len());
+        if slots > 0 {
+            let mut want: Vec<(f32, usize)> = Vec::with_capacity(slots);
+            for (id, sector) in self.index.sectors.iter().enumerate() {
+                if self.loaded.contains_key(&id) || self.pending.contains(&id) || self.failed.contains(&id) {
+                    continue;
+                }
+                let distance = Self::dist_to(sector, pos);
+                if distance >= self.load_radius {
+                    continue;
+                }
+                let at = want
+                    .binary_search_by(|(current_distance, current_id)| {
+                        current_distance.total_cmp(&distance).then_with(|| current_id.cmp(&id))
+                    })
+                    .unwrap_or_else(|at| at);
+                if at < slots {
+                    want.insert(at, (distance, id));
+                    if want.len() > slots {
+                        want.pop();
+                    }
+                }
+            }
+            for (_, id) in want {
+                self.pending.insert(id);
+                let path = self.assets.path(&self.index.sectors[id].file);
+                let tx = self.tx.clone();
+                let include_collision = !self.own_bound;
+                rayon::spawn(move || {
+                    let r = decode_sector_with_collision(id, &path, include_collision);
+                    let _ = tx.send((id, r));
+                });
+            }
         }
         // upload finished (time-boxed)
         let t0 = std::time::Instant::now();
